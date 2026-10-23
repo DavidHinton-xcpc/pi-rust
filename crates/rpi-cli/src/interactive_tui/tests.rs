@@ -3411,6 +3411,52 @@ fn ime_commit_is_not_buffered_as_paste() {
 }
 
 #[test]
+fn paste_batch_drain_appends_the_probed_char_first() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // The probe hands the next pasted character over already read, so the
+    // drain must take it before slurping the console records behind it.
+    let mut pending = Some(Event::Key(KeyEvent::new(
+        KeyCode::Char('b'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(take_paste_text_char(&mut pending), Some('b'));
+    assert!(
+        pending.is_none(),
+        "absorbed char must leave nothing stashed"
+    );
+
+    // Shift is a text modifier and must still be absorbed.
+    let mut pending = Some(Event::Key(KeyEvent::new(
+        KeyCode::Char('B'),
+        KeyModifiers::SHIFT,
+    )));
+    assert_eq!(take_paste_text_char(&mut pending), Some('B'));
+    assert!(pending.is_none());
+
+    // Enter and Ctrl/Alt chords belong to the normal dispatcher; keep them
+    // stashed so a batch drain cannot swallow or reorder them.
+    for key in [
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    ] {
+        let mut pending = Some(Event::Key(key));
+        assert_eq!(take_paste_text_char(&mut pending), None);
+        assert!(matches!(pending, Some(Event::Key(k)) if k == key));
+    }
+
+    let mut pending = Some(Event::FocusGained);
+    assert_eq!(take_paste_text_char(&mut pending), None);
+    assert!(matches!(pending, Some(Event::FocusGained)));
+
+    let mut pending = None;
+    assert_eq!(take_paste_text_char(&mut pending), None);
+    assert!(pending.is_none());
+}
+
+#[test]
 fn pasted_enter_is_not_a_submit() {
     let now = std::time::Instant::now();
 

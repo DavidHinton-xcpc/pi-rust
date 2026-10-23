@@ -547,9 +547,14 @@ pub(super) const PASTE_PROBE: std::time::Duration = std::time::Duration::from_mi
 /// cannot deliver two keypresses this fast, so anything tighter is paste.
 pub(super) const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Text volume worth folding into a `[paste #n …]` marker, and worth the
-/// native console drain that slurps the rest of a clipboard payload in one
-/// syscall.
+/// Text volume worth the native console drain that slurps the rest of a
+/// clipboard payload in one syscall. Whether the drained run is later folded
+/// into a `[paste #n …]` marker is the editor's decision
+/// (`PASTE_FOLD_CHAR_THRESHOLD` / `PASTE_FOLD_LINE_THRESHOLD`).
+///
+/// Only the Windows paste path and its tests use this, so it is compiled out
+/// elsewhere — otherwise it would be dead code under `-D warnings`.
+#[cfg(any(windows, test))]
 pub(super) const PASTE_RUN_MIN_CHARS: usize = 128;
 
 /// Windows crossterm reads console KEY_EVENTs, not bracketed-paste payloads, so
@@ -576,12 +581,12 @@ impl WindowsPasteRun {
         !self.text.is_empty()
     }
 
-    /// Whether the run is long enough to be worth folding into a `[paste #n]`
-    /// marker instead of inserting verbatim.
+    /// Whether the run is long enough to be worth the native console drain
+    /// instead of reading the rest of the payload one event at a time.
     ///
     /// Size — not elapsed time — is what separates a clipboard paste from an
     /// IME commit: `我们` arrives back-to-back exactly like a two-character
-    /// paste, so only a run past this threshold is treated as pasted content.
+    /// paste, so only a run past this threshold takes the bulk path.
     #[cfg(any(windows, test))]
     pub(super) fn is_paste_candidate(&self) -> bool {
         self.burst && self.text.chars().count() >= PASTE_RUN_MIN_CHARS
@@ -618,6 +623,39 @@ impl WindowsPasteRun {
             editor.handle_paste(&self.text);
         }
         *self = Self::default();
+    }
+}
+
+/// Take the next event out of `pending` when it is a printable text key that
+/// continues the current paste run. Enter, chorded keys and non-key events are
+/// put back untouched for the caller to dispatch normally.
+///
+/// The Windows char path has already read this event out of the console, so a
+/// batched console drain must append its character *first*: `read_text_batch`
+/// starts at the record after it, and draining ahead would reorder the run.
+#[cfg(any(windows, test))]
+pub(super) fn take_paste_text_char(pending: &mut Option<Event>) -> Option<char> {
+    let key = match pending.take() {
+        Some(Event::Key(key)) => key,
+        other => {
+            *pending = other;
+            return None;
+        }
+    };
+    match key.code {
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && ch != '\r'
+                && ch != '\n' =>
+        {
+            Some(ch)
+        }
+        _ => {
+            *pending = Some(Event::Key(key));
+            None
+        }
     }
 }
 

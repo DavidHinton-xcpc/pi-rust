@@ -2707,7 +2707,8 @@ pub async fn interactive_tui(
                         // poll would report "more input" for ordinary typing.
                         let (more_queued, stashed) =
                             probe_paste_input(pending_event.take(), || {
-                                if crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false)
+                                if crossterm::event::poll(std::time::Duration::ZERO)
+                                    .unwrap_or(false)
                                 {
                                     crossterm::event::read().ok()
                                 } else {
@@ -2718,14 +2719,23 @@ pub async fn interactive_tui(
                         if more_queued {
                             windows_paste_run.feed(ch, std::time::Instant::now());
                             #[cfg(windows)]
-                            if pending_event.is_none()
+                            if windows_paste_run.is_paste_candidate()
                                 && state_for_key
                                     .extension_claimed_keys
                                     .lock()
                                     .unwrap()
                                     .is_empty()
                             {
-                                windows_paste_run.read_queued_text();
+                                // The probe already removed the next event from
+                                // the console. Append its character before the
+                                // batch drain; `read_text_batch` starts at the
+                                // record after it.
+                                if let Some(next) = take_paste_text_char(&mut pending_event) {
+                                    windows_paste_run.feed(next, std::time::Instant::now());
+                                }
+                                if pending_event.is_none() {
+                                    windows_paste_run.read_queued_text();
+                                }
                             }
                             continue;
                         }
