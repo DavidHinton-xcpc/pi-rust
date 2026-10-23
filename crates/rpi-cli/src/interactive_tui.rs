@@ -2707,7 +2707,8 @@ pub async fn interactive_tui(
                         // poll would report "more input" for ordinary typing.
                         let (more_queued, stashed) =
                             probe_paste_input(pending_event.take(), || {
-                                if crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false)
+                                if crossterm::event::poll(std::time::Duration::ZERO)
+                                    .unwrap_or(false)
                                 {
                                     crossterm::event::read().ok()
                                 } else {
