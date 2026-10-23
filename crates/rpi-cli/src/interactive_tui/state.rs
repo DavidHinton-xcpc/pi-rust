@@ -547,10 +547,21 @@ pub(super) const PASTE_PROBE: std::time::Duration = std::time::Duration::from_mi
 /// cannot deliver two keypresses this fast, so anything tighter is paste.
 pub(super) const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Windows crossterm reads console KEY_EVENTs, not bracketed-paste payloads.
-/// Buffer a rapid text run before handing it to the editor as one paste.
-/// A lone typed character is released promptly; a confirmed run may pause
-/// briefly while the terminal feeds the rest of the clipboard.
+/// Text volume worth folding into a `[paste #n …]` marker, and worth the
+/// native console drain that slurps the rest of a clipboard payload in one
+/// syscall.
+pub(super) const PASTE_RUN_MIN_CHARS: usize = 128;
+
+/// Windows crossterm reads console KEY_EVENTs, not bracketed-paste payloads, so
+/// a clipboard paste arrives as ordinary `KeyCode::Char` events.
+///
+/// The caller decides paste-vs-typing with a **queue probe**, not a timer: the
+/// console hands a whole clipboard payload over already queued, so input still
+/// waiting behind the current key means paste, and an empty queue means this is
+/// typing that must reach the editor at once. Deciding on elapsed time instead
+/// is what made typing feel laggy — an IME committing a word delivers its
+/// characters with no gap at all, so every committed word sat in this buffer
+/// until the `burst` timeout expired.
 #[derive(Default)]
 pub(super) struct WindowsPasteRun {
     pub(super) text: String,
@@ -559,10 +570,24 @@ pub(super) struct WindowsPasteRun {
 }
 
 impl WindowsPasteRun {
-    pub(super) fn grace(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(if self.burst { 120 } else { 15 })
+    /// Whether anything is buffered, i.e. the current run is being treated as a
+    /// paste.
+    pub(super) fn is_buffering(&self) -> bool {
+        !self.text.is_empty()
     }
 
+    /// Whether the run is long enough to be worth folding into a `[paste #n]`
+    /// marker instead of inserting verbatim.
+    ///
+    /// Size — not elapsed time — is what separates a clipboard paste from an
+    /// IME commit: `我们` arrives back-to-back exactly like a two-character
+    /// paste, so only a run past this threshold is treated as pasted content.
+    #[cfg(any(windows, test))]
+    pub(super) fn is_paste_candidate(&self) -> bool {
+        self.burst && self.text.chars().count() >= PASTE_RUN_MIN_CHARS
+    }
+
+    /// Buffer one character of a paste run.
     pub(super) fn feed(&mut self, ch: char, now: std::time::Instant) {
         if self
             .last_at
@@ -576,9 +601,9 @@ impl WindowsPasteRun {
 
     #[cfg(windows)]
     pub(super) fn read_queued_text(&mut self) {
-        // A few queued characters could be ordinary typing. Only take the
-        // native fast path once the existing heuristic confirms a longer run.
-        if self.burst && self.text.len() >= 64 {
+        // Drain the rest of a confirmed paste straight out of the console: the
+        // round trip per record is what makes a large paste slow to appear.
+        if self.is_paste_candidate() {
             if let Ok(text) = rpi_tui::windows_paste::read_text_batch() {
                 if !text.is_empty() {
                     self.text.push_str(&text);

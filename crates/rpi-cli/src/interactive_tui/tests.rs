@@ -3377,6 +3377,39 @@ fn pasted_win_crlf_text_has_no_stray_carriage_returns() {
     assert!(!editor.get_text().contains('\r'));
 }
 
+/// An IME commit delivers a whole word with no gap between its characters, so a
+/// gap-based paste heuristic classified normal Chinese input as paste and held
+/// it in a buffer until the user stopped typing. The run must instead be handed
+/// to the editor on the very keystroke that arrives with nothing queued behind
+/// it — which is what this asserts about the state machine itself.
+#[test]
+fn ime_commit_is_not_buffered_as_paste() {
+    let mut run = WindowsPasteRun::default();
+    let now = std::time::Instant::now();
+
+    // `我们` arrives back-to-back: burst = true, but far too short to fold.
+    run.feed('我', now);
+    run.feed('们', now);
+    assert!(run.burst, "back-to-back characters are a burst");
+    assert!(
+        !run.is_paste_candidate(),
+        "a two-character IME commit must never be treated as a paste"
+    );
+
+    // Flushing it empties the buffer, so the next word starts clean.
+    let editor = rpi_tui::Editor::simple();
+    run.flush(&editor);
+    assert_eq!(editor.get_text(), "我们");
+    assert!(!run.is_buffering(), "flush must clear the buffer");
+
+    // A genuine clipboard paste clears the size threshold.
+    let mut big = WindowsPasteRun::default();
+    for _ in 0..PASTE_RUN_MIN_CHARS {
+        big.feed('x', now);
+    }
+    assert!(big.is_paste_candidate(), "a long run is still foldable");
+}
+
 #[test]
 fn pasted_enter_is_not_a_submit() {
     let now = std::time::Instant::now();

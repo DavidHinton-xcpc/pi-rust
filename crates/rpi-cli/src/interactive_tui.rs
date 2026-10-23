@@ -1710,17 +1710,18 @@ pub async fn interactive_tui(
                 ev
             } else {
                 // `event::read()` blocks indefinitely. Poll first so shutdown can
-                // stop and join this worker even when no further key arrives.
-                match crossterm::event::poll(
-                    if cfg!(windows) && !windows_paste_run.text.is_empty() {
-                        windows_paste_run.grace()
-                    } else {
-                        std::time::Duration::from_millis(50)
-                    },
-                ) {
+                // stop and join this worker even when no further key arrives. A
+                // paste run being collected may pause for the rest of the
+                // payload; ordinary typing must be taken at once.
+                let idle = if cfg!(windows) && windows_paste_run.is_buffering() {
+                    std::time::Duration::from_millis(120)
+                } else {
+                    std::time::Duration::from_millis(50)
+                };
+                match crossterm::event::poll(idle) {
                     Ok(true) => {}
                     Ok(false) => {
-                        if cfg!(windows) && !windows_paste_run.text.is_empty() {
+                        if cfg!(windows) && windows_paste_run.is_buffering() {
                             windows_paste_run.flush(&editor_for_key);
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
@@ -2692,19 +2693,48 @@ pub async fn interactive_tui(
                     if ch == '\r' || ch == '\n' {
                         // Treat these the same as KeyCode::Enter below.
                     } else {
-                        windows_paste_run.feed(ch, std::time::Instant::now());
-                        #[cfg(windows)]
-                        if windows_paste_run.burst
-                            && windows_paste_run.text.len() >= 64
-                            && pending_event.is_none()
-                            && state_for_key
-                                .extension_claimed_keys
-                                .lock()
-                                .unwrap()
-                                .is_empty()
-                        {
-                            windows_paste_run.read_queued_text();
+                        // Paste vs typing is decided by the console queue, not
+                        // by elapsed time. A clipboard payload is handed over
+                        // already queued, so a *real* key still waiting behind
+                        // this one means the run is a paste to collect and fold.
+                        // An empty queue means these are keystrokes — and an IME
+                        // commit, which delivers a whole word with no gap at all,
+                        // looks exactly like this — so they go straight to the
+                        // editor instead of waiting out a timer.
+                        //
+                        // `probe_paste_input` is essential here: Windows queues
+                        // every key's Release directly behind its Press, so a raw
+                        // poll would report "more input" for ordinary typing.
+                        let (more_queued, stashed) =
+                            probe_paste_input(pending_event.take(), || {
+                                if crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false)
+                                {
+                                    crossterm::event::read().ok()
+                                } else {
+                                    None
+                                }
+                            });
+                        pending_event = stashed;
+                        if more_queued {
+                            windows_paste_run.feed(ch, std::time::Instant::now());
+                            #[cfg(windows)]
+                            if pending_event.is_none()
+                                && state_for_key
+                                    .extension_claimed_keys
+                                    .lock()
+                                    .unwrap()
+                                    .is_empty()
+                            {
+                                windows_paste_run.read_queued_text();
+                            }
+                            continue;
                         }
+                        // Nothing queued behind it: hand the run over now. This
+                        // is the typing path, so it must not wait on a timer.
+                        windows_paste_run.feed(ch, std::time::Instant::now());
+                        windows_paste_run.flush(&editor_for_key);
+                        refresh_autocomplete(&state_for_key, &editor_for_key);
+                        tui_for_key.request_render_reusing_scroll_content();
                         continue;
                     }
                 }
