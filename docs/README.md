@@ -17,8 +17,11 @@
 | 无头服务端与远程 TUI | [远程模式](remote/user-guide.md) |
 | Agent 与扩展调试 | [Rust 调试指南](debugging/rust-debugging.md) |
 | 重复思考、取消与崩溃恢复排查 | [问题复盘](debugging/llm-repetition-forensics.md)（历史证据与修复过程） |
+| 拖选无法复制与 Shift+Enter 失效排查 | [选区与换行审查](debugging/selection-and-shift-enter.md)（0.8.x 逐版本取证与修复方案） |
 | 启动、内存与安装体积测量 | [性能基准](performance/benchmark-vs-pi.md)（含测量日期与边界） |
 | 发版与跨平台分发 | [发布流程](maintaining/releasing.md) |
+| 提交前自检、CI 门槛与 review 约定 | [贡献规则落地清单](maintaining/contributing-checklist.md) |
+| 会话/模型/footer 切换的状态缺口与修复 | [会话切换缺口](maintaining/session-switch-gaps.md)（0.8.3 五项缺口的根因与修复） |
 | 对外介绍与文章草稿 | [推广素材](promotion/README.md) |
 | CLI `docs` 工具的模型可读输入 | [内置文档源](rpi-tool/README.md) |
 
