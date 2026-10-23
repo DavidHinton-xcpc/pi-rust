@@ -1257,6 +1257,24 @@ impl TuiState {
         self.extension_editor_open() || self.extension_input_open()
     }
 
+    /// Reset every per-session counter and cached transcript handle after the
+    /// harness swaps to a different session (`/new`, `/session`, `/fork`,
+    /// `/import`, tree navigation).
+    ///
+    /// The chat container is cleared separately by each caller, which also
+    /// rebuilds the welcome header. This method covers the state that lives
+    /// outside that container: the footer's accumulated usage/context badge,
+    /// the `/copy` cache, and the tool/bash component maps keyed by
+    /// `tool_call_id` from the session being left behind.
+    pub(super) fn reset_session_state(&self) {
+        self.footer.reset_session_counters();
+        *self.last_assistant_text.lock().unwrap() = String::new();
+        self.current_assistant.lock().unwrap().take();
+        self.tool_components.lock().unwrap().clear();
+        self.bash_components.lock().unwrap().clear();
+        self.pending_bash_messages.lock().unwrap().clear();
+    }
+
     pub(super) fn set_hide_thinking(&self, hide: bool) {
         *self.hide_thinking.lock().unwrap() = hide;
         if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {

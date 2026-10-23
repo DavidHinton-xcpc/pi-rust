@@ -95,10 +95,10 @@ pub(super) async fn share_session(harness: &AgentHarness, chat: &Arc<Container>)
 /// session the user continues in). Uses the repo's `fork_typed`, then swaps
 /// the harness backing and renders the (empty-ish) fork transcript.
 /// Hot-switch the harness to another saved session: abort any in-flight run,
-/// open the target session file, swap the durable backing, and re-render the
-/// transcript from the new history (mirrors pi's `/session` resume-in-place).
-/// Shared by the `/session` selector, `/import`, and `/fork`. The current
-/// model/footer stay put (v1 doesn't replay the session's ModelChange entries).
+/// open the target session file, swap the durable backing, restore the model the
+/// session was last using, and re-render the transcript from the new history
+/// (mirrors pi's `/session` resume-in-place).
+/// Shared by the `/session` selector, `/import`, and `/fork`.
 pub(super) async fn switch_to_session(
     harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
@@ -107,6 +107,7 @@ pub(super) async fn switch_to_session(
     chat: &Arc<Container>,
     state: &Arc<TuiState>,
     tool_context: &rpi_extensions::ToolCallContext,
+    catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) -> bool {
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
@@ -129,14 +130,24 @@ pub(super) async fn switch_to_session(
                 state.set_status(RunStatus::Idle);
                 return false;
             }
+            // Switching sessions must not carry the previous session's footer
+            // totals, `/copy` cache, or tool components over.
+            state.reset_session_state();
+            // Replay the target session's own model. Without this the lane keeps
+            // whatever `/model` last selected, so a session resumed after a
+            // temporary switch silently runs on the wrong model — the session's
+            // own `ModelChange`/assistant entries are the authority.
+            restore_session_model(harness, lane, state, catalog).await;
             chat.clear();
-            add_welcome_message(chat);
+            let (tools, skills, context_files) = current_capabilities(harness, lane).await;
+            add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
             render_session_history(
                 harness,
                 chat,
                 state.markdown_transformer(),
                 Some(state.extension_session.clone()),
                 state.images_visible(),
+                Some(&state.footer),
             )
             .await;
             state.set_status(RunStatus::Idle);
@@ -151,8 +162,134 @@ pub(super) async fn switch_to_session(
     }
 }
 
+/// Apply the model a freshly-opened session was last using.
+///
+/// The session log is the authority: `ModelChange` entries and every assistant
+/// turn record the provider/model that produced them. Without this replay the
+/// lane keeps whatever the previous session (or a temporary `/model` pick) left
+/// behind, so switching back to an older session silently ran it on the wrong
+/// model while the footer still showed the new one.
+///
+/// Best-effort: a session with no recorded model, or a model that is no longer
+/// in the authenticated catalog, leaves the current lane model untouched rather
+/// than failing the switch.
+pub(super) async fn restore_session_model(
+    harness: &AgentHarness,
+    lane: &Arc<dyn AgentLane>,
+    state: &Arc<TuiState>,
+    catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
+) {
+    let tree = harness.session().view("main");
+    let Ok(entries) = tree
+        .find_entries(&EntryQuery {
+            entry_type: None,
+            custom_type: None,
+            order: Some(EntryOrder::OldestFirst),
+            limit: None,
+            cursor: None,
+        })
+        .await
+    else {
+        return;
+    };
+    let Some((provider, model_id)) = rpi_harness::session::build_session_context(
+        &entries,
+        &rpi_harness::session::SessionContextBuildOptions::default(),
+    )
+    .model
+    else {
+        return;
+    };
+    let models = catalog
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let Some(model) = models
+        .iter()
+        .find(|m| m.provider == provider && m.id.eq_ignore_ascii_case(&model_id))
+        .cloned()
+    else {
+        return;
+    };
+    if lane.set_model(model.clone()).await.is_ok() {
+        state.set_current_model(&model);
+    }
+}
+
+/// `/new` (alias `/clear`): begin a fresh session.
+///
+/// Creates a new JSONL session file, swaps it onto the harness through the
+/// shared `set_active_session` funnel (so plugin channels follow the swap),
+/// rebuilds the transcript with the session's REAL capability snapshot, and
+/// drops every per-session counter in the footer.
+///
+/// Without the session swap the previous file kept growing and `/session`
+/// showed a single entry; without the capability snapshot the banner rendered
+/// `Tools (0) none` / `Skills (0) none`; without the counter reset the new
+/// session's footer kept adding to the old usage totals.
+pub(super) async fn start_new_session(
+    harness: &AgentHarness,
+    lane: &Arc<dyn AgentLane>,
+    cwd: &std::path::Path,
+    chat: &Arc<Container>,
+    state: &Arc<TuiState>,
+    tool_context: &rpi_extensions::ToolCallContext,
+) -> bool {
+    // Abort an in-flight run before the backing session changes underneath it.
+    if *state.status.lock().unwrap() == RunStatus::Working {
+        state.set_status(RunStatus::Aborting);
+        let _ = lane.abort().await;
+    }
+    if let Err(error) = lane.wait_for_idle().await {
+        add_error_message(chat, &format!("Could not start a new session: {error}"));
+        state.set_status(RunStatus::Idle);
+        return false;
+    }
+
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let dir = crate::session::default_session_dir(cwd);
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        add_error_message(
+            chat,
+            &format!("Could not create session dir {}: {error}", dir.display()),
+        );
+        state.set_status(RunStatus::Idle);
+        return false;
+    }
+    let session = match crate::session::create_jsonl_session(&dir, &cwd_str).await {
+        Ok(session) => session,
+        Err(error) => {
+            add_error_message(chat, &format!("Could not create session: {error}"));
+            state.set_status(RunStatus::Idle);
+            return false;
+        }
+    };
+    let id = session.storage().metadata().id.clone();
+    if let Err(error) =
+        crate::session::set_active_session(harness, session, Some(tool_context)).await
+    {
+        add_error_message(chat, &format!("Could not start a new session: {error}"));
+        state.set_status(RunStatus::Idle);
+        return false;
+    }
+
+    // The harness now points at a different session, so nothing from the old
+    // one may survive on screen or in the footer.
+    state.reset_session_state();
+    chat.clear();
+    let (tools, skills, context_files) = current_capabilities(harness, lane).await;
+    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
+    state.set_status(RunStatus::Idle);
+    add_note_message(chat, &format!("Started new session {id}."));
+    true
+}
+
 /// `/import <path>`: validate and save a session in the selected repository,
 /// then activate it through the same funnel as other session switches.
+///
+/// Restores the imported session's own model and folds its recorded usage back
+/// into the footer, so an imported transcript resumes exactly where it stopped
+/// instead of inheriting the previous session's counters and model.
 pub(super) async fn import_session(
     harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
@@ -161,6 +298,7 @@ pub(super) async fn import_session(
     chat: &Arc<Container>,
     state: &Arc<TuiState>,
     tool_context: &rpi_extensions::ToolCallContext,
+    catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
     use std::path::Path as FsPath;
 
@@ -202,14 +340,20 @@ pub(super) async fn import_session(
         add_error_message(chat, &format!("Could not import session: {error}"));
         return;
     }
+    // The imported session brings its own history: drop the counters of the
+    // session being left behind, then replay the imported one's model.
+    state.reset_session_state();
+    restore_session_model(harness, lane, state, catalog).await;
     chat.clear();
-    add_welcome_message(chat);
+    let (tools, skills, context_files) = current_capabilities(harness, lane).await;
+    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
     render_session_history(
         harness,
         chat,
         state.markdown_transformer(),
         Some(state.extension_session.clone()),
         state.images_visible(),
+        Some(&state.footer),
     )
     .await;
     state.set_status(RunStatus::Idle);
@@ -253,14 +397,19 @@ pub(super) async fn fork_session(
         add_error_message(chat, &format!("Could not fork session: {error}"));
         return;
     }
+    // The fork is a different session; do not inherit the source's footer
+    // totals or cached transcript handles.
+    state.reset_session_state();
     chat.clear();
-    add_welcome_message(chat);
+    let (tools, skills, context_files) = current_capabilities(harness, &harness.lane("main")).await;
+    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
     render_session_history(
         harness,
         chat,
         state.markdown_transformer(),
         Some(state.extension_session.clone()),
         state.images_visible(),
+        Some(&state.footer),
     )
     .await;
     state.set_status(RunStatus::Idle);
@@ -269,19 +418,26 @@ pub(super) async fn fork_session(
 
 /// Render the restored session's prior transcript (user + assistant messages)
 /// into the chat container. Called at TUI startup for `--continue`/`--resume`/
-/// `--session` launches; a no-op for fresh sessions (no entries). Best-effort:
-/// any session read failure just starts with an empty transcript.
+/// `--session` launches and by every in-place session switch; a no-op for fresh
+/// sessions (no entries). Best-effort: any session read failure just starts with
+/// an empty transcript.
 ///
 /// `transformer` is the live assistant-markdown transformer (B5e); `None` is
 /// the identity path. Each restored assistant component installs it so replayed
 /// history renders through the same `register_markdown_transformer` handlers
 /// the live stream does.
+///
+/// When `footer` is supplied the replayed usage is folded back into it, so a
+/// session the user returns to shows the `↑input ↓output` totals, cache-hit
+/// rate and context badge it had rather than a blank footer. `footer` is `None`
+/// only at startup, where the footer has not been built yet.
 pub(super) async fn render_session_history(
     harness: &AgentHarness,
     chat: &Arc<Container>,
     transformer: Option<MarkdownTransformer>,
     extension_session: Option<crate::session::ExtensionSessionCell>,
     show_images: bool,
+    footer: Option<&rpi_tui::FooterComponent>,
 ) {
     let tree = harness.session().view("main");
     let entries = match tree
@@ -301,6 +457,15 @@ pub(super) async fn render_session_history(
         Err(_) => return,
     };
     let mut rendered_any = false;
+    // Replayed usage is folded into the footer at the end so returning to a
+    // session restores its counters instead of leaving the footer blank.
+    let mut restored_input = 0i64;
+    let mut restored_output = 0i64;
+    let mut restored_cache_read = 0i64;
+    let mut restored_cache_write = 0i64;
+    let mut restored_cost = 0f64;
+    let mut restored_cache_denom = 0i64;
+    let mut restored_context: Option<i64> = None;
     for e in entries {
         match e {
             Entry::Message(me) => match &me.message {
@@ -320,6 +485,24 @@ pub(super) async fn render_session_history(
                     }
                     comp.update_blocks(&assistant_blocks(a));
                     chat.add_child(comp);
+                    // Fold this turn into the footer totals the same way the
+                    // live `MessageEnd` handler does, so the restored footer is
+                    // indistinguishable from the one the session ended with.
+                    restored_input += a.usage.input;
+                    restored_output += a.usage.output;
+                    restored_cache_read += a.usage.cache_read;
+                    restored_cache_write += a.usage.cache_write;
+                    restored_cost += a.usage.cost.total;
+                    restored_cache_denom +=
+                        a.usage.input + a.usage.cache_read + a.usage.cache_write;
+                    if a.stop_reason != rpi_ai::StopReason::Aborted
+                        && a.stop_reason != rpi_ai::StopReason::Error
+                    {
+                        let tokens = a.usage.context_tokens();
+                        if tokens > 0 {
+                            restored_context = Some(tokens);
+                        }
+                    }
                     // The component adds spacing only when it has visible content.
                     if let Some(text) = extension_usage_text(extension_session.as_ref(), &a.usage) {
                         add_note_message(chat, &text);
@@ -457,6 +640,25 @@ pub(super) async fn render_session_history(
                 );
                 rendered_any = true;
             }
+        }
+    }
+    if let Some(footer) = footer {
+        // Only restore when the session actually recorded usage; a fresh or
+        // metadata-only session must not overwrite the live counters.
+        if restored_input > 0 || restored_output > 0 || restored_cost > 0.0 {
+            footer.add_usage(
+                restored_input,
+                restored_output,
+                restored_cache_read,
+                restored_cache_write,
+                restored_cost,
+            );
+            if restored_cache_denom > 0 && restored_cache_read > 0 {
+                footer.set_cache_hit_rate(Some(
+                    restored_cache_read as f64 / restored_cache_denom as f64 * 100.0,
+                ));
+            }
+            footer.set_context_tokens(restored_context);
         }
     }
     if rendered_any {

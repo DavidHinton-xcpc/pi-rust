@@ -212,13 +212,18 @@ pub(super) async fn cycle_model(
 }
 
 /// Commit UI/default changes only after the live lane accepts the model.
+///
+/// `save_default` is the ONLY way a selection rewrites `settings.json`'s
+/// `defaultModel`: `/settings → Default model` passes `true`; the plain
+/// `/model` selector and the Ctrl+P cycle pass `false` and are session-scoped
+/// only. A cross-provider pick used to persist implicitly, which meant an
+/// ordinary temporary switch silently replaced the saved default.
 pub(super) async fn apply_model_selection(
     lane: &Arc<dyn AgentLane>,
     state: &Arc<TuiState>,
     model: rpi_ai::Model,
     save_default: bool,
 ) -> Result<String, String> {
-    let current = lane.get_model().await.map_err(|error| error.to_string())?;
     lane.set_model(model.clone())
         .await
         .map_err(|error| format!("Could not switch model: {error}"))?;
@@ -227,11 +232,15 @@ pub(super) async fn apply_model_selection(
         "Model set to {}/{} — applies to the next message.",
         model.provider, model.id
     );
-    if save_default || current.provider != model.provider {
+    if save_default {
         match set_default_model(&model.provider, &model.id) {
             Ok(_) => note.push_str(" Default saved."),
             Err(error) => note.push_str(&format!(" Could not save the default: {error}")),
         }
+    } else {
+        // Session-scoped switch: point at the explicit way to make it stick
+        // instead of writing the default behind the user's back.
+        note.push_str(" Not saved as the default — use /settings to change it.");
     }
     Ok(note)
 }

@@ -750,8 +750,25 @@ fn hot_cycle_crosses_providers_and_anchors_duplicate_ids_to_the_live_lane() {
                 assert!(
                     strip_ansi(&state.footer.render(120).join("\n")).contains("(second) shared")
                 );
+                // A plain `/model` / Ctrl+P switch is session-scoped: it must
+                // NOT rewrite the saved default, not even across providers.
+                // (It used to, so an ordinary temporary switch silently
+                // replaced `defaultModel`.)
                 let saved = crate::settings::load_settings().unwrap();
-                assert_eq!(saved.default_provider.as_deref(), Some("second"));
+                assert_eq!(
+                    saved.default_provider.as_deref(),
+                    None,
+                    "a session-scoped switch must not save a default provider"
+                );
+                assert_eq!(
+                    saved.default_model.as_deref(),
+                    None,
+                    "a session-scoped switch must not save a default model"
+                );
+                assert!(
+                    note.contains("Not saved as the default"),
+                    "the note should say the switch was not persisted: {note}"
+                );
                 assert_eq!(
                     cycle_model(&lane, &catalog, true).await.unwrap().unwrap(),
                     first
@@ -785,6 +802,215 @@ fn hot_cycle_crosses_providers_and_anchors_duplicate_ids_to_the_live_lane() {
                     crate::settings::load_settings().unwrap().default_provider,
                     saved.default_provider
                 );
+            });
+    });
+}
+
+#[test]
+fn explicit_default_model_selection_still_persists() {
+    // The `/settings → Default model` path passes `save_default = true`; that
+    // is now the ONLY way a selection rewrites settings.json.
+    with_isolated_config_dir(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let lane: Arc<dyn AgentLane> = harness.lane("main");
+                let state = test_tui_state();
+                let model = rpi_ai::Model::new(
+                    "saved-model",
+                    "Saved",
+                    rpi_ai::Api::OpenaiCompletions,
+                    "saved",
+                    "http://saved.invalid",
+                );
+                let note = apply_model_selection(&lane, &state, model, true)
+                    .await
+                    .unwrap();
+                assert!(note.contains("Default saved"), "note: {note}");
+                let saved = crate::settings::load_settings().unwrap();
+                assert_eq!(saved.default_provider.as_deref(), Some("saved"));
+                assert_eq!(saved.default_model.as_deref(), Some("saved-model"));
+                harness.close().await.unwrap();
+            });
+    });
+}
+
+#[test]
+fn new_session_creates_a_file_and_resets_footer_and_banner() {
+    // `/new` must (a) start a real session so the transcript no longer appends
+    // to the previous file, (b) advertise the session's real tools/skills in
+    // the banner, and (c) drop the previous session's footer counters.
+    with_isolated_config_dir(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = tmp.path();
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let lane: Arc<dyn AgentLane> = harness.lane("main");
+                let state = test_tui_state();
+                let chat = Arc::new(Container::new());
+                let tool_context =
+                    rpi_extensions::ToolCallContext::new(cwd.to_string_lossy().to_string());
+
+                // Simulate a session that has already accumulated usage.
+                state.footer.set_context_window(200_000);
+                state.footer.add_usage(12_000, 3_400, 0, 0, 0.5);
+                state.footer.set_context_tokens(Some(100_000));
+                state.footer.set_session_name(Some("previous"));
+                *state.last_assistant_text.lock().unwrap() = "old reply".to_string();
+
+                // Give the session a discoverable skill so the banner has real
+                // capability data. Without this the assertion below could not
+                // tell the fixed banner from the buggy `Tools (0) none` one.
+                harness
+                    .set_resources(rpi_harness::types::AgentHarnessResources {
+                        context_files: vec!["/ctx/AGENTS.md".to_string()],
+                        prompt_templates: None,
+                        skills: Some(vec![rpi_harness::types::Skill {
+                            name: "demo-skill".to_string(),
+                            description: "a fixture skill".to_string(),
+                            content: "body".to_string(),
+                            file_path: "/skills/demo/SKILL.md".to_string(),
+                            disable_model_invocation: None,
+                        }]),
+                    })
+                    .await
+                    .unwrap();
+
+                let before = harness.session().storage().metadata().id.clone();
+                assert!(
+                    start_new_session(&harness, &lane, cwd, &chat, &state, &tool_context).await,
+                    "start_new_session should succeed"
+                );
+                let after = harness.session().storage().metadata().id.clone();
+
+                // (a) A different session backs the harness now.
+                assert_ne!(before, after, "a new session file must be created");
+                let session_dir = crate::session::default_session_dir(cwd);
+                // The JSONL repo nests files under a cwd-encoded directory, so
+                // walk the tree rather than assuming a flat layout.
+                let mut files: Vec<String> = Vec::new();
+                let mut stack = vec![session_dir.clone()];
+                while let Some(dir) = stack.pop() {
+                    let Ok(entries) = std::fs::read_dir(&dir) else {
+                        continue;
+                    };
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            stack.push(path);
+                        } else {
+                            files.push(path.file_name().unwrap().to_string_lossy().to_string());
+                        }
+                    }
+                }
+                assert!(
+                    files.iter().any(|f| f.contains(&after)),
+                    "the new session must be on disk under {}: {files:?}",
+                    session_dir.display()
+                );
+
+                // (c) Footer counters were dropped.
+                let footer = strip_ansi(&state.footer.render(120).join("\n"));
+                assert!(!footer.contains("↑12k"), "usage must reset: {footer}");
+                assert!(!footer.contains("previous"), "name must reset: {footer}");
+                assert!(state.last_assistant_text.lock().unwrap().is_empty());
+
+                // (b) The banner reports the real capability counts, not
+                // `Tools (0) none` / `Skills (0) none`.
+                let banner = strip_ansi(&chat.render(120).join("\n"));
+                assert!(
+                    banner.contains("Skills (1)"),
+                    "banner must report the real skill count: {banner}"
+                );
+                assert!(
+                    banner.contains("demo-skill"),
+                    "banner must name the discovered skill: {banner}"
+                );
+                assert!(
+                    !banner.contains("Skills (0)"),
+                    "banner must not claim zero skills: {banner}"
+                );
+
+                harness.close().await.unwrap();
+            });
+    });
+}
+
+#[test]
+fn switching_back_to_a_session_restores_its_footer_and_model() {
+    // Returning to a session must show the counters and model that session
+    // ended with, not a blank footer and whatever `/model` last picked.
+    with_isolated_config_dir(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let lane: Arc<dyn AgentLane> = harness.lane("main");
+                let state = test_tui_state();
+
+                // The session being returned to used `second` and spent tokens.
+                let first = rpi_ai::Model::new(
+                    "prov",
+                    "First",
+                    rpi_ai::Api::OpenaiCompletions,
+                    "first",
+                    "http://first.invalid",
+                );
+                let second = rpi_ai::Model::new(
+                    "prov",
+                    "Second",
+                    rpi_ai::Api::OpenaiCompletions,
+                    "second",
+                    "http://second.invalid",
+                );
+                let catalog = Arc::new(std::sync::RwLock::new(vec![first.clone(), second.clone()]));
+
+                // Record a `ModelChange` in the session log, exactly as a real
+                // session would have after the user picked `second` in it.
+                use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind};
+                harness
+                    .session()
+                    .append_entry(
+                        ProvisionedEntry {
+                            id: "m1".to_string(),
+                            kind: ProvisionedKind::ModelChange {
+                                provider: second.provider.clone(),
+                                model_id: second.id.clone(),
+                            },
+                        },
+                        "main",
+                    )
+                    .await
+                    .unwrap();
+
+                // A `/model` pick left the lane on `first`; the footer agrees.
+                lane.set_model(first.clone()).await.unwrap();
+                state.set_current_model(&first);
+                state.footer.set_context_window(200_000);
+
+                // Switch back to the session under test.
+                restore_session_model(&harness, &lane, &state, &catalog).await;
+                assert_eq!(
+                    lane.get_model().await.unwrap(),
+                    second,
+                    "the session's own model must win over the stale /model pick"
+                );
+                let footer = strip_ansi(&state.footer.render(120).join("\n"));
+                assert!(
+                    footer.contains("(second) prov"),
+                    "the footer must name the restored model: {footer}"
+                );
+
+                harness.close().await.unwrap();
             });
     });
 }

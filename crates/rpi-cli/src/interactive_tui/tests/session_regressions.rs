@@ -6,6 +6,13 @@ fn state_with_root(root: &std::path::Path) -> Arc<TuiState> {
     state
 }
 
+/// An empty authenticated catalog: these tests exercise session plumbing, not
+/// model resolution, so `restore_session_model` finds nothing to apply and
+/// leaves the lane untouched.
+fn empty_catalog() -> Arc<std::sync::RwLock<Vec<rpi_ai::Model>>> {
+    Arc::new(std::sync::RwLock::new(Vec::new()))
+}
+
 fn assert_session_locked(path: &str) {
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -55,7 +62,8 @@ async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_pick
             &cwd,
             &state.chat_container,
             &state,
-            &context
+            &context,
+            &empty_catalog(),
         )
         .await
     );
@@ -130,6 +138,7 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
         &state.chat_container,
         &state,
         &context,
+        &empty_catalog(),
     )
     .await;
     assert_eq!(harness.session().storage().metadata().id, expected);
@@ -192,6 +201,7 @@ async fn invalid_import_leaves_the_active_session_and_repository_untouched() {
         &state.chat_container,
         &state,
         &context,
+        &empty_catalog(),
     )
     .await;
     assert_eq!(harness.session().storage().metadata().id, initial);
