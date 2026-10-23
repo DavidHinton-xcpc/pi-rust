@@ -3408,7 +3408,7 @@ fn ime_commit_is_not_buffered_as_paste() {
 
     // Flushing it empties the buffer, so the next word starts clean.
     let editor = rpi_tui::Editor::simple();
-    run.flush(&editor);
+    run.flush(&editor, now);
     assert_eq!(editor.get_text(), "我们");
     assert!(!run.is_buffering(), "flush must clear the buffer");
 
@@ -3418,6 +3418,83 @@ fn ime_commit_is_not_buffered_as_paste() {
         big.feed('x', now);
     }
     assert!(big.is_paste_candidate(), "a long run is still foldable");
+}
+
+/// The console can hand one clipboard payload over in several batches. When the
+/// batch holding the final newline arrives after the text batch was already
+/// flushed to the editor, the run is empty — but that newline still belongs to
+/// the paste and must not submit the prompt.
+#[test]
+fn paste_split_just_before_its_trailing_enter_is_not_a_submit() {
+    let now = std::time::Instant::now();
+    let clipboard = "alpha\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n";
+    let editor = rpi_tui::Editor::simple();
+
+    let mut run = WindowsPasteRun::default();
+    for ch in "alpha".chars() {
+        run.feed(ch, now);
+    }
+    run.flush(&editor, now);
+    assert_eq!(editor.get_text(), "alpha");
+    assert!(!run.is_buffering(), "the text batch is already inserted");
+
+    // The newline lands in the next batch, inside the carry window, and the
+    // clipboard confirms which text it belongs to.
+    let entered_at = now + std::time::Duration::from_millis(60);
+    assert!(
+        windows_enter_in_paste(&run, false, Some(clipboard), entered_at),
+        "a newline split from its paste must not submit"
+    );
+
+    // A genuinely later Enter is the user's own and has to submit.
+    let typed_at = now + PASTE_CARRY_GAP + std::time::Duration::from_millis(1);
+    assert!(
+        !windows_enter_in_paste(&run, false, Some(clipboard), typed_at),
+        "a typed Enter after the carry window still submits"
+    );
+
+    // An IME commit is not in the clipboard, so its Enter still submits even
+    // immediately after the commit is inserted.
+    let mut ime = WindowsPasteRun::default();
+    ime.feed('我', now);
+    ime.feed('们', now);
+    ime.flush(&editor, now);
+    assert!(
+        !windows_enter_in_paste(&ime, false, Some(clipboard), entered_at),
+        "an IME commit must never absorb the Enter that submits it"
+    );
+}
+
+/// Once a run crosses the fold threshold the loop must stop probing per
+/// character: the probe stashes the next event, and that stash is what made the
+/// native console drain unreachable.
+#[test]
+fn native_batch_read_is_reached_before_the_queue_probe() {
+    let now = std::time::Instant::now();
+
+    let mut run = WindowsPasteRun::default();
+    for _ in 0..PASTE_RUN_MIN_CHARS {
+        run.feed('x', now);
+    }
+    assert!(run.is_paste_candidate());
+    assert!(
+        !run.probe_needed(),
+        "an established paste must drain the console rather than stash a probe"
+    );
+    assert!(
+        should_drain_queued_text(&run, true),
+        "the native batch read has to be reachable"
+    );
+    assert!(
+        !should_drain_queued_text(&run, false),
+        "claimed extension keys keep ownership of the console"
+    );
+
+    // A short IME commit still probes, which is what keeps typing immediate.
+    let mut ime = WindowsPasteRun::default();
+    ime.feed('我', now);
+    ime.feed('们', now);
+    assert!(ime.probe_needed());
 }
 
 #[test]
