@@ -552,6 +552,10 @@ pub(super) const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::fro
 /// Text volume worth folding into a `[paste #n …]` marker, and worth the
 /// native console drain that slurps the rest of a clipboard payload in one
 /// syscall.
+///
+/// Only the Windows paste path and its tests fold runs, so the constant is
+/// absent from other builds instead of tripping `-D dead-code`.
+#[cfg(any(windows, test))]
 pub(super) const PASTE_RUN_MIN_CHARS: usize = 128;
 
 /// Windows crossterm reads console KEY_EVENTs, not bracketed-paste payloads, so
