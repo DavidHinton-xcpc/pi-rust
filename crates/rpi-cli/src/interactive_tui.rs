@@ -1722,7 +1722,7 @@ pub async fn interactive_tui(
                     Ok(true) => {}
                     Ok(false) => {
                         if cfg!(windows) && windows_paste_run.is_buffering() {
-                            windows_paste_run.flush(&editor_for_key);
+                            windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
                         }
@@ -2693,6 +2693,30 @@ pub async fn interactive_tui(
                     if ch == '\r' || ch == '\n' {
                         // Treat these the same as KeyCode::Enter below.
                     } else {
+                        let now = std::time::Instant::now();
+                        // Feed first: `feed` is what detects the burst, and the
+                        // fold threshold is what decides whether this run is an
+                        // established paste.
+                        windows_paste_run.feed(ch, now);
+                        // An established paste is drained straight out of the
+                        // console. Probing here would stash the next event, which
+                        // is what made that drain unreachable. `pending_event` is
+                        // `None` at this point (the loop took it above), so
+                        // reading the console cannot reorder input.
+                        if !windows_paste_run.probe_needed() {
+                            #[cfg(windows)]
+                            if should_drain_queued_text(
+                                &windows_paste_run,
+                                state_for_key
+                                    .extension_claimed_keys
+                                    .lock()
+                                    .unwrap()
+                                    .is_empty(),
+                            ) {
+                                windows_paste_run.read_queued_text();
+                            }
+                            continue;
+                        }
                         // Paste vs typing is decided by the console queue, not
                         // by elapsed time. A clipboard payload is handed over
                         // already queued, so a *real* key still waiting behind
@@ -2717,23 +2741,11 @@ pub async fn interactive_tui(
                             });
                         pending_event = stashed;
                         if more_queued {
-                            windows_paste_run.feed(ch, std::time::Instant::now());
-                            #[cfg(windows)]
-                            if pending_event.is_none()
-                                && state_for_key
-                                    .extension_claimed_keys
-                                    .lock()
-                                    .unwrap()
-                                    .is_empty()
-                            {
-                                windows_paste_run.read_queued_text();
-                            }
                             continue;
                         }
                         // Nothing queued behind it: hand the run over now. This
                         // is the typing path, so it must not wait on a timer.
-                        windows_paste_run.feed(ch, std::time::Instant::now());
-                        windows_paste_run.flush(&editor_for_key);
+                        windows_paste_run.flush(&editor_for_key, now);
                         refresh_autocomplete(&state_for_key, &editor_for_key);
                         tui_for_key.request_render_reusing_scroll_content();
                         continue;
@@ -2753,21 +2765,30 @@ pub async fn interactive_tui(
                         }
                     });
                     pending_event = stashed;
-                    let clipboard = if !more_queued && windows_paste_run.burst {
-                        read_clipboard_text()
-                    } else {
-                        None
-                    };
-                    if windows_enter_in_paste(&windows_paste_run, more_queued, clipboard.as_deref())
-                    {
-                        windows_paste_run.feed('\n', std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    // Read the clipboard only when some text here could be a
+                    // paste still waiting for its trailing newline — the live
+                    // run or a batch flushed within `PASTE_CARRY_GAP`.
+                    let clipboard =
+                        if !more_queued && windows_paste_run.paste_tail_text(now).is_some() {
+                            read_clipboard_text()
+                        } else {
+                            None
+                        };
+                    if windows_enter_in_paste(
+                        &windows_paste_run,
+                        more_queued,
+                        clipboard.as_deref(),
+                        now,
+                    ) {
+                        windows_paste_run.feed('\n', now);
                         crate::key_trace::note("windows paste run -> newline");
                         continue;
                     }
                     crate::key_trace::note("windows paste run -> flush + submit");
-                    windows_paste_run.flush(&editor_for_key);
+                    windows_paste_run.flush(&editor_for_key, now);
                 } else {
-                    windows_paste_run.flush(&editor_for_key);
+                    windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
                 }
             }
 

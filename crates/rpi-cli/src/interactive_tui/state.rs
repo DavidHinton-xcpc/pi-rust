@@ -550,11 +550,24 @@ pub(super) const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::fro
 /// Text volume worth folding into a `[paste #n …]` marker, and worth the
 /// native console drain that slurps the rest of a clipboard payload in one
 /// syscall.
-///
-/// Only the Windows paste path and its tests fold runs, so the constant is
-/// absent from other builds instead of tripping `-D dead-code`.
-#[cfg(any(windows, test))]
 pub(super) const PASTE_RUN_MIN_CHARS: usize = 128;
+
+/// How long a flushed burst stays available as evidence that a trailing Enter
+/// belongs to it.
+///
+/// The console can deliver one clipboard payload in several batches, so the
+/// batch holding the final newline may arrive after the text batch was already
+/// handed to the editor. Keeping the flushed text briefly lets
+/// [`windows_enter_in_paste`] still corroborate that newline against the
+/// clipboard, while a much later typed Enter is no longer mistaken for one.
+pub(super) const PASTE_CARRY_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Text this run already handed to the editor, kept only while it can still be
+/// the head of a paste whose trailing newline has not arrived yet.
+pub(super) struct PasteTail {
+    pub(super) text: String,
+    pub(super) at: std::time::Instant,
+}
 
 /// Windows crossterm reads console KEY_EVENTs, not bracketed-paste payloads, so
 /// a clipboard paste arrives as ordinary `KeyCode::Char` events.
@@ -571,6 +584,8 @@ pub(super) struct WindowsPasteRun {
     pub(super) text: String,
     pub(super) last_at: Option<std::time::Instant>,
     pub(super) burst: bool,
+    /// Batches of this run already flushed within [`PASTE_CARRY_GAP`].
+    pub(super) tail: Option<PasteTail>,
 }
 
 impl WindowsPasteRun {
@@ -586,9 +601,17 @@ impl WindowsPasteRun {
     /// Size — not elapsed time — is what separates a clipboard paste from an
     /// IME commit: `我们` arrives back-to-back exactly like a two-character
     /// paste, so only a run past this threshold is treated as pasted content.
-    #[cfg(any(windows, test))]
     pub(super) fn is_paste_candidate(&self) -> bool {
         self.burst && self.text.chars().count() >= PASTE_RUN_MIN_CHARS
+    }
+
+    /// Whether the per-character queue probe still has to run.
+    ///
+    /// An established paste is drained straight out of the console instead:
+    /// probing first would stash the next event, and that stash is exactly what
+    /// made the native batch read unreachable.
+    pub(super) fn probe_needed(&self) -> bool {
+        !self.is_paste_candidate()
     }
 
     /// Buffer one character of a paste run.
@@ -617,34 +640,98 @@ impl WindowsPasteRun {
         }
     }
 
-    pub(super) fn flush(&mut self, editor: &Editor) {
+    /// Text a trailing newline could still belong to: what is buffered now plus
+    /// whatever this run already flushed within [`PASTE_CARRY_GAP`].
+    ///
+    /// `None` means nothing here was a paste, so an Enter cannot be pasted
+    /// content.
+    pub(super) fn paste_tail_text(&self, now: std::time::Instant) -> Option<String> {
+        let tail = self
+            .tail
+            .as_ref()
+            .filter(|tail| now.duration_since(tail.at) <= PASTE_CARRY_GAP);
+        let buffered = self.burst && !self.text.is_empty();
+        if tail.is_none() && !buffered {
+            return None;
+        }
+        let mut text = tail.map(|tail| tail.text.clone()).unwrap_or_default();
+        text.push_str(&self.text);
+        Some(text)
+    }
+
+    /// Hand the buffered run to the editor.
+    ///
+    /// A burst keeps its text as a [`PasteTail`] so a trailing newline that the
+    /// console delivers in a later batch is still attributed to this paste
+    /// instead of submitting the prompt.
+    pub(super) fn flush(&mut self, editor: &Editor, now: std::time::Instant) {
         if !self.text.is_empty() {
             editor.handle_paste(&self.text);
+            if self.burst {
+                let extend = self
+                    .tail
+                    .as_ref()
+                    .is_some_and(|tail| now.duration_since(tail.at) <= PASTE_CARRY_GAP);
+                let text = std::mem::take(&mut self.text);
+                if extend {
+                    if let Some(tail) = self.tail.as_mut() {
+                        tail.text.push_str(&text);
+                        tail.at = now;
+                    } else {
+                        self.tail = Some(PasteTail { text, at: now });
+                    }
+                } else {
+                    self.tail = Some(PasteTail { text, at: now });
+                }
+            } else {
+                self.tail = None;
+            }
         }
-        *self = Self::default();
+        self.text.clear();
+        self.burst = false;
+        self.last_at = None;
     }
 }
 
 /// Never turn a lone Enter into a newline. A queued next key proves this is
 /// an interior pasted newline. At the end of a paste, require clipboard
 /// corroboration before consuming Enter; otherwise preserve submit.
+///
+/// The corroborated text is the buffered run *plus* any batch of it already
+/// flushed within [`PASTE_CARRY_GAP`]: the console can hand a clipboard payload
+/// over in several batches, so the newline may arrive after the text was
+/// inserted and the run is already empty.
 pub(super) fn windows_enter_in_paste(
     run: &WindowsPasteRun,
     more_queued: bool,
     clipboard: Option<&str>,
+    now: std::time::Instant,
 ) -> bool {
     if more_queued {
         return true;
     }
-    if run.text.is_empty() {
+    let Some(pasted) = run.paste_tail_text(now) else {
         return false;
-    }
-    run.burst
-        && clipboard.is_some_and(|text| {
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            let prefix = format!("{}\n", run.text);
-            normalized.starts_with(&prefix) && normalized.matches('\n').count() >= 10
-        })
+    };
+    clipboard.is_some_and(|clipboard| {
+        let normalized = clipboard.replace("\r\n", "\n").replace('\r', "\n");
+        let prefix = format!("{pasted}\n");
+        normalized.starts_with(&prefix) && normalized.matches('\n').count() >= 10
+    })
+}
+
+/// Whether the key loop should drain the console natively instead of probing
+/// per character.
+///
+/// Reaching this needs an established paste plus no extension holding raw key
+/// ownership. The caller evaluates it *before* any probe, so the drain cannot be
+/// pre-empted by a stashed event.
+#[cfg(any(windows, test))]
+pub(super) fn should_drain_queued_text(
+    run: &WindowsPasteRun,
+    extension_claimed_keys_empty: bool,
+) -> bool {
+    run.is_paste_candidate() && extension_claimed_keys_empty
 }
 
 /// Whether a bare Enter is pasted content (insert a newline) rather than a
