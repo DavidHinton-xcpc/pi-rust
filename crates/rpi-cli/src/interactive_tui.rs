@@ -2742,6 +2742,10 @@ pub async fn interactive_tui(
                             });
                         pending_event = stashed;
                         if more_queued {
+                            // Real input was queued behind this character, which
+                            // is the only proof that this run is a paste. IME
+                            // commits never reach here: their queue is empty.
+                            windows_paste_run.mark_collected();
                             continue;
                         }
                         // Nothing queued behind it: hand the run over now. This
@@ -2770,12 +2774,11 @@ pub async fn interactive_tui(
                     // Read the clipboard only when some text here could be a
                     // paste still waiting for its trailing newline — the live
                     // run or a batch flushed within `PASTE_CARRY_GAP`.
-                    let clipboard =
-                        if !more_queued && windows_paste_run.paste_tail_text(now).is_some() {
-                            read_clipboard_text()
-                        } else {
-                            None
-                        };
+                    let clipboard = if !more_queued && windows_paste_run.has_paste_evidence(now) {
+                        read_clipboard_text()
+                    } else {
+                        None
+                    };
                     if windows_enter_in_paste(
                         &windows_paste_run,
                         more_queued,

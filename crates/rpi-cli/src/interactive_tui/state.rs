@@ -564,8 +564,12 @@ pub(super) const PASTE_RUN_MIN_CHARS: usize = 128;
 /// clipboard, while a much later typed Enter is no longer mistaken for one.
 pub(super) const PASTE_CARRY_GAP: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Text this run already handed to the editor, kept only while it can still be
-/// the head of a paste whose trailing newline has not arrived yet.
+/// The most recent batch this run already handed to the editor, kept only while
+/// it can still be the head of a paste whose trailing newline has not arrived.
+///
+/// Exactly one batch is kept: the tail is the head of *the current* paste, so a
+/// second paste starting inside [`PASTE_CARRY_GAP`] replaces it rather than
+/// being glued onto it.
 pub(super) struct PasteTail {
     pub(super) text: String,
     pub(super) at: std::time::Instant,
@@ -586,7 +590,16 @@ pub(super) struct WindowsPasteRun {
     pub(super) text: String,
     pub(super) last_at: Option<std::time::Instant>,
     pub(super) burst: bool,
-    /// Batches of this run already flushed within [`PASTE_CARRY_GAP`].
+    /// Set once the console proved this run is a paste: real input was still
+    /// queued behind one of its characters.
+    ///
+    /// This — not elapsed time, and not run length — is what separates a
+    /// clipboard payload from an IME commit. A committed word arrives with an
+    /// empty queue, so it never gets this flag, never leaves a [`PasteTail`]
+    /// behind, and can never absorb the Enter that submits it.
+    pub(super) collected: bool,
+    /// The most recent batch of this run already handed to the editor, kept
+    /// while a trailing newline could still belong to it.
     pub(super) tail: Option<PasteTail>,
 }
 
@@ -616,6 +629,16 @@ impl WindowsPasteRun {
         !self.is_paste_candidate()
     }
 
+    /// Record that the console proved this run is a paste, because real input
+    /// was still queued behind one of its characters.
+    ///
+    /// Callers set this from the queue-probe path and from the native batch
+    /// drain. The typing path — where the queue was empty — deliberately never
+    /// sets it.
+    pub(super) fn mark_collected(&mut self) {
+        self.collected = true;
+    }
+
     /// Buffer one character of a paste run.
     pub(super) fn feed(&mut self, ch: char, now: std::time::Instant) {
         if self
@@ -637,25 +660,39 @@ impl WindowsPasteRun {
                 if !text.is_empty() {
                     self.text.push_str(&text);
                     self.last_at = Some(std::time::Instant::now());
+                    self.mark_collected();
                 }
             }
         }
     }
 
+    /// Whether an Enter arriving now could still belong to a paste: a batch was
+    /// flushed recently, or text is being collected right now.
+    ///
+    /// Cheap pre-check for the caller, which would otherwise clone the tail on
+    /// every Enter just to learn that there is nothing to corroborate.
+    pub(super) fn has_paste_evidence(&self, now: std::time::Instant) -> bool {
+        let tail_fresh = self
+            .tail
+            .as_ref()
+            .is_some_and(|tail| now.duration_since(tail.at) <= PASTE_CARRY_GAP);
+        tail_fresh || (self.burst && !self.text.is_empty())
+    }
+
     /// Text a trailing newline could still belong to: what is buffered now plus
-    /// whatever this run already flushed within [`PASTE_CARRY_GAP`].
+    /// the most recent batch this run already flushed within
+    /// [`PASTE_CARRY_GAP`].
     ///
     /// `None` means nothing here was a paste, so an Enter cannot be pasted
     /// content.
     pub(super) fn paste_tail_text(&self, now: std::time::Instant) -> Option<String> {
+        if !self.has_paste_evidence(now) {
+            return None;
+        }
         let tail = self
             .tail
             .as_ref()
             .filter(|tail| now.duration_since(tail.at) <= PASTE_CARRY_GAP);
-        let buffered = self.burst && !self.text.is_empty();
-        if tail.is_none() && !buffered {
-            return None;
-        }
         let mut text = tail.map(|tail| tail.text.clone()).unwrap_or_default();
         text.push_str(&self.text);
         Some(text)
@@ -663,34 +700,30 @@ impl WindowsPasteRun {
 
     /// Hand the buffered run to the editor.
     ///
-    /// A burst keeps its text as a [`PasteTail`] so a trailing newline that the
-    /// console delivers in a later batch is still attributed to this paste
-    /// instead of submitting the prompt.
+    /// Only a run the console proved is a paste keeps its text as a
+    /// [`PasteTail`], so a trailing newline delivered in a later batch is still
+    /// attributed to that paste instead of submitting the prompt. A short IME
+    /// commit is a burst too — its characters arrive with no gap at all — but
+    /// it was collected from an empty queue, so it leaves no tail and its Enter
+    /// still submits.
     pub(super) fn flush(&mut self, editor: &Editor, now: std::time::Instant) {
         if !self.text.is_empty() {
             editor.handle_paste(&self.text);
-            if self.burst {
-                let extend = self
-                    .tail
-                    .as_ref()
-                    .is_some_and(|tail| now.duration_since(tail.at) <= PASTE_CARRY_GAP);
-                let text = std::mem::take(&mut self.text);
-                if extend {
-                    if let Some(tail) = self.tail.as_mut() {
-                        tail.text.push_str(&text);
-                        tail.at = now;
-                    } else {
-                        self.tail = Some(PasteTail { text, at: now });
-                    }
-                } else {
-                    self.tail = Some(PasteTail { text, at: now });
-                }
+            if self.burst && self.collected {
+                // Replace, never append: the tail is the head of *this* paste,
+                // so a second paste inside the window must not be glued onto it
+                // — a concatenated prefix can never match either clipboard.
+                self.tail = Some(PasteTail {
+                    text: std::mem::take(&mut self.text),
+                    at: now,
+                });
             } else {
                 self.tail = None;
             }
         }
         self.text.clear();
         self.burst = false;
+        self.collected = false;
         self.last_at = None;
     }
 }

@@ -3434,6 +3434,8 @@ fn paste_split_just_before_its_trailing_enter_is_not_a_submit() {
     for ch in "alpha".chars() {
         run.feed(ch, now);
     }
+    // The console proved this is a paste: input was still queued behind it.
+    run.mark_collected();
     run.flush(&editor, now);
     assert_eq!(editor.get_text(), "alpha");
     assert!(!run.is_buffering(), "the text batch is already inserted");
@@ -3452,17 +3454,116 @@ fn paste_split_just_before_its_trailing_enter_is_not_a_submit() {
         !windows_enter_in_paste(&run, false, Some(clipboard), typed_at),
         "a typed Enter after the carry window still submits"
     );
+}
 
-    // An IME commit is not in the clipboard, so its Enter still submits even
-    // immediately after the commit is inserted.
+/// The behaviour this whole change exists for: an IME commit must never absorb
+/// the Enter that submits it. Crucially this has to hold even when the clipboard
+/// happens to start with the committed word — otherwise the guard only works by
+/// accident, because the test clipboard did not match.
+#[test]
+fn ime_commit_then_enter_submits_even_when_the_clipboard_starts_with_it() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+
+    // Deliberately corroborating: same head word, and enough newlines for the
+    // clipboard check to pass if it were ever consulted.
+    let clipboard = "我们\n第二行\n3\n4\n5\n6\n7\n8\n9\n10\n11\n";
+
     let mut ime = WindowsPasteRun::default();
     ime.feed('我', now);
     ime.feed('们', now);
+    // The typing path: the queue was empty, so nothing was collected.
     ime.flush(&editor, now);
+
+    assert_eq!(editor.get_text(), "我们");
+    assert!(
+        !ime.has_paste_evidence(now),
+        "an IME commit must leave no paste evidence behind"
+    );
+    assert!(
+        ime.paste_tail_text(now).is_none(),
+        "an IME commit must not keep a paste tail"
+    );
+
+    let entered_at = now + std::time::Duration::from_millis(80);
     assert!(
         !windows_enter_in_paste(&ime, false, Some(clipboard), entered_at),
-        "an IME commit must never absorb the Enter that submits it"
+        "an IME commit must never absorb the Enter that submits it, even when \
+         the clipboard starts with the committed word"
     );
+}
+
+/// Two pastes inside the carry window are two separate pastes. Gluing the second
+/// batch onto the first makes the corroborated prefix match neither clipboard,
+/// which is exactly how a trailing Enter slips through and submits the prompt.
+#[test]
+fn consecutive_pastes_each_keep_their_own_trailing_enter() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let clipboard_a = "AAAA\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    let clipboard_b = "BBBB\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+
+    let mut run = WindowsPasteRun::default();
+    for ch in "AAAA".chars() {
+        run.feed(ch, now);
+    }
+    run.mark_collected();
+    run.flush(&editor, now);
+
+    // Second paste starts inside `PASTE_CARRY_GAP`.
+    let second_at = now + std::time::Duration::from_millis(120);
+    for ch in "BBBB".chars() {
+        run.feed(ch, second_at);
+    }
+    run.mark_collected();
+    run.flush(&editor, second_at);
+    assert_eq!(editor.get_text(), "AAAABBBB");
+
+    // The tail must describe the *second* paste, not a concatenation of both.
+    assert_eq!(
+        run.paste_tail_text(second_at).as_deref(),
+        Some("BBBB"),
+        "the tail has to be the head of the most recent paste"
+    );
+
+    let enter_at = second_at + std::time::Duration::from_millis(80);
+    assert!(
+        windows_enter_in_paste(&run, false, Some(clipboard_b), enter_at),
+        "the second paste's trailing Enter must not submit"
+    );
+    // And it must not corroborate against the *first* clipboard either.
+    assert!(
+        !windows_enter_in_paste(&run, false, Some(clipboard_a), enter_at),
+        "a stale clipboard must not be accepted as evidence"
+    );
+}
+
+/// A paste that ends without a trailing newline must still leave its text
+/// available: the console can split the payload anywhere, not only before the
+/// final newline.
+#[test]
+fn paste_tail_is_dropped_once_the_carry_window_expires() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let clipboard = "alpha\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n";
+
+    let mut run = WindowsPasteRun::default();
+    for ch in "alpha".chars() {
+        run.feed(ch, now);
+    }
+    run.mark_collected();
+    run.flush(&editor, now);
+
+    assert!(run.has_paste_evidence(now));
+    let expired = now + PASTE_CARRY_GAP + std::time::Duration::from_millis(1);
+    assert!(!run.has_paste_evidence(expired));
+    assert!(run.paste_tail_text(expired).is_none());
+    assert!(!windows_enter_in_paste(
+        &run,
+        false,
+        Some(clipboard),
+        expired
+    ));
 }
 
 /// Once a run crosses the fold threshold the loop must stop probing per
