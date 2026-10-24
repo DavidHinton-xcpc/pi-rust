@@ -703,30 +703,51 @@ impl WindowsPasteRun {
         })
     }
 
-    /// Texts a trailing newline could still belong to, longest first: all
-    /// batches flushed within the carry window concatenated, then the live
-    /// run, then the most recent flushed batch alone.
+    /// Texts a trailing newline could still belong to, longest first.
     ///
     /// Empty means nothing here was a paste, so an Enter cannot be pasted
-    /// content. Returning the candidates separately — rather than one glued
-    /// string — is what keeps one paste's continuation (accumulate) apart from
-    /// two pastes' boundary (last batch alone): the caller matches each against
-    /// the clipboard and any match wins.
+    /// content. The candidates depend on what the run is doing:
+    ///
+    /// - **Still buffering** (live text): continuations — each carried variant
+    ///   joined with the live text, then the live text alone (the head of a
+    ///   *new* paste). The carry **by itself is deliberately absent**: once
+    ///   the user edits on top of a completed paste, the live text continues
+    ///   neither carried variant, and an old prefix match must not override
+    ///   those edits by swallowing the Enter that submits them.
+    /// - **Idle** (nothing buffered): a trailing batch may still arrive, so
+    ///   the carried window corroborates on its own — whole, then the most
+    ///   recent batch alone (the head of a new paste).
+    /// - **No carry**: a live run corroborates only when its text already
+    ///   contains a newline — the one thing an IME commit never produces. A
+    ///   coalesced commit earns `collected` from queue occupancy just like a
+    ///   paste, so length or proof alone cannot separate them; the first
+    ///   batch of a real multi-line paste (its trailing Enter queued behind
+    ///   the text) does contain pasted newlines and still corroborates.
+    ///
+    /// Returning the candidates separately — rather than one glued string —
+    /// is what keeps one paste's continuation apart from two pastes'
+    /// boundary: the caller matches each against the clipboard and any match
+    /// wins.
     pub(super) fn paste_tail_texts(&self, now: std::time::Instant) -> Vec<String> {
+        let live = self.text.as_str();
         let Some(tail) = self.fresh_tail(now) else {
+            if live.contains('\n') {
+                return vec![live.to_string()];
+            }
             return Vec::new();
         };
-        let mut candidates = Vec::with_capacity(3);
-        if !tail.text.is_empty() {
-            candidates.push(tail.text.clone());
+        if live.is_empty() {
+            let mut candidates = vec![tail.text.clone()];
+            if tail.last != tail.text {
+                candidates.push(tail.last.clone());
+            }
+            return candidates;
         }
-        if !self.text.is_empty() {
-            candidates.push(self.text.clone());
+        let mut candidates = vec![format!("{}{live}", tail.text)];
+        if tail.last != tail.text {
+            candidates.push(format!("{}{live}", tail.last));
         }
-        if !tail.last.is_empty() {
-            candidates.push(tail.last.clone());
-        }
-        candidates.dedup();
+        candidates.push(live.to_string());
         candidates
     }
 
@@ -776,11 +797,12 @@ impl WindowsPasteRun {
 /// an interior pasted newline. At the end of a paste, require clipboard
 /// corroboration before consuming Enter; otherwise preserve submit.
 ///
-/// Corroboration is per candidate: everything flushed within the carry window
-/// concatenated (the continuation of one payload), the live run, and the most
-/// recent batch alone (the head of a *new* paste). Any single candidate
-/// matching the clipboard prefix proves the Enter is pasted content, which
-/// keeps one paste's split batches and two consecutive pastes both working.
+/// Corroboration tries the candidates from [`WindowsPasteRun::paste_tail_texts`]
+/// in turn: while the run is still buffering, continuations of the carried
+/// paste joined with the live text, or the live text alone (the head of a new
+/// paste); while it is idle, the carried window itself. When live edits match
+/// no candidate, the carried paste has already been completed and consumed,
+/// so the Enter submits instead of inserting another newline.
 pub(super) fn windows_enter_in_paste(
     run: &WindowsPasteRun,
     more_queued: bool,

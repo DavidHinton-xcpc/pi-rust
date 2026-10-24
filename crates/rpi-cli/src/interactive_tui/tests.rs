@@ -3967,3 +3967,72 @@ fn review_pr91_single_character_ime_batches_leave_no_tail() {
     assert_eq!(editor.get_text(), "我们");
     assert!(!run.has_paste_evidence(now + std::time::Duration::from_millis(200)));
 }
+
+// Re-review probes for PR #91: boundary cases of the candidate construction.
+#[test]
+fn rereview_pr91_first_paste_with_queued_trailing_enter_does_not_submit() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let text = "alpha\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+    let clipboard = format!("{text}\n");
+    assert!(review_pr91_deliver_batch(
+        &mut run, &editor, text, true, now
+    ));
+    assert!(
+        run.tail.is_none(),
+        "nothing has been flushed before the queued Enter"
+    );
+    assert_eq!(run.text, text);
+    assert!(run.has_paste_evidence(now));
+    assert!(
+        windows_enter_in_paste(&run, false, Some(&clipboard), now),
+        "a live first paste must be corroborated without requiring an older flushed tail"
+    );
+}
+
+#[test]
+fn rereview_pr91_split_paste_includes_both_flushed_and_live_text() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "alphabeta\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    review_pr91_deliver_batch(&mut run, &editor, "alpha", false, now);
+    let later = now + std::time::Duration::from_millis(10);
+    assert!(review_pr91_deliver_batch(
+        &mut run, &editor, "beta", true, later
+    ));
+    assert_eq!(run.tail.as_ref().unwrap().text, "alpha");
+    assert_eq!(run.text, "beta");
+    assert!(
+        windows_enter_in_paste(&run, false, Some(clipboard), later),
+        "the clipboard prefix must include both alpha (flushed) and beta (still buffered)"
+    );
+}
+
+#[test]
+fn rereview_pr91_completed_paste_must_not_swallow_the_next_edited_submit() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let text = "alpha\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+    let clipboard = format!("{text}\n");
+    review_pr91_deliver_batch(&mut run, &editor, text, false, now);
+    let pasted_enter = now + std::time::Duration::from_millis(10);
+    assert!(windows_enter_in_paste(
+        &run,
+        false,
+        Some(&clipboard),
+        pasted_enter
+    ));
+    run.feed('\n', pasted_enter); // The actual Enter handler accepts the pasted newline.
+    let edited_at = now + std::time::Duration::from_millis(80);
+    assert!(review_pr91_deliver_batch(
+        &mut run, &editor, "X", true, edited_at
+    ));
+    assert_eq!(run.text, "\nX");
+    assert!(
+        !windows_enter_in_paste(&run, false, Some(&clipboard), edited_at),
+        "a stale matching prefix must not override the unrelated live edit when Enter submits"
+    );
+}
