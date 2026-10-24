@@ -3481,7 +3481,7 @@ fn ime_commit_then_enter_submits_even_when_the_clipboard_starts_with_it() {
         "an IME commit must leave no paste evidence behind"
     );
     assert!(
-        ime.paste_tail_text(now).is_none(),
+        ime.paste_tail_texts(now).is_empty(),
         "an IME commit must not keep a paste tail"
     );
 
@@ -3519,11 +3519,11 @@ fn consecutive_pastes_each_keep_their_own_trailing_enter() {
     run.flush(&editor, second_at);
     assert_eq!(editor.get_text(), "AAAABBBB");
 
-    // The tail must describe the *second* paste, not a concatenation of both.
-    assert_eq!(
-        run.paste_tail_text(second_at).as_deref(),
-        Some("BBBB"),
-        "the tail has to be the head of the most recent paste"
+    // The candidates must include the second paste alone, so its own trailing
+    // Enter corroborates — even though the first paste is still carried too.
+    assert!(
+        run.paste_tail_texts(second_at).iter().any(|t| t == "BBBB"),
+        "the tail has to include the head of the most recent paste alone"
     );
 
     let enter_at = second_at + std::time::Duration::from_millis(80);
@@ -3557,7 +3557,7 @@ fn paste_tail_is_dropped_once_the_carry_window_expires() {
     assert!(run.has_paste_evidence(now));
     let expired = now + PASTE_CARRY_GAP + std::time::Duration::from_millis(1);
     assert!(!run.has_paste_evidence(expired));
-    assert!(run.paste_tail_text(expired).is_none());
+    assert!(run.paste_tail_texts(expired).is_empty());
     assert!(!windows_enter_in_paste(
         &run,
         false,
@@ -3830,4 +3830,140 @@ fn ask_user_bridge_answers_and_cancels_by_request_id() {
             "op": "open", "requestId": "r4", "ui": {"kind": "input"}
         }))
         .is_err());
+}
+
+// Local review probes for PR #91. Exercise the real state/probe methods using
+// the Press/Release queue consumed by the Windows text-key branch.
+fn review_pr91_deliver_batch(
+    run: &mut WindowsPasteRun,
+    editor: &rpi_tui::Editor,
+    text: &str,
+    trailing_enter: bool,
+    now: std::time::Instant,
+) -> bool {
+    let mut queue = std::collections::VecDeque::new();
+    for ch in text.chars() {
+        for kind in [KeyEventKind::Press, KeyEventKind::Release] {
+            queue.push_back(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+                kind,
+            )));
+        }
+    }
+    if trailing_enter {
+        queue.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+    }
+    let mut pending = None;
+    while let Some(event) = pending.take().or_else(|| queue.pop_front()) {
+        let Event::Key(key) = event else {
+            unreachable!()
+        };
+        if !should_dispatch_key(key.kind) {
+            continue;
+        }
+        if key.code == KeyCode::Enter {
+            assert!(queue.is_empty());
+            return true;
+        }
+        let KeyCode::Char(ch) = key.code else {
+            unreachable!()
+        };
+        run.feed(ch, now);
+        assert!(
+            run.probe_needed(),
+            "these short batches do not use the native drain"
+        );
+        let (more, stashed) = probe_paste_input(pending.take(), || queue.pop_front());
+        pending = stashed;
+        if more {
+            run.mark_collected();
+        } else {
+            run.flush(editor, now);
+        }
+    }
+    false
+}
+
+#[test]
+fn review_pr91_one_paste_split_into_three_queue_batches_keeps_its_prefix() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "alphabeta\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    review_pr91_deliver_batch(&mut run, &editor, "alpha", false, now);
+    review_pr91_deliver_batch(
+        &mut run,
+        &editor,
+        "beta",
+        false,
+        now + std::time::Duration::from_millis(10),
+    );
+    assert_eq!(editor.get_text(), "alphabeta");
+    assert!(
+        windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            now + std::time::Duration::from_millis(20)
+        ),
+        "the third batch's Enter must not submit a partially received paste"
+    );
+}
+
+#[test]
+fn review_pr91_second_paste_enter_ignores_the_previous_paste_tail() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "BBBB\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    review_pr91_deliver_batch(&mut run, &editor, "AAAA", false, now);
+    let second_at = now + std::time::Duration::from_millis(20);
+    assert!(review_pr91_deliver_batch(
+        &mut run, &editor, "BBBB", true, second_at
+    ));
+    assert_eq!(run.text, "BBBB");
+    assert!(
+        windows_enter_in_paste(&run, false, Some(clipboard), second_at),
+        "a previous paste's tail must not prevent this paste's newline from matching"
+    );
+}
+
+#[test]
+fn review_pr91_queued_ime_commit_can_submit_after_two_hundred_ms() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, now);
+    assert_eq!(editor.get_text(), "我们");
+    assert!(
+        !windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            now + std::time::Duration::from_millis(200)
+        ),
+        "queued IME characters must not swallow a subsequent typed Enter"
+    );
+}
+
+#[test]
+fn review_pr91_single_character_ime_batches_leave_no_tail() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    review_pr91_deliver_batch(&mut run, &editor, "我", false, now);
+    review_pr91_deliver_batch(
+        &mut run,
+        &editor,
+        "们",
+        false,
+        now + std::time::Duration::from_millis(1),
+    );
+    assert_eq!(editor.get_text(), "我们");
+    assert!(!run.has_paste_evidence(now + std::time::Duration::from_millis(200)));
 }
