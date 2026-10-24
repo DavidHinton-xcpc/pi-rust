@@ -580,14 +580,23 @@ pub(super) const PASTE_MATURE_CARRY_GAP: std::time::Duration =
 /// pastes inside the window must not be glued, so the most recent batch is also
 /// kept alone (`last`): the corroborated text is each candidate in turn, and
 /// whichever matches the clipboard wins.
+///
+/// Each variant carries its **own** lifetime: a batch that reached the fold
+/// threshold on its own keeps the long window, one that only adds a few
+/// characters to an old accumulated paste keeps the short one. Maturity is
+/// decided per variant so an older large paste cannot promote a new short
+/// input (a coalesced IME commit) to the 500 ms window.
 pub(super) struct PasteTail {
     /// All batches flushed within the carry window, concatenated.
     pub(super) text: String,
     /// The most recent batch alone.
     pub(super) last: String,
-    /// Whether the accumulated text reached the fold threshold: mature pastes
-    /// get the longer carry window.
+    /// Whether the accumulated text reached the fold threshold: the
+    /// accumulated variant gets the longer carry window.
     pub(super) mature: bool,
+    /// Whether the most recent batch alone reached the fold threshold: the
+    /// `last` variant gets its own, independently computed window.
+    pub(super) last_mature: bool,
     pub(super) at: std::time::Instant,
 }
 
@@ -682,25 +691,31 @@ impl WindowsPasteRun {
         }
     }
 
-    /// Whether an Enter arriving now could still belong to a paste: a batch was
-    /// flushed recently, or text is being collected right now.
+    /// Whether an Enter arriving now could still belong to a paste: a tail
+    /// variant was flushed recently, or text is being collected right now.
     ///
     /// Cheap pre-check for the caller, which would otherwise clone the tail on
     /// every Enter just to learn that there is nothing to corroborate.
     pub(super) fn has_paste_evidence(&self, now: std::time::Instant) -> bool {
-        self.fresh_tail(now).is_some() || (self.burst && !self.text.is_empty())
+        self.tail.as_ref().is_some_and(|tail| {
+            Self::variant_fresh(tail, tail.mature, now)
+                || Self::variant_fresh(tail, tail.last_mature, now)
+        }) || (self.burst && !self.text.is_empty())
     }
 
-    /// The still-fresh tail, using the carry window its maturity earned.
-    fn fresh_tail(&self, now: std::time::Instant) -> Option<&PasteTail> {
-        self.tail.as_ref().filter(|tail| {
-            let gap = if tail.mature {
-                PASTE_MATURE_CARRY_GAP
-            } else {
-                PASTE_CARRY_GAP
-            };
-            now.duration_since(tail.at) <= gap
-        })
+    /// Whether one tail variant is still inside the carry window its own
+    /// maturity earned.
+    ///
+    /// Both variants share the flush instant; only the window differs, and it
+    /// is decided per variant: a short batch flushed on top of an old large
+    /// paste must not inherit the large paste's 500 ms window.
+    fn variant_fresh(tail: &PasteTail, mature: bool, now: std::time::Instant) -> bool {
+        let gap = if mature {
+            PASTE_MATURE_CARRY_GAP
+        } else {
+            PASTE_CARRY_GAP
+        };
+        now.duration_since(tail.at) <= gap
     }
 
     /// Texts a trailing newline could still belong to, longest first.
@@ -708,21 +723,26 @@ impl WindowsPasteRun {
     /// Empty means nothing here was a paste, so an Enter cannot be pasted
     /// content. The candidates depend on what the run is doing:
     ///
-    /// - **Still buffering** (live text): continuations — each carried variant
-    ///   joined with the live text, then the live text alone (the head of a
-    ///   *new* paste). The carry **by itself is deliberately absent**: once
+    /// - **Still buffering** (live text): continuations — each *fresh* carried
+    ///   variant joined with the live text, then the live text alone (the head
+    ///   of a *new* paste). The carry **by itself is deliberately absent**: once
     ///   the user edits on top of a completed paste, the live text continues
     ///   neither carried variant, and an old prefix match must not override
     ///   those edits by swallowing the Enter that submits them.
     /// - **Idle** (nothing buffered): a trailing batch may still arrive, so
-    ///   the carried window corroborates on its own — whole, then the most
-    ///   recent batch alone (the head of a new paste).
-    /// - **No carry**: a live run corroborates only when its text already
-    ///   contains a newline — the one thing an IME commit never produces. A
-    ///   coalesced commit earns `collected` from queue occupancy just like a
-    ///   paste, so length or proof alone cannot separate them; the first
-    ///   batch of a real multi-line paste (its trailing Enter queued behind
-    ///   the text) does contain pasted newlines and still corroborates.
+    ///   each fresh carried variant corroborates on its own — whole, then the
+    ///   most recent batch alone (the head of a new paste). Each variant only
+    ///   outlives the window its own length earned.
+    /// - **No carry**: a live run corroborates when the console proved it is a
+    ///   paste (`collected`) or its text already contains a newline. Queue
+    ///   occupancy alone cannot separate a paste's first line from a coalesced
+    ///   IME commit, but it does not have to: the last character of an IME
+    ///   batch always finds an empty queue behind it, so the batch flushes
+    ///   *before* its submitting Enter is classified — a live `collected` run
+    ///   at Enter time means real input was queued behind that very character,
+    ///   which an IME commit never produces. The newline gate covers the
+    ///   console-batch boundary where the paste's first line ends before any
+    ///   newline has been accepted into the run.
     ///
     /// Returning the candidates separately — rather than one glued string —
     /// is what keeps one paste's continuation apart from two pastes'
@@ -730,21 +750,27 @@ impl WindowsPasteRun {
     /// wins.
     pub(super) fn paste_tail_texts(&self, now: std::time::Instant) -> Vec<String> {
         let live = self.text.as_str();
-        let Some(tail) = self.fresh_tail(now) else {
-            if live.contains('\n') {
+        let Some(tail) = self.tail.as_ref() else {
+            if self.collected || live.contains('\n') {
                 return vec![live.to_string()];
             }
             return Vec::new();
         };
         if live.is_empty() {
-            let mut candidates = vec![tail.text.clone()];
-            if tail.last != tail.text {
+            let mut candidates = Vec::new();
+            if Self::variant_fresh(tail, tail.mature, now) {
+                candidates.push(tail.text.clone());
+            }
+            if Self::variant_fresh(tail, tail.last_mature, now) && tail.last != tail.text {
                 candidates.push(tail.last.clone());
             }
             return candidates;
         }
-        let mut candidates = vec![format!("{}{live}", tail.text)];
-        if tail.last != tail.text {
+        let mut candidates = Vec::new();
+        if Self::variant_fresh(tail, tail.mature, now) {
+            candidates.push(format!("{}{live}", tail.text));
+        }
+        if Self::variant_fresh(tail, tail.last_mature, now) && tail.last != tail.text {
             candidates.push(format!("{}{live}", tail.last));
         }
         candidates.push(live.to_string());
@@ -769,14 +795,16 @@ impl WindowsPasteRun {
                 // independent pastes is not decided here — the candidate list
                 // keeps the last batch alone for exactly that case.
                 let batch = std::mem::take(&mut self.text);
-                let carried = match self.fresh_tail(now) {
-                    Some(tail) => tail.text.clone(),
-                    None => String::new(),
-                };
+                let carried = self
+                    .tail
+                    .as_ref()
+                    .filter(|tail| Self::variant_fresh(tail, tail.mature, now))
+                    .map(|tail| tail.text.clone())
+                    .unwrap_or_default();
                 let text = format!("{carried}{batch}");
-                let mature =
-                    text.chars().count() >= PASTE_RUN_MIN_CHARS || self.is_paste_candidate();
+                let mature = text.chars().count() >= PASTE_RUN_MIN_CHARS;
                 self.tail = Some(PasteTail {
+                    last_mature: batch.chars().count() >= PASTE_RUN_MIN_CHARS,
                     text,
                     last: batch,
                     mature,

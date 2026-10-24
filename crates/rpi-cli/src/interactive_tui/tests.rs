@@ -4036,3 +4036,51 @@ fn rereview_pr91_completed_paste_must_not_swallow_the_next_edited_submit() {
         "a stale matching prefix must not override the unrelated live edit when Enter submits"
     );
 }
+
+// Carry-review probes for PR #91: batch boundaries of the first line and
+// per-variant maturity of the tail.
+#[test]
+fn carry_review_pr91_first_line_can_end_at_a_console_batch_boundary() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "alpha\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    // Only the first line and its Enter have reached the queue. The rest of
+    // this same clipboard payload will arrive in a subsequent console batch.
+    assert!(review_pr91_deliver_batch(
+        &mut run, &editor, "alpha", true, now
+    ));
+    assert!(run.tail.is_none());
+    assert_eq!(run.text, "alpha");
+    assert!(run.burst && run.collected);
+    assert!(run.has_paste_evidence(now));
+    assert!(
+        windows_enter_in_paste(&run, false, Some(clipboard), now),
+        "the first pasted newline must not submit just because later lines are in another batch"
+    );
+}
+
+#[test]
+fn carry_review_pr91_a_prior_large_paste_must_not_extend_a_new_ime_commits_window() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    // An already completed large paste leaves mature carry. It has no trailing
+    // newline, so there is no pending pasted Enter waiting to be attributed.
+    for _ in 0..PASTE_RUN_MIN_CHARS {
+        run.feed('x', now);
+    }
+    run.mark_collected();
+    run.flush(&editor, now);
+    assert!(run.tail.as_ref().unwrap().mature);
+    let commit_at = now + std::time::Duration::from_millis(50);
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, commit_at);
+    assert_eq!(run.tail.as_ref().unwrap().last, "我们");
+    assert!(run.text.is_empty());
+    let clipboard = "我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    let typed_enter = commit_at + std::time::Duration::from_millis(200);
+    assert!(
+        !windows_enter_in_paste(&run, false, Some(clipboard), typed_enter),
+        "the previous paste must not give a new two-character IME commit a 500ms carry window"
+    );
+}
