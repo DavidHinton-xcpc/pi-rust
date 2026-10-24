@@ -116,6 +116,15 @@ pub(super) async fn switch_to_session(
         add_error_message(chat, &format!("Could not switch session: {error}"));
         return false;
     }
+    // Same late-result race as `/new`: a running user `!command` finishes into
+    // the live lane, which would be the NEW session after this swap.
+    if state.user_bash_running() {
+        add_note_message(
+            chat,
+            "Wait for the !command to finish before switching sessions, or press Esc to cancel it.",
+        );
+        return false;
+    }
     let cwd_str = cwd.to_string_lossy().to_string();
     match crate::session::open_session_by_id_in_dir(id, &cwd_str, &state.session_dir).await {
         Ok(new_session) => {
@@ -188,6 +197,15 @@ pub(super) async fn import_session(
         add_error_message(chat, &format!("Could not import session: {error}"));
         return;
     }
+    // Same late-result race as `/new`: a running user `!command` finishes into
+    // the live lane, which would be the NEW session after this swap.
+    if state.user_bash_running() {
+        add_note_message(
+            chat,
+            "Wait for the !command to finish before importing a session, or press Esc to cancel it.",
+        );
+        return;
+    }
     let result =
         crate::session::import_session_file(src, &cwd.to_string_lossy(), &state.session_dir).await;
     let new_session = match result {
@@ -238,6 +256,15 @@ pub(super) async fn fork_session(
         add_error_message(chat, &format!("Could not fork session: {error}"));
         return;
     }
+    // Same late-result race as `/new`: a running user `!command` finishes into
+    // the live lane, which would be the NEW session after this swap.
+    if state.user_bash_running() {
+        add_note_message(
+            chat,
+            "Wait for the !command to finish before forking a session, or press Esc to cancel it.",
+        );
+        return;
+    }
     let new_session = match crate::session::fork_session_storage(
         harness,
         &cwd.to_string_lossy(),
@@ -283,6 +310,11 @@ pub(super) async fn fork_session(
 /// follow the swap), rebuilds the transcript with the session's REAL capability
 /// snapshot, and drops every per-session counter in the footer.
 ///
+/// The persistence policy of the run is honoured: when the current session is
+/// ephemeral (`--no-session`), the fresh session is another in-memory one —
+/// nothing may land on disk, and `/new` must never turn an explicit
+/// no-persistence choice into persistent chat history.
+///
 /// The session being left behind is **not** deleted: its file stays on disk and
 /// remains reachable through `/session`. Removing user data is not something
 /// `/new` should do implicitly.
@@ -305,28 +337,49 @@ pub(super) async fn start_new_session(
         state.set_status(RunStatus::Idle);
         return false;
     }
-    let dir = &state.session_dir;
-    if let Err(error) = std::fs::create_dir_all(dir) {
-        add_error_message(
+    // A user `!command` writes its result through the live lane when it
+    // finishes (`UserBashFinished`), with no originating-session identity.
+    // Swapping the session underneath it would record that result in the NEW
+    // conversation, so the switch waits for the shell run to finish. Merely
+    // cancelling would not close the race: the completion is still coming.
+    if state.user_bash_running() {
+        add_note_message(
             chat,
-            &format!(
-                "Could not create session dir {}: {error} — check write permissions",
-                dir.display()
-            ),
+            "Wait for the !command to finish before starting a new session, or press Esc to cancel it.",
         );
-        state.set_status(RunStatus::Idle);
         return false;
     }
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let new_session = match crate::session::create_jsonl_session(dir, &cwd_str).await {
-        Ok(session) => session,
-        Err(error) => {
+    let ephemeral = harness.session().storage().is_ephemeral();
+    let new_session = if ephemeral {
+        // `--no-session` chose no persistence; the fresh session honours that
+        // choice instead of silently writing a JSONL file to disk.
+        crate::session::ephemeral_session()
+    } else {
+        let dir = &state.session_dir;
+        if let Err(error) = std::fs::create_dir_all(dir) {
             add_error_message(
                 chat,
-                &format!("Could not create session: {error} — the current session is still active"),
+                &format!(
+                    "Could not create session dir {}: {error} — check write permissions",
+                    dir.display()
+                ),
             );
             state.set_status(RunStatus::Idle);
             return false;
+        }
+        let cwd_str = cwd.to_string_lossy().to_string();
+        match crate::session::create_jsonl_session(dir, &cwd_str).await {
+            Ok(session) => session,
+            Err(error) => {
+                add_error_message(
+                    chat,
+                    &format!(
+                        "Could not create session: {error} — the current session is still active"
+                    ),
+                );
+                state.set_status(RunStatus::Idle);
+                return false;
+            }
         }
     };
     let new_id = new_session.storage().metadata().id.clone();
@@ -359,7 +412,11 @@ pub(super) async fn start_new_session(
     )
     .await;
     state.set_status(RunStatus::Idle);
-    add_note_message(chat, &format!("Started new session {new_id}."));
+    if ephemeral {
+        add_note_message(chat, "Started a new ephemeral session (--no-session).");
+    } else {
+        add_note_message(chat, &format!("Started new session {new_id}."));
+    }
     true
 }
 

@@ -422,6 +422,100 @@ fn jsonl_files_under(root: &std::path::Path) -> Vec<String> {
     found
 }
 
+/// A fresh in-memory session identical in shape to the one `--no-session`
+/// builds (`session.rs`'s `ephemeral_session`), so the regression below
+/// exercises the real persistence policy, not a hand-picked double.
+fn ephemeral_harness_session() -> rpi_harness::session::Session {
+    let storage = rpi_harness::session::memory::InMemorySessionStorage::new(
+        rpi_harness::session::types::SessionMetadata {
+            id: "ephemeral".into(),
+            created_at: 0,
+            parent_session_id: None,
+        },
+        Arc::new(rpi_harness::session::memory::SystemClock),
+        Arc::new(rpi_harness::session::session::DefaultIdGenerator::new()),
+    );
+    rpi_harness::session::Session::new(Arc::new(storage), None)
+}
+
+// Local review probes for PR #98 (session-boundary regressions), kept as
+// regression tests. They drive the real `start_new_session` swap path with
+// the same in-memory storage `--no-session` installs; no network, real
+// filesystem confined to a tempdir.
+
+#[tokio::test]
+async fn review_pr98_new_keeps_an_ephemeral_session_off_disk() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness
+        .set_session(ephemeral_harness_session())
+        .await
+        .unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    let context = rpi_extensions::ToolCallContext::new(cwd.to_string_lossy());
+    assert!(!root.exists());
+    assert!(
+        start_new_session(
+            &harness,
+            &lane,
+            cwd,
+            &state.chat_container,
+            &state,
+            &context
+        )
+        .await
+    );
+    lane.append_message(user_message_with_images(
+        "review-only ephemeral message",
+        vec![],
+    ))
+    .await
+    .unwrap();
+    let files = jsonl_files_under(cwd);
+    assert!(
+        files.is_empty(),
+        "--no-session must remain in memory after /new; persisted files: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn review_pr98_new_must_not_switch_under_an_unscoped_user_bash_run() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let previous_id = source.storage().metadata().id.clone();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(source).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    let context = rpi_extensions::ToolCallContext::new(cwd.to_string_lossy());
+    let cancellation = state.begin_user_bash();
+    assert!(*state.status.lock().unwrap() == RunStatus::Idle);
+    let switched = start_new_session(
+        &harness,
+        &lane,
+        cwd,
+        &state.chat_container,
+        &state,
+        &context,
+    )
+    .await;
+    // UserBashFinished has no originating-session field and appends through
+    // this same live lane. It must not straddle a session swap uncoordinated.
+    assert!(
+        !switched
+            || cancellation.is_cancelled()
+            || harness.session().storage().metadata().id == previous_id,
+        "/new switched while the previous session's unscoped !command remained active"
+    );
+}
+
 /// A tool that exists only to give the banner something to count.
 struct BannerProbeTool {
     schema: rpi_ai::types::Tool,
