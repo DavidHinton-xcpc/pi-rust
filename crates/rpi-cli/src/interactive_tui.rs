@@ -2961,7 +2961,7 @@ pub async fn interactive_tui(
                                 state.markdown_transformer(),
                                 Some(state.extension_session.clone()),
                                 state.images_visible(),
-                                None,
+                                Some(&state.footer),
                             )
                             .await;
                             add_note_message(
@@ -3020,6 +3020,7 @@ pub async fn interactive_tui(
                     &chat_container,
                     &state,
                     &reload_context.tool_context,
+                    &reload_context.catalog,
                 )
                 .await;
                 tui.request_render(false);
@@ -3033,6 +3034,7 @@ pub async fn interactive_tui(
                     &chat_container,
                     &state,
                     &reload_context.tool_context,
+                    &reload_context.catalog,
                 )
                 .await;
                 tui.request_render(false);
@@ -3143,6 +3145,7 @@ pub async fn interactive_tui(
                     &chat_container,
                     &state,
                     &reload_context.tool_context,
+                    &reload_context.catalog,
                 )
                 .await;
                 tui.request_render(false);
