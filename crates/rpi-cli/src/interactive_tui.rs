@@ -70,7 +70,7 @@ use tokio_util::sync::CancellationToken;
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, UserMessage};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
-use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
+use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
 use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
@@ -3145,7 +3145,6 @@ pub async fn interactive_tui(
                     &chat_container,
                     &state,
                     &reload_context.tool_context,
-                    &reload_context.catalog,
                 )
                 .await;
                 tui.request_render(false);

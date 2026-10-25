@@ -257,7 +257,6 @@ pub(super) async fn fork_session(
     chat: &Arc<Container>,
     state: &Arc<TuiState>,
     tool_context: &rpi_extensions::ToolCallContext,
-    catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
     let lane = harness.lane("main");
     if *state.status.lock().unwrap() == RunStatus::Working {
@@ -302,9 +301,11 @@ pub(super) async fn fork_session(
     state.reset_session_state();
     let (tools, skills, context_files) = current_capabilities(harness, &lane).await;
     add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
-    // A fork keeps serving the same lane, but the swap above resets it — replay
-    // the source session's model so the fork continues where it left off.
-    restore_session_model(harness, &lane, state, catalog).await;
+    // A fork continues the CURRENT conversation: a `/model` pick made after the
+    // last recorded turn is still the user's live intent, and `apply_model_selection`
+    // deliberately persists nothing for the replay to read. Restoring the older
+    // recorded model here would silently undo that pick, so the fork keeps the
+    // live model instead of replaying.
     render_session_history(
         harness,
         chat,
@@ -460,13 +461,16 @@ pub(super) async fn render_session_history(
 ) {
     // Usage the replay accumulates, folded into `footer` at the end so
     // returning to a session restores its counters instead of leaving the
-    // footer blank (or showing the previous session's numbers).
+    // footer blank (or showing the previous session's numbers). Totals are
+    // sums; the cache-hit rate keeps the live `MessageEnd` semantics (the
+    // LATEST eligible turn's rate, not a session average), so reopening a
+    // history cannot change what the footer showed live.
     let mut restored_input = 0i64;
     let mut restored_output = 0i64;
     let mut restored_cache_read = 0i64;
     let mut restored_cache_write = 0i64;
     let mut restored_cost = 0f64;
-    let mut restored_cache_denom = 0i64;
+    let mut restored_hit_rate: Option<f64> = None;
     let mut restored_context: Option<i64> = None;
     let tree = harness.session().view("main");
     let entries = match tree
@@ -506,16 +510,18 @@ pub(super) async fn render_session_history(
                     comp.update_blocks(&assistant_blocks(a));
                     chat.add_child(comp);
                     // Accumulate under the same rules the live `MessageEnd`
-                    // handler applies (events.rs): totals, cache-hit rate
-                    // denominator, and the last non-aborted/errored context
-                    // size.
+                    // handler applies (events.rs): totals sum across turns,
+                    // while the cache-hit rate is the LATEST turn's eligible
+                    // rate (each eligible turn overwrites, matching live).
                     restored_input += a.usage.input;
                     restored_output += a.usage.output;
                     restored_cache_read += a.usage.cache_read;
                     restored_cache_write += a.usage.cache_write;
                     restored_cost += a.usage.cost.total;
-                    restored_cache_denom +=
-                        a.usage.input + a.usage.cache_read + a.usage.cache_write;
+                    let denom = a.usage.input + a.usage.cache_read + a.usage.cache_write;
+                    if denom > 0 && (a.usage.cache_read + a.usage.cache_write) > 0 {
+                        restored_hit_rate = Some(a.usage.cache_read as f64 / denom as f64 * 100.0);
+                    }
                     if a.stop_reason != rpi_ai::StopReason::Aborted
                         && a.stop_reason != rpi_ai::StopReason::Error
                     {
@@ -678,10 +684,8 @@ pub(super) async fn render_session_history(
                 restored_cache_write,
                 restored_cost,
             );
-            if restored_cache_denom > 0 && (restored_cache_read + restored_cache_write) > 0 {
-                footer.set_cache_hit_rate(Some(
-                    restored_cache_read as f64 / restored_cache_denom as f64 * 100.0,
-                ));
+            if let Some(rate) = restored_hit_rate {
+                footer.set_cache_hit_rate(Some(rate));
             }
             footer.set_context_tokens(restored_context);
         }
@@ -696,6 +700,11 @@ pub(super) async fn render_session_history(
 /// behind, so switching back to an older session silently ran it on the wrong
 /// model while the footer still showed the new one.
 ///
+/// The derivation is **branch-scoped**: only the lane's selected ancestry
+/// counts (`find_entries_on_branch` from the lane leaf), never the session-wide
+/// entry list — an abandoned sibling branch or a child lane's later turn must
+/// not select the model.
+///
 /// Best-effort: a session with no recorded model, or a model that is no longer
 /// in the authenticated catalog, leaves the current lane model untouched rather
 /// than failing the switch. Resuming a session must not fail because one of its
@@ -706,15 +715,20 @@ pub(super) async fn restore_session_model(
     state: &Arc<TuiState>,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
-    let tree = harness.session().view("main");
-    let Ok(entries) = tree
-        .find_entries(&EntryQuery {
-            entry_type: None,
-            custom_type: None,
-            order: Some(EntryOrder::OldestFirst),
-            limit: None,
-            cursor: None,
-        })
+    // Branch-scoped, not `find_entries`: the lane view's session-wide query
+    // ignores which leaf is selected, so abandoned branches and child lanes
+    // would bleed into the derivation.
+    let Ok(entries) = harness
+        .find_entries_on_branch(
+            &EntryQuery {
+                entry_type: None,
+                custom_type: None,
+                order: Some(EntryOrder::OldestFirst),
+                limit: None,
+                cursor: None,
+            },
+            &BranchBounds::default(),
+        )
         .await
     else {
         return;
