@@ -590,12 +590,15 @@ pub(super) const PASTE_MATURE_CARRY_GAP: std::time::Duration =
 /// One more fact separates IME from paste where even the queue probe cannot:
 /// **shape**. A coalesced IME commit is queued behind itself, so the probe
 /// marks it `collected` exactly like a paste's first batch — but it is one
-/// batch, it is short, and it never contains a newline. A clipboard payload
-/// that corroborates an Enter must hold at least ten newlines, so a real
-/// paste whose only flushed batch is a single short line still has the rest
-/// of its lines queued *behind* that Enter — they corroborate through the
-/// `more_queued` path, never through a short lone tail. Such a tail can only
-/// match a clipboard by coincidence, so it is not offered as evidence.
+/// batch, it is short, and it never contains a newline. A lone short batch is
+/// therefore not trusted for the whole short carry window: it corroborates
+/// only while an Enter could still be trailing its own batch at machine
+/// speed (`PASTE_BURST_GAP`, far below any human key-to-key delay), and only
+/// through the variant it actually shaped. Batch order inside one clipboard
+/// payload is preserved but not atomic — the payload's own newline can be the
+/// next console batch while the rest of the payload is still in transit, so
+/// order alone cannot retire a lone short tail, and a clipboard prefix match
+/// beyond machine speed is coincidence, not evidence.
 pub(super) struct PasteTail {
     /// All batches flushed within the carry window, concatenated.
     pub(super) text: String,
@@ -607,10 +610,14 @@ pub(super) struct PasteTail {
     /// Whether the most recent batch alone reached the fold threshold: the
     /// `last` variant gets its own, independently computed window.
     pub(super) last_mature: bool,
-    /// Whether this tail was built by exactly one newline-less batch with
-    /// nothing carried into it — the exact shape of a coalesced IME commit
-    /// the queue probe marked `collected`.
+    /// Whether the accumulated text is exactly one newline-less batch with
+    /// nothing carried into it — the shape of a coalesced IME commit the
+    /// queue probe marked `collected`.
     pub(super) single_batch: bool,
+    /// Whether the most recent batch is newline-less and short on its own,
+    /// independent of what was carried: a carried history must not re-enable
+    /// a lone short `last` candidate.
+    pub(super) last_single_batch: bool,
     pub(super) at: std::time::Instant,
 }
 
@@ -772,22 +779,27 @@ impl WindowsPasteRun {
         };
         if live.is_empty() {
             let mut candidates = Vec::new();
-            // A tail built by one short newline-less batch is the exact shape
-            // of a coalesced IME commit the queue probe marked `collected`.
-            // A real paste corroborating through this idle path has either
-            // interior newlines in the batch, more batches carried into the
-            // tail, or fold-threshold volume — never all three absent. The
-            // queue could not separate this commit from a paste; its shape
-            // can, so the tail is not evidence and a matching clipboard
-            // prefix (the commit happens to be the clipboard's first word)
-            // cannot swallow the user's Enter.
-            let lone_short_batch = tail.single_batch && !tail.mature && !tail.last_mature;
-            if !lone_short_batch && Self::variant_fresh(tail, tail.mature, now) {
+            // Each variant is gated by the shape *it* has, and a lone short
+            // newline-less variant corroborates only while an Enter could
+            // still be trailing its batch at machine speed. The payload's own
+            // newline may trail at machine speed — the first-newline batch
+            // boundary — but a human's Enter (IME confirm, then Enter: two
+            // actions) never does, so beyond `PASTE_BURST_GAP` the shape is
+            // an IME commit and a clipboard prefix match is coincidence. A
+            // carried history must not re-enable a lone short `last`
+            // candidate: `last_single_batch` is computed from the batch
+            // alone, independent of the carry.
+            let lone_short_expired = |shape: bool, mature: bool| {
+                shape && !mature && now.duration_since(tail.at) > PASTE_BURST_GAP
+            };
+            if Self::variant_fresh(tail, tail.mature, now)
+                && !lone_short_expired(tail.single_batch, tail.mature)
+            {
                 candidates.push(tail.text.clone());
             }
-            if !lone_short_batch
+            if tail.last != tail.text
                 && Self::variant_fresh(tail, tail.last_mature, now)
-                && tail.last != tail.text
+                && !lone_short_expired(tail.last_single_batch, tail.last_mature)
             {
                 candidates.push(tail.last.clone());
             }
@@ -833,6 +845,8 @@ impl WindowsPasteRun {
                 self.tail = Some(PasteTail {
                     last_mature: batch.chars().count() >= PASTE_RUN_MIN_CHARS,
                     single_batch: carried.is_empty() && !batch.contains('\n'),
+                    last_single_batch: !batch.contains('\n')
+                        && batch.chars().count() < PASTE_RUN_MIN_CHARS,
                     text,
                     last: batch,
                     mature,

@@ -3580,7 +3580,11 @@ fn consecutive_pastes_each_keep_their_own_trailing_enter() {
         "the tail has to include the head of the most recent paste alone"
     );
 
-    let enter_at = second_at + std::time::Duration::from_millis(80);
+    // The trailing Enter trails its batch at machine speed — a console-level
+    // split of the payload, not a human key-to-key delay (two IME commits in
+    // the same shape must submit instead: the standalone lone-short window
+    // is `PASTE_BURST_GAP`).
+    let enter_at = second_at + std::time::Duration::from_millis(10);
     assert!(
         windows_enter_in_paste(&run, false, Some(clipboard_b), enter_at),
         "the second paste's trailing Enter must not submit"
@@ -4158,5 +4162,138 @@ fn final_review_pr91_coalesced_ime_commit_never_leaves_a_tail_that_eats_enter() 
     assert!(
         !windows_enter_in_paste(&run, false, Some(clipboard), entered_at),
         "a coalesced IME commit must not leave a tail that can consume a later Enter"
+    );
+}
+
+// Round-6 review probes for PR #91: the first newline can land in its own
+// console batch while the rest of the payload is still in transit, and a
+// carried tail must not re-enable a lone short last batch.
+#[test]
+fn latest_review_pr91_first_newline_can_be_its_own_console_batch() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "alpha\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    // The same clipboard arrives in order as [alpha], [Enter], [remaining lines].
+    // At the Enter, no later event has reached the queue within PASTE_PROBE.
+    review_pr91_deliver_batch(&mut run, &editor, "alpha", false, now);
+    let entered_at = now + std::time::Duration::from_millis(10);
+    assert_eq!(editor.get_text(), "alpha");
+    assert!(run.tail.as_ref().unwrap().single_batch);
+    assert!(run.has_paste_evidence(entered_at));
+    assert!(
+        windows_enter_in_paste(&run, false, Some(clipboard), entered_at),
+        "a batch boundary before the first newline must not submit the partial clipboard"
+    );
+}
+
+#[test]
+fn latest_review_pr91_old_paste_must_not_enable_a_short_ime_tail() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    for _ in 0..PASTE_RUN_MIN_CHARS {
+        run.feed('x', now);
+    }
+    run.mark_collected();
+    run.flush(&editor, now);
+    let commit_at = now + std::time::Duration::from_millis(50);
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, commit_at);
+    let tail = run.tail.as_ref().unwrap();
+    assert!(!tail.single_batch);
+    assert!(!tail.last_mature);
+    assert_eq!(tail.last, "我们");
+    let typed_at = commit_at + std::time::Duration::from_millis(80);
+    let clipboard = "我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    assert!(
+        !windows_enter_in_paste(&run, false, Some(clipboard), typed_at),
+        "an older paste must not make a new lone IME batch eligible to swallow Enter"
+    );
+}
+
+#[test]
+fn latest_review_pr91_two_ime_commits_must_not_enable_the_last_tail() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    review_pr91_deliver_batch(&mut run, &editor, "你好", false, now);
+    let commit_at = now + std::time::Duration::from_millis(50);
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, commit_at);
+    let clipboard = "我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    assert!(
+        !windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            commit_at + std::time::Duration::from_millis(80)
+        ),
+        "two newline-less IME commits must not enable the standalone last candidate"
+    );
+}
+
+// Flanking probes around the machine-speed boundary the fix draws for lone
+// short tails: corroborate at batch-trailing speed, submit beyond it.
+#[test]
+fn round6_pr91_lone_short_tail_corroborates_within_the_burst_gap() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "alpha\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    review_pr91_deliver_batch(&mut run, &editor, "alpha", false, now);
+    assert!(
+        windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            now + std::time::Duration::from_millis(15)
+        ),
+        "an Enter trailing its batch at machine speed is the paste's own newline"
+    );
+}
+
+#[test]
+fn round6_pr91_lone_short_tail_stops_corroborating_beyond_the_burst_gap() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "alpha\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    review_pr91_deliver_batch(&mut run, &editor, "alpha", false, now);
+    assert!(
+        !windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            now + std::time::Duration::from_millis(25)
+        ),
+        "beyond machine speed the Enter is the user's, even if the clipboard matches"
+    );
+}
+
+#[test]
+fn round6_pr91_carried_last_batch_corroborates_only_within_the_burst_gap() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    review_pr91_deliver_batch(&mut run, &editor, "你好", false, now);
+    let commit_at = now + std::time::Duration::from_millis(50);
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, commit_at);
+    let clipboard = "我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    assert!(
+        windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            commit_at + std::time::Duration::from_millis(15)
+        ),
+        "a carried history must not change the machine-speed window of the last batch"
+    );
+    assert!(
+        !windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            commit_at + std::time::Duration::from_millis(25)
+        ),
+        "the last batch alone is back to a typed Enter once machine speed is exceeded"
     );
 }
