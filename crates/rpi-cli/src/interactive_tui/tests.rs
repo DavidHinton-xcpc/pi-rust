@@ -4179,7 +4179,7 @@ fn latest_review_pr91_first_newline_can_be_its_own_console_batch() {
     review_pr91_deliver_batch(&mut run, &editor, "alpha", false, now);
     let entered_at = now + std::time::Duration::from_millis(10);
     assert_eq!(editor.get_text(), "alpha");
-    assert!(run.tail.as_ref().unwrap().single_batch);
+    assert!(run.tail.as_ref().unwrap().lone_short);
     assert!(run.has_paste_evidence(entered_at));
     assert!(
         windows_enter_in_paste(&run, false, Some(clipboard), entered_at),
@@ -4200,7 +4200,7 @@ fn latest_review_pr91_old_paste_must_not_enable_a_short_ime_tail() {
     let commit_at = now + std::time::Duration::from_millis(50);
     review_pr91_deliver_batch(&mut run, &editor, "我们", false, commit_at);
     let tail = run.tail.as_ref().unwrap();
-    assert!(!tail.single_batch);
+    assert!(!tail.lone_short);
     assert!(!tail.last_mature);
     assert_eq!(tail.last, "我们");
     let typed_at = commit_at + std::time::Duration::from_millis(80);
@@ -4295,5 +4295,59 @@ fn round6_pr91_carried_last_batch_corroborates_only_within_the_burst_gap() {
             commit_at + std::time::Duration::from_millis(25)
         ),
         "the last batch alone is back to a typed Enter once machine speed is exceeded"
+    );
+}
+
+// Round-7 review probe for PR #91: concatenating short newline-less IME
+// batches must not give the accumulated candidate full carry eligibility.
+#[test]
+fn next_review_pr91_accumulated_ime_batches_must_not_swallow_submit() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    review_pr91_deliver_batch(&mut run, &editor, "你好", false, now);
+    let second_at = now + std::time::Duration::from_millis(50);
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, second_at);
+    let entered_at = second_at + std::time::Duration::from_millis(80);
+    assert_eq!(editor.get_text(), "你好我们");
+    assert!(
+        run.tail.as_ref().unwrap().lone_short,
+        "the concatenated IME shape is lone-short as a whole"
+    );
+    let clipboard = "你好我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    assert!(
+        !windows_enter_in_paste(&run, false, Some(clipboard), entered_at),
+        "a concatenated pair of short IME commits must not become paste evidence at 80 ms"
+    );
+}
+
+// Flanking probe: the same concatenated shape corroborates only while an
+// Enter could trail the second batch at machine speed.
+#[test]
+fn round7_pr91_concatenated_short_batches_corroborate_only_at_machine_speed() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "你好我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    review_pr91_deliver_batch(&mut run, &editor, "你好", false, now);
+    let second_at = now + std::time::Duration::from_millis(50);
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, second_at);
+    assert!(
+        windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            second_at + std::time::Duration::from_millis(15)
+        ),
+        "a payload split into two newline-less batches keeps its newline at machine speed"
+    );
+    assert!(
+        !windows_enter_in_paste(
+            &run,
+            false,
+            Some(clipboard),
+            second_at + std::time::Duration::from_millis(25)
+        ),
+        "beyond machine speed the accumulated newline-less text is IME-shaped, not paste evidence"
     );
 }

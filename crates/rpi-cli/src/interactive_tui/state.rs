@@ -610,10 +610,12 @@ pub(super) struct PasteTail {
     /// Whether the most recent batch alone reached the fold threshold: the
     /// `last` variant gets its own, independently computed window.
     pub(super) last_mature: bool,
-    /// Whether the accumulated text is exactly one newline-less batch with
-    /// nothing carried into it — the shape of a coalesced IME commit the
-    /// queue probe marked `collected`.
-    pub(super) single_batch: bool,
+    /// Whether the accumulated text is newline-less and short as a whole —
+    /// the shape of one coalesced IME commit, or of several concatenated
+    /// ones. A real paste accumulating past one batch either carries an
+    /// interior newline in a batch or reaches the fold threshold; IME
+    /// commits never contain a newline.
+    pub(super) lone_short: bool,
     /// Whether the most recent batch is newline-less and short on its own,
     /// independent of what was carried: a carried history must not re-enable
     /// a lone short `last` candidate.
@@ -793,7 +795,7 @@ impl WindowsPasteRun {
                 shape && !mature && now.duration_since(tail.at) > PASTE_BURST_GAP
             };
             if Self::variant_fresh(tail, tail.mature, now)
-                && !lone_short_expired(tail.single_batch, tail.mature)
+                && !lone_short_expired(tail.lone_short, tail.mature)
             {
                 candidates.push(tail.text.clone());
             }
@@ -844,7 +846,7 @@ impl WindowsPasteRun {
                 let mature = text.chars().count() >= PASTE_RUN_MIN_CHARS;
                 self.tail = Some(PasteTail {
                     last_mature: batch.chars().count() >= PASTE_RUN_MIN_CHARS,
-                    single_batch: carried.is_empty() && !batch.contains('\n'),
+                    lone_short: !text.contains('\n') && !mature,
                     last_single_batch: !batch.contains('\n')
                         && batch.chars().count() < PASTE_RUN_MIN_CHARS,
                     text,
