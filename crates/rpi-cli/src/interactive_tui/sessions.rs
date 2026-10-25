@@ -472,18 +472,24 @@ pub(super) async fn render_session_history(
     let mut restored_cost = 0f64;
     let mut restored_hit_rate: Option<f64> = None;
     let mut restored_context: Option<i64> = None;
-    let tree = harness.session().view("main");
-    let entries = match tree
-        .find_entries(&EntryQuery {
-            entry_type: None,
-            custom_type: None,
-            // Session queries default to newest-first for selectors and
-            // pagination. The transcript appends children top-to-bottom, so
-            // restored history must explicitly be chronological.
-            order: Some(EntryOrder::OldestFirst),
-            limit: None,
-            cursor: None,
-        })
+    // Branch-scoped like `restore_session_model`: the transcript and the usage
+    // must reflect the main lane's SELECTED ancestry. The session-wide
+    // `find_entries` ignores which leaf is selected, so a child lane's later
+    // turn would otherwise supply the main context badge (and an abandoned
+    // sibling's history would render).
+    let entries = match harness
+        .find_entries_on_branch(
+            &EntryQuery {
+                entry_type: None,
+                custom_type: None,
+                // Branch results walk leaf→root; the transcript renders
+                // top-to-bottom, so reverse to chronological.
+                order: Some(EntryOrder::OldestFirst),
+                limit: None,
+                cursor: None,
+            },
+            &BranchBounds::default(),
+        )
         .await
     {
         Ok(e) => e,
@@ -613,6 +619,11 @@ pub(super) async fn render_session_history(
                     ),
                 );
                 rendered_any = true;
+                // Same as the live `/compact` success path: the last assistant
+                // usage describes the PRE-compaction context, so the badge must
+                // reset to `?`/0.0% here too. A later valid assistant report on
+                // the branch re-populates it; usage totals stay intact.
+                restored_context = None;
             }
             Entry::BranchSummary(summary) => {
                 add_note_message(chat, &format!("Branch summary: {}", summary.summary));

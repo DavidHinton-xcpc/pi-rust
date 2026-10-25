@@ -1052,6 +1052,135 @@ async fn review_pr104_fork_preserves_a_model_pick_before_the_next_turn() {
     );
 }
 
+fn review_084_context_turn(model: &str, tokens: i64) -> AgentMessage {
+    recorded_assistant_turn(
+        "faux",
+        model,
+        rpi_ai::types::Usage {
+            input: tokens,
+            output: 1,
+            total_tokens: tokens,
+            ..rpi_ai::types::Usage::zero()
+        },
+    )
+}
+
+#[tokio::test]
+async fn rereview_pr104_context_must_not_come_from_a_child_lane() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let source_id = source.storage().metadata().id.clone();
+    let main_tip = source
+        .append_message(review_084_context_turn("parent-model", 50_000))
+        .await
+        .unwrap();
+    source
+        .create_lane("child-context", Some(&main_tip))
+        .await
+        .unwrap();
+    source
+        .view("child-context")
+        .append_message(review_084_context_turn("child-model", 190_000))
+        .await
+        .unwrap();
+    let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(target).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    let mut parent_model = pr104_review_model("parent-model");
+    parent_model.context_window = 200_000;
+    let catalog = Arc::new(std::sync::RwLock::new(vec![parent_model]));
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &source_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &catalog,
+        )
+        .await
+    );
+    // The previous model fix works, but usage replay still queries all lanes.
+    assert_eq!(lane.get_model().await.unwrap().id, "parent-model");
+    let footer = strip_ansi(&state.footer.render(160).join("\n"));
+    assert!(
+        footer.contains("25.0%/200k"),
+        "the main context is 50k/200k, not the child's 190k/200k: {footer}"
+    );
+}
+
+#[tokio::test]
+async fn rereview_pr104_compaction_must_invalidate_pre_compaction_context() {
+    use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind};
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let source_id = source.storage().metadata().id.clone();
+    source
+        .append_message(review_084_context_turn("model", 100_000))
+        .await
+        .unwrap();
+    // Seed the durable state after a successful /compact, without a model call.
+    // run_compact() explicitly clears the live context badge for this state.
+    source
+        .append_entry(
+            ProvisionedEntry {
+                id: "review-context-compaction".into(),
+                kind: ProvisionedKind::Compaction {
+                    summary: "Small replacement summary".into(),
+                    retained_tail: vec![],
+                    tokens_before: 100_000,
+                    details: None,
+                    usage: None,
+                },
+            },
+            "main",
+        )
+        .await
+        .unwrap();
+    let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(target).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    let mut model = pr104_review_model("model");
+    model.context_window = 200_000;
+    let catalog = Arc::new(std::sync::RwLock::new(vec![model]));
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &source_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &catalog,
+        )
+        .await
+    );
+    let footer = strip_ansi(&state.footer.render(160).join("\n"));
+    assert!(
+        footer.split_whitespace().any(|part| part == "0.0%/200k"),
+        "after compaction there is no new context report; old 50% must not reappear: {footer}"
+    );
+}
+
 /// A tool that exists only to give the banner something to count.
 struct BannerProbeTool {
     schema: rpi_ai::types::Tool,
