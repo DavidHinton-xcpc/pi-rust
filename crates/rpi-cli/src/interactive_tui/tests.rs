@@ -3468,24 +3468,30 @@ fn ime_commit_is_not_buffered_as_paste() {
     assert!(big.is_paste_candidate(), "a long run is still foldable");
 }
 
-/// The console can hand one clipboard payload over in several batches. When the
-/// batch holding the final newline arrives after the text batch was already
-/// flushed to the editor, the run is empty — but that newline still belongs to
-/// the paste and must not submit the prompt.
+/// The console can hand one clipboard payload over in several batches. When
+/// the batch holding the final newline arrives after the text batch was
+/// already flushed to the editor, the run is empty — but that newline still
+/// belongs to the paste and must not submit the prompt.
+///
+/// The flushed batch here carries an interior newline: a multi-line payload
+/// whose first console batch ends after its second line. That shape is what
+/// separates it from a coalesced IME commit, which is also queued behind
+/// itself but never contains a newline — see
+/// [`final_review_pr91_coalesced_ime_commit_never_leaves_a_tail_that_eats_enter`].
 #[test]
 fn paste_split_just_before_its_trailing_enter_is_not_a_submit() {
     let now = std::time::Instant::now();
-    let clipboard = "alpha\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n";
+    let clipboard = "alpha\nbeta\nc\nd\ne\nf\ng\nh\ni\nj\nk\n";
     let editor = rpi_tui::Editor::simple();
 
     let mut run = WindowsPasteRun::default();
-    for ch in "alpha".chars() {
+    for ch in "alpha\nbeta".chars() {
         run.feed(ch, now);
     }
     // The console proved this is a paste: input was still queued behind it.
     run.mark_collected();
     run.flush(&editor, now);
-    assert_eq!(editor.get_text(), "alpha");
+    assert_eq!(editor.get_text(), "alpha\nbeta");
     assert!(!run.is_buffering(), "the text batch is already inserted");
 
     // The newline lands in the next batch, inside the carry window, and the
@@ -4130,5 +4136,27 @@ fn carry_review_pr91_a_prior_large_paste_must_not_extend_a_new_ime_commits_windo
     assert!(
         !windows_enter_in_paste(&run, false, Some(clipboard), typed_enter),
         "the previous paste must not give a new two-character IME commit a 500ms carry window"
+    );
+}
+
+// Re-review probe (round 5) for PR #91: a coalesced IME commit delivered as
+// one queued batch sets `collected` through the queue probe, so its flush
+// leaves a short PasteTail. The clipboard happening to share the commit's
+// prefix must not make that tail eligible to swallow the user's Enter.
+#[test]
+fn final_review_pr91_coalesced_ime_commit_never_leaves_a_tail_that_eats_enter() {
+    let now = std::time::Instant::now();
+    let editor = rpi_tui::Editor::simple();
+    let mut run = WindowsPasteRun::default();
+    let clipboard = "我们\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    // One queued batch: 我们's Press/Release pairs, exactly as a coalesced
+    // IME commit arrives. No newline ever enters this batch.
+    review_pr91_deliver_batch(&mut run, &editor, "我们", false, now);
+    assert_eq!(editor.get_text(), "我们");
+    // Enter arrives within the short carry window (~80 ms).
+    let entered_at = now + std::time::Duration::from_millis(80);
+    assert!(
+        !windows_enter_in_paste(&run, false, Some(clipboard), entered_at),
+        "a coalesced IME commit must not leave a tail that can consume a later Enter"
     );
 }
