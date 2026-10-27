@@ -404,6 +404,14 @@ pub trait AgentLane: Send + Sync {
     /// lose the turn the user just watched is one turn wide instead of the whole
     /// session. Backends with nothing to wait for are a no-op.
     async fn drain_session(&self) {}
+    /// Take the session writes that failed during this lane's runs.
+    ///
+    /// The host renders them: a warning inside an alternate screen reaches
+    /// nobody, and a conversation that silently stopped being saved is the one
+    /// failure a user has to act on before exiting.
+    fn take_write_failures(&self) -> Vec<HarnessWriteFailure> {
+        Vec::new()
+    }
     async fn run_when_idle(
         &self,
         callback: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
@@ -671,10 +679,52 @@ pub struct AgentHarness {
     /// Serializes external appends with operation admission and boundary drains.
     /// Never held while executing a tool or invoking an external event handler.
     message_writes: Arc<tokio::sync::Mutex<()>>,
+    /// Session writes that failed while the run continued. Drained by the host
+    /// so the transcript can report them: a `tracing::warn!` inside an alternate
+    /// screen reaches nobody, and a conversation that silently stopped being
+    /// saved is the one failure a user has to act on before exiting.
+    write_failures: Arc<Mutex<Vec<HarnessWriteFailure>>>,
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
 }
+
+/// A session write that failed after the run had already decided to continue.
+///
+/// Carried to the host rather than logged: see `AgentHarness::take_write_failures`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessWriteFailure {
+    /// What could not be persisted, e.g. "a salvaged assistant message".
+    pub what: String,
+    /// The backend's message, verbatim.
+    pub message: String,
+    /// When the failure was recorded (`Clock` milliseconds).
+    pub at: i64,
+}
+
+/// Record a failed session write, keeping the queue bounded.
+///
+/// Free-standing so the associated helpers that run before a harness exists (the
+/// interrupted-operation recovery in `create`) can report the same way.
+fn record_write_failure(queue: &Mutex<Vec<HarnessWriteFailure>>, what: &str, message: &str) {
+    let mut failures = queue.lock().unwrap_or_else(|e| e.into_inner());
+    if failures.len() >= MAX_WRITE_FAILURES {
+        return;
+    }
+    failures.push(HarnessWriteFailure {
+        what: what.to_string(),
+        message: message.to_string(),
+        at: now_ms(),
+    });
+}
+
+/// Upper bound on queued write failures.
+///
+/// A backend that fails every write would otherwise grow this without limit for
+/// as long as the run lasts. The host drains on every `AgentEnd` and at run end,
+/// so the cap only accumulates while a single run fails repeatedly — 16 covers
+/// that while keeping the report short enough to read.
+pub const MAX_WRITE_FAILURES: usize = 16;
 
 mod child;
 pub use child::ChildHarness;
@@ -739,6 +789,7 @@ impl AgentHarness {
                 &options.tools,
                 &CancellationToken::new(),
                 !died_awaiting_retry,
+                None,
             )
             .await?;
             if let Some(dead) = interrupted {
@@ -807,6 +858,7 @@ impl AgentHarness {
             bus: HarnessEventBus::new(),
             lane: "main".to_string(),
             message_writes: Arc::new(tokio::sync::Mutex::new(())),
+            write_failures: Arc::new(Mutex::new(Vec::new())),
             child_scope,
             is_child: false,
             max_turns: None,
@@ -1096,6 +1148,38 @@ impl AgentHarness {
         self.session.drain().await;
     }
 
+    /// Record a session write that failed while the run kept going.
+    ///
+    /// Keeps the `tracing::warn!` at the call site: the log is still the place a
+    /// developer looks. The queue exists because a warning inside an alternate
+    /// screen reaches nobody, and "your conversation stopped being saved" is the
+    /// one failure a user must see before exiting.
+    ///
+    /// Dropping past [`MAX_WRITE_FAILURES`] is deliberate: a backend failing every
+    /// write would otherwise grow this for as long as the run lasts, and the host
+    /// drains at every turn boundary anyway.
+    fn record_write_failure(&self, what: &str, error: &SessionError) {
+        record_write_failure(&self.write_failures, what, &error.message);
+    }
+
+    /// Record a failure whose error type is already flattened to a message.
+    fn record_write_failure_message(&self, what: &str, message: &str) {
+        record_write_failure(&self.write_failures, what, message);
+    }
+
+    /// Take the write failures recorded since the last drain.
+    ///
+    /// The host calls this at `AgentEnd` and when a run finishes, then renders
+    /// them: a failed write is not a run failure, so it cannot ride the run
+    /// outcome. Lane handles share the queue with the harness that spawned them.
+    pub fn take_write_failures(&self) -> Vec<HarnessWriteFailure> {
+        let mut failures = self
+            .write_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *failures)
+    }
+
     /// Return a runner bound to a session lane. All lanes share configuration,
     /// cancellation, and the event bus, while persistence and context use the
     /// selected lane's branch. The lane must already exist in the session.
@@ -1106,6 +1190,7 @@ impl AgentHarness {
             bus: self.bus.clone(),
             lane: name.to_string(),
             message_writes: Arc::clone(&self.message_writes),
+            write_failures: Arc::clone(&self.write_failures),
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
@@ -1180,8 +1265,19 @@ impl AgentHarness {
     /// `get_entry` may return `None` until the message has been committed.
     pub async fn append_message(&self, message: AgentMessage) -> HarnessResult<String> {
         let gate = self.message_writes.lock().await;
-        let (id, _, appended) = self.append_message_locked(message).await?;
+        let result = self.append_message_locked(message).await;
         drop(gate);
+        let (id, _, appended) = match result {
+            Ok(appended) => appended,
+            Err(error) => {
+                // A user message that failed to persist is the clearest form of
+                // "your conversation is not being saved": the text is on screen
+                // and the write was refused. Record it for the host and keep the
+                // error flowing to the caller.
+                self.record_write_failure_message("a message you sent", &error.to_string());
+                return Err(error);
+            }
+        };
         self.emit_appended_messages(appended).await;
         Ok(id)
     }
@@ -2850,6 +2946,7 @@ impl AgentHarness {
         tools: &[HarnessTool],
         signal: &CancellationToken,
         salvage_failed_attempts: bool,
+        write_failures: Option<&Mutex<Vec<HarnessWriteFailure>>>,
     ) -> HarnessResult<()> {
         let open = session
             .find_open_operations(lane, Some(2))
@@ -2913,6 +3010,13 @@ impl AgentHarness {
                             %error,
                             "could not persist a salvaged assistant message after an interrupted run"
                         );
+                        if let Some(queue) = write_failures {
+                            record_write_failure(
+                                queue,
+                                "a salvaged assistant message from an interrupted run",
+                                &error.message,
+                            );
+                        }
                     }
                 }
             }
@@ -3697,6 +3801,7 @@ impl AgentHarness {
             &recovery_tools,
             &signal,
             true,
+            Some(&self.write_failures),
         )
         .await?;
 
@@ -4347,6 +4452,7 @@ impl AgentHarness {
                             %error,
                             "could not record the run-budget stop notice"
                         );
+                        self.record_write_failure("the run-budget stop notice", &error);
                     }
                 }
                 let outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
@@ -4419,6 +4525,10 @@ impl AgentHarness {
                                 %append_error,
                                 "could not persist a salvaged assistant message"
                             );
+                            self.record_write_failure(
+                                "a salvaged assistant message",
+                                &append_error,
+                            );
                         }
                     }
                 }
@@ -4490,6 +4600,7 @@ impl AgentHarness {
             &recovery_tools,
             &signal,
             true,
+            Some(&self.write_failures),
         )
         .await?;
 
@@ -5115,6 +5226,10 @@ impl AgentLane for AgentHarness {
         AgentHarness::drain_session(self).await
     }
 
+    fn take_write_failures(&self) -> Vec<HarnessWriteFailure> {
+        AgentHarness::take_write_failures(self)
+    }
+
     async fn run_when_idle(
         &self,
         callback: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
@@ -5287,6 +5402,7 @@ pub struct LaneHandle {
     #[allow(dead_code)]
     bus: HarnessEventBus,
     message_writes: Arc<tokio::sync::Mutex<()>>,
+    write_failures: Arc<Mutex<Vec<HarnessWriteFailure>>>,
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
@@ -5300,6 +5416,7 @@ impl LaneHandle {
             bus: self.bus.clone(),
             lane: self.lane.clone(),
             message_writes: Arc::clone(&self.message_writes),
+            write_failures: Arc::clone(&self.write_failures),
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
@@ -5452,6 +5569,10 @@ impl AgentLane for LaneHandle {
     /// Forward to the backend through the session facade.
     async fn drain_session(&self) {
         AgentHarness::drain_session(&self.runner()).await
+    }
+
+    fn take_write_failures(&self) -> Vec<HarnessWriteFailure> {
+        AgentHarness::take_write_failures(&self.runner())
     }
 
     async fn run_when_idle(
@@ -5868,6 +5989,136 @@ mod session_switch_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), lane.drain_session())
             .await
             .expect("draining after a write must complete");
+    }
+
+    /// A failed session write must survive as data the host can render.
+    ///
+    /// `tracing::warn!` inside an alternate screen reaches nobody, so the queue is
+    /// the only channel by which "the conversation stopped being saved" can reach
+    /// the user. This pins the recording and the drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_write_is_recorded_and_drained_once() {
+        let harness = AgentHarness::create(opts()).await.unwrap();
+        assert!(harness.take_write_failures().is_empty());
+
+        harness.record_write_failure(
+            "a salvaged assistant message",
+            &SessionError::storage("disk full"),
+        );
+        let drained = harness.take_write_failures();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].what, "a salvaged assistant message");
+        assert_eq!(drained[0].message, "disk full");
+
+        // Drained, not peeked at: a second call must be empty, otherwise the host
+        // would re-report the same failure on every turn boundary.
+        assert!(harness.take_write_failures().is_empty());
+    }
+
+    /// A real backend failure must reach the queue, not just the log.
+    ///
+    /// The probes above call `record_write_failure` directly, which only proves
+    /// the queue works. This one drives the production path: the JSONL writer
+    /// refuses the append, `append_message` returns `Err`, and the harness has to
+    /// record it. Without this, "the transcript shows the failure" would rest on
+    /// a hand-wired call that a future edit could drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_append_is_reported_as_a_write_failure() {
+        /// Refuses every append, the way a full disk does.
+        struct RefusingAppend;
+
+        #[async_trait::async_trait]
+        impl rpi_tools::env::AppendFile for RefusingAppend {
+            async fn append(&mut self, _: &[u8]) -> Result<(), rpi_tools::FileError> {
+                Err(rpi_tools::FileError::new(
+                    rpi_tools::FileErrorCode::Unknown,
+                    "disk full",
+                ))
+            }
+        }
+
+        let tmp =
+            std::env::temp_dir().join(format!("rpi-write-failure-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let env = Arc::new(OsExecutionEnv::with_cwd(tmp.clone()));
+        let fs: Arc<dyn FileSystem> = env.clone();
+        let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+            fs,
+            sessions_root: tmp.join("sessions").to_string_lossy().into_owned(),
+            clock: Arc::new(SystemClock),
+            ids: Arc::new(DefaultIdGenerator::new()),
+        });
+        let storage = repo
+            .create_typed(&JsonlSessionCreateOptions {
+                id: Some("sess-write".into()),
+                parent_session_id: None,
+                cwd: tmp.to_string_lossy().into_owned(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        storage.install_append_handle(Box::new(RefusingAppend));
+
+        let mut options = opts();
+        options.session = Session::new(Arc::new(storage), None);
+        let harness = AgentHarness::create(options).await.unwrap();
+        let lane = harness.lane("main");
+
+        // A plain append through the harness must record the failure.
+        let result = harness
+            .append_message(crate::messages::create_custom_message(
+                "probe",
+                UserContent::Text("must not be saved".into()),
+                true,
+                None,
+                0,
+            ))
+            .await;
+        assert!(
+            result.is_err(),
+            "the refusing writer must surface its error"
+        );
+        let reported = lane.take_write_failures();
+        assert!(
+            reported.iter().any(|f| f.message.contains("disk full")),
+            "a refused append must be queued for the host, got {reported:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A lane handle must see the failures the harness it spawned recorded.
+    ///
+    /// The TUI holds `Arc<dyn AgentLane>`, not the harness, so a per-lane copy of
+    /// the queue would make every failure invisible on exactly the surface that
+    /// renders them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_shares_the_write_failures_of_its_harness() {
+        let harness = AgentHarness::create(opts()).await.unwrap();
+        let lane = harness.lane("main");
+        harness.record_write_failure("the run-budget stop notice", &SessionError::storage("EIO"));
+        let drained = lane.take_write_failures();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].what, "the run-budget stop notice");
+        assert!(harness.take_write_failures().is_empty());
+    }
+
+    /// A backend failing every write must not grow the queue without bound.
+    ///
+    /// The host drains at turn boundaries, but one run can fail many writes before
+    /// reaching one, and an unbounded queue turns a disk problem into an
+    /// out-of-memory one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_failures_are_bounded() {
+        let harness = AgentHarness::create(opts()).await.unwrap();
+        for _ in 0..(MAX_WRITE_FAILURES * 4) {
+            harness.record_write_failure(
+                "a salvaged assistant message",
+                &SessionError::storage("disk full"),
+            );
+        }
+        assert_eq!(harness.take_write_failures().len(), MAX_WRITE_FAILURES);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

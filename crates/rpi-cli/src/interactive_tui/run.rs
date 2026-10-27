@@ -211,6 +211,9 @@ pub(super) async fn run_prompt_streaming(
     // run/prompt — covers aborts and the non-streaming path, where no
     // `AgentEnd` event necessarily reaches the drain task.
     refresh_pending_messages(state, lane).await;
+    // The blocking path has no drain task, so `AgentEnd` never runs and this is
+    // the only place its write failures can surface.
+    super::events::report_write_failures(&state.chat_container, lane);
 
     // Authoritative context-badge fallback. The streaming drain normally
     // updates it from `MessageEnd`, but a `Lagged` broadcast or the blocking
