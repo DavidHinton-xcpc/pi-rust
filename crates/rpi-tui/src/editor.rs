@@ -1319,6 +1319,17 @@ impl Editor {
             (KeyModifiers::SHIFT, KeyCode::Enter)
             | (KeyModifiers::SHIFT, KeyCode::Char('\r'))
             | (KeyModifiers::SHIFT, KeyCode::Char('\n')) => self.insert("\n"),
+            // A host terminal that rewrites Shift+Enter delivers Ctrl+Enter
+            // instead of a SHIFT-modified Enter: Windows Terminal's
+            // `sendInput "\n"` binding turns the chord into a bare LF, which
+            // ConPTY hands back as `Enter + CONTROL` (the LF itself is
+            // indistinguishable from Ctrl+J once raw mode is on). #108's
+            // native-Shift guard only fires on `Enter` with empty modifiers,
+            // so this shape used to fall through to `_ => return false` and
+            // drop the key silently. Bind it to the same newline as Ctrl+J.
+            (KeyModifiers::CONTROL, KeyCode::Enter)
+            | (KeyModifiers::CONTROL, KeyCode::Char('\r'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('\n')) => self.insert_no_undo("\n"),
 
             // Ctrl shortcuts
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.cursor_home(),
@@ -2219,6 +2230,26 @@ l12",
             editor.on_submit(Arc::new(|_| panic!("Shift+Enter must not submit")));
             editor.insert("draft");
             editor.handle_key(KeyEvent::new(code, KeyModifiers::SHIFT));
+            assert_eq!(editor.get_text(), "draft\n");
+        }
+    }
+
+    /// Regression: a host terminal can rewrite Shift+Enter before rpi ever sees
+    /// it. Windows Terminal's `sendInput "\n"` binding emits a bare LF, which
+    /// ConPTY delivers as `Enter + CONTROL` — the same record a real Ctrl+Enter
+    /// produces. #108's guard only covers `Enter` with empty modifiers, so this
+    /// shape reached the catch-all arm and the key was dropped with no feedback.
+    /// It must insert a newline and must not submit.
+    #[test]
+    fn ctrl_enter_encodings_insert_newline_without_submitting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for code in [KeyCode::Enter, KeyCode::Char('\r'), KeyCode::Char('\n')] {
+            let editor = Editor::simple();
+            editor.on_submit(Arc::new(|_| {
+                panic!("rewritten Shift+Enter must not submit")
+            }));
+            editor.insert("draft");
+            editor.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL));
             assert_eq!(editor.get_text(), "draft\n");
         }
     }

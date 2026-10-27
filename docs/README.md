@@ -18,6 +18,7 @@
 | 子 agent 配置继承、权限与生命周期 | [宿主管理的子 agent](extensions/subagents.md) |
 | 无头服务端与远程 TUI | [远程模式](remote/user-guide.md) |
 | Agent 与扩展调试 | [Rust 调试指南](debugging/rust-debugging.md) |
+| Windows 上修饰键 + Enter 失效（终端改写 vs 守卫） | [Shift+Enter 排查](debugging/windows-shift-enter.md) |
 | 重复思考、取消与崩溃恢复排查 | [问题复盘](debugging/llm-repetition-forensics.md)（历史证据与修复过程） |
 | 启动、内存与安装体积测量 | [性能基准](performance/benchmark-vs-pi.md)（含测量日期与边界） |
 | 流式消息复制、增量合并与实测 | [消息传递优化](performance/message-copy.md) |
