@@ -357,10 +357,18 @@ impl EnterCompletion {
 /// through to the editor unchanged, preserving the upstream behavior that an
 /// unknown `/skill:name` reaches the model untouched.
 ///
-/// Interception is armed only when the choice is unambiguous: the candidate
-/// list holds exactly one item, or the user has explicitly moved the
-/// highlight. A fresh ambiguous popup (several candidates, index 0) resolves
-/// to `Submit` — Enter sends what was typed, never a silently guessed row.
+/// A `/` popup is confirmed the way the panel presents it: Enter takes the
+/// HIGHLIGHTED row — index 0 on a fresh popup, which is the row the panel
+/// paints as the first choice — and then falls through to submit, exactly the
+/// row Tab (`accept_top_suggestion`) takes. Ambiguity is not a reason to
+/// refuse: a fuzzy provider answers every prefix of every command with
+/// several candidates, so requiring a sole candidate made most commands
+/// unreachable by Enter (`/cle` ⏎ sent `/cle` to the model instead of running
+/// `/clear`), while the panel had already shown which command row 0 is.
+///
+/// An `@`-path popup is different in one respect: taking a row CONSUMES the
+/// Enter instead of sending the prompt, so it still requires an unambiguous
+/// choice (one candidate, or an explicit ↑/↓) before Enter takes a row.
 pub(super) fn resolve_enter_completion(
     state: &Arc<TuiState>,
     editor: &Arc<Editor>,
@@ -381,6 +389,15 @@ pub(super) fn resolve_enter_completion(
     if !explicit {
         return None;
     }
+    // The `/` completion context is the COMMAND token the user is typing. The
+    // provider answers for the whole text before the caret (`start` 0,
+    // `end` = caret), so with the caret in the ARGUMENTS (`/help me`) the
+    // replacement would run to the end of the line and swallow them: Enter on
+    // `/help me` must submit `/help me`, not `/help`.
+    let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    if !popup.is_path && cursor > command_end {
+        return None;
+    }
     // Explicit selection: the user navigated THIS popup with ↑/↓. The stamp
     // (set by navigation, retired when the popup changes) is what carries the
     // intent — the row index alone cannot express "↓ then ↑ selected row 0".
@@ -392,7 +409,9 @@ pub(super) fn resolve_enter_completion(
     let Some(top) = popup.items.get(index) else {
         return None;
     };
-    if popup.items.len() > 1 && !explicit_selection {
+    // A path completion consumes the Enter, so an ambiguous path popup keeps
+    // plain submit until the user picks a row.
+    if popup.is_path && popup.items.len() > 1 && !explicit_selection {
         return Some(EnterCompletion {
             action: EnterCompletionAction::Submit,
             candidate: None,
