@@ -1404,6 +1404,13 @@ pub trait SessionStorage: Send + Sync {
     async fn get_label(&self, id: &str) -> SessionResult<Option<String>>;
     async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()>;
     async fn get_stats(&self) -> SessionResult<SessionStats>;
+
+    /// Wait for any in-flight durable write to settle.
+    ///
+    /// Only durable backends have anything to wait for. The in-memory backend is
+    /// consistent by construction and the SQLite backend commits each mutation
+    /// inside the call that returns it, so the default is a no-op.
+    async fn drain(&self) {}
 }
 
 /// Repo-level lifecycle. Mirrors TS `SessionRepo`.
