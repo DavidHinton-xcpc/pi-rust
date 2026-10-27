@@ -283,7 +283,19 @@ pub(super) async fn run_prompt_streaming(
             }
         },
         Err(e) => {
-            add_error_message(&state.chat_container, &e.to_string());
+            // A refused session write is not a provider problem: retrying will fail
+            // the same way, and the transcript on screen is the only copy left.
+            if e.tag() == rpi_harness::result::HarnessErrorTag::SessionStorage {
+                add_error_message(
+                    &state.chat_container,
+                    &format!(
+                        "The conversation could not be saved: {e}.
+                         Your messages are still on screen; export them with /export before exiting."
+                    ),
+                );
+            } else {
+                add_error_message(&state.chat_container, &e.to_string());
+            }
         }
     }
 

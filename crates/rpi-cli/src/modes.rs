@@ -114,7 +114,16 @@ pub async fn print(
                                 }
                             }
                         }
-                        eprintln!("run failed: {error:?}");
+                        if error.code == "SessionStorage" {
+                            // Print mode: no transcript to fall back on, so name the
+                            // recovery explicitly instead of printing a provider error.
+                            eprintln!(
+                                "conversation not saved: {} — export it before exiting",
+                                error.message
+                            );
+                        } else {
+                            eprintln!("run failed: {error:?}");
+                        }
                     }
                     HarnessRunOutcome::Suspended { .. } => {
                         eprintln!("run suspended (deferred) — resume is not supported in v1");
