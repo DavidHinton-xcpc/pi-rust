@@ -397,6 +397,13 @@ pub trait AgentLane: Send + Sync {
     ) -> HarnessResult<RecordUsageResult>;
 
     async fn wait_for_idle(&self) -> HarnessResult<()>;
+
+    /// Wait for every in-flight durable write to settle.
+    ///
+    /// Called at the end of each run so the window in which a forced exit could
+    /// lose the turn the user just watched is one turn wide instead of the whole
+    /// session. Backends with nothing to wait for are a no-op.
+    async fn drain_session(&self) {}
     async fn run_when_idle(
         &self,
         callback: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
@@ -1076,6 +1083,17 @@ impl AgentHarness {
     /// doesn't surface).
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Wait for every in-flight durable write to settle.
+    ///
+    /// A mutation is acknowledged to its caller only after the backend commits
+    /// it, but a turn's writes are issued by the harness while the UI is already
+    /// painting the result. An exit that aborts the tasks carrying those writes
+    /// can therefore leave a turn the user saw with no durable counterpart.
+    /// Callers on a shutdown path must await this before aborting them.
+    pub async fn drain_session(&self) {
+        self.session.drain().await;
     }
 
     /// Return a runner bound to a session lane. All lanes share configuration,
@@ -4108,7 +4126,9 @@ impl AgentHarness {
                 snap.retry.max_agent_delay_ms,
             )),
             cache_retention: snap.stream_options.cache_retention.unwrap_or_default(),
-            session_id: None,
+            // Providers key prompt caching and session affinity on it (TS
+            // `sessionId: this.session.id`); without it every turn may miss.
+            session_id: Some(self.session.storage().metadata().id),
             signal: signal.clone(),
         };
 
@@ -5090,6 +5110,11 @@ impl AgentLane for AgentHarness {
         }
     }
 
+    /// Forward to the backend through the session facade.
+    async fn drain_session(&self) {
+        AgentHarness::drain_session(self).await
+    }
+
     async fn run_when_idle(
         &self,
         callback: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
@@ -5422,6 +5447,11 @@ impl AgentLane for LaneHandle {
 
     async fn wait_for_idle(&self) -> HarnessResult<()> {
         self.runner().wait_for_idle().await
+    }
+
+    /// Forward to the backend through the session facade.
+    async fn drain_session(&self) {
+        AgentHarness::drain_session(&self.runner()).await
     }
 
     async fn run_when_idle(
@@ -5801,6 +5831,43 @@ mod session_switch_tests {
             entry_transforms: Vec::new(),
             provider_hooks: None,
         }
+    }
+
+    /// The host must be able to wait for the session's durable writes.
+    ///
+    /// The backend's wait existed but was unreachable: `JsonlSessionStorage::drain`
+    /// was public on the concrete type, while the TUI only holds `dyn AgentLane`.
+    /// Without this entry point the shutdown path had nothing to call, so it
+    /// aborted the tasks carrying a turn's writes without waiting — the wait was
+    /// dead code and the "in-flight append" contract covered nothing.
+    ///
+    /// This asserts the call is reachable from a lane and is safe to make on an
+    /// idle session (no deadlock on the shutdown path). The backend's own probes
+    /// cover what the wait actually waits for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_can_wait_for_the_sessions_durable_writes() {
+        let harness = AgentHarness::create(opts()).await.unwrap();
+        let lane = harness.lane("main");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), lane.drain_session())
+            .await
+            .expect("draining an idle lane must not block the shutdown path");
+
+        // A write admitted through the harness must be settled by the time the
+        // wait returns, so a shutdown that follows cannot drop it.
+        harness
+            .append_message(crate::messages::create_custom_message(
+                "shutdown",
+                UserContent::Text("written before exit".into()),
+                true,
+                None,
+                0,
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), lane.drain_session())
+            .await
+            .expect("draining after a write must complete");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

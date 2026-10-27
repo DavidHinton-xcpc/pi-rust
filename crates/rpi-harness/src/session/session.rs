@@ -510,6 +510,15 @@ impl Session {
         self.query_log(options).await
     }
 
+    /// Wait for any in-flight durable write to settle.
+    ///
+    /// The facade forwards to the backend. Only the JSONL backend has a write
+    /// that can still be in flight when its caller returns; the others commit
+    /// inside the call, so their `drain` is the trait's default no-op.
+    pub async fn drain(&self) {
+        self.storage_arc().drain().await;
+    }
+
     // -- Private helpers (mirror TS privates) --------------------------------
 
     /// `getLeafIdForLane(lane)` — the lane's current leaf, or `None` when empty.

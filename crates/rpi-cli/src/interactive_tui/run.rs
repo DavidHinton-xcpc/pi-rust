@@ -201,6 +201,12 @@ pub(super) async fn run_prompt_streaming(
     }
 
     state.set_status(RunStatus::Idle);
+    // Let the run's own writes reach the disk before this function returns.
+    // A forced exit (`emergency_exit`) bypasses the shutdown sequence entirely,
+    // and it is only taken while a run is in flight — i.e. exactly when there is
+    // work that has not been persisted yet. Draining here bounds that window to
+    // one run instead of the whole session.
+    lane.drain_session().await;
     // Guarantee the pending-messages display reconciles at the end of every
     // run/prompt — covers aborts and the non-streaming path, where no
     // `AgentEnd` event necessarily reaches the drain task.

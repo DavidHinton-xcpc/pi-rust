@@ -388,8 +388,11 @@ impl JsonlSessionStorage {
     }
 
     /// Wait for all in-flight appends to settle. Mirrors TS `drain`.
+    ///
+    /// Thin alias for the trait method so the concrete type keeps the inherent
+    /// entry point the module docs refer to.
     pub async fn drain(&self) {
-        let _reservation = self.tail.lock().await;
+        <Self as SessionStorage>::drain(self).await;
     }
 
     /// The rich JSONL metadata (the trait exposes only the base subset).
@@ -832,6 +835,17 @@ impl SessionStorage for JsonlSessionStorage {
     async fn get_stats(&self) -> SessionResult<SessionStats> {
         let state = self.state.lock().await;
         Ok(state.get_stats().clone())
+    }
+
+    /// Wait for the append that is in flight, if any, to settle.
+    ///
+    /// Every mutating method serialises through `self.tail` and holds it for the
+    /// whole stamp -> persist -> apply sequence, so acquiring it here waits for a
+    /// write that has already been admitted. `self.append` would not do: it is
+    /// released once the bytes are handed to the writer, which happens before the
+    /// caller's `await` on the append returns.
+    async fn drain(&self) {
+        let _reservation = self.tail.lock().await;
     }
 }
 
@@ -2194,5 +2208,116 @@ mod tests {
             eprintln!("review native OS cancellation: acknowledged_seq={}, lines_before_reload={}, prior_cancelled_write_visible={}, acknowledged_survives_reload={}, lines_after_reload={}", acknowledged.seq(), before.lines().count(), before.contains("native-cancelled"), found, fs.read_text_file("native.jsonl", None).await.unwrap().lines().count());
             assert!(found, "the real native append writer persisted the cancelled write but its missing reducer commit caused a later successful entry to be dropped on reload");
         });
+    }
+
+    /// `drain` must not return while an admitted write is still in flight.
+    ///
+    /// Reuses the `ReviewWriteThenPause` handle' that the review regression
+    /// installs: it appends the bytes and then parks, so the write is on the
+    /// file but the append future has not resolved. `drain` therefore has to
+    /// wait for the *append*, not for the bytes to be handed over.
+    ///
+    /// The pre-fix contract said "wait for all in-flight appends to settle" while
+    /// the body took `self.append` — the lock the writer had already released
+    /// before its `await` resolved. Taking `self.tail` is what actually waits,
+    /// because every mutating method holds it across stamp -> persist -> apply.
+    #[tokio::test]
+    async fn drain_waits_for_an_in_flight_append() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let storage = Arc::new(
+            JsonlSessionStorage::create(
+                fs.clone(),
+                "/review.jsonl",
+                header(),
+                Arc::new(FakeClock::new()),
+                Arc::new(CounterIdGenerator::new()),
+            )
+            .await
+            .unwrap(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *storage.append.lock().await = Some(Box::new(ReviewWriteThenPause {
+            fs: Arc::clone(&fs),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            pause_once: true,
+        }));
+
+        let writer = {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move { storage.append_entry(review_entry("parked"), "main").await })
+        };
+        entered.notified().await;
+
+        let drained =
+            tokio::time::timeout(std::time::Duration::from_millis(50), storage.drain()).await;
+        assert!(
+            drained.is_err(),
+            "drain returned while an admitted append was still in flight"
+        );
+
+        release.notify_one();
+        writer.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), storage.drain())
+            .await
+            .expect("drain must complete once the append settled");
+        assert!(storage.get_entry("parked").await.unwrap().is_some());
+    }
+
+    /// The wait must be reachable through the trait object, not just the type.
+    ///
+    /// The facade and the harness forwarding chain only ever hold
+    /// `dyn SessionStorage`. A `drain` that existed only as an inherent method
+    /// would leave the production path with nothing to call, which is exactly how
+    /// the wait stayed dead code before.
+    #[tokio::test]
+    async fn drain_through_the_trait_object_waits_for_an_in_flight_append() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let concrete = Arc::new(
+            JsonlSessionStorage::create(
+                fs.clone(),
+                "/review-dyn.jsonl",
+                header(),
+                Arc::new(FakeClock::new()),
+                Arc::new(CounterIdGenerator::new()),
+            )
+            .await
+            .unwrap(),
+        );
+        let storage: Arc<dyn SessionStorage> = Arc::clone(&concrete) as Arc<dyn SessionStorage>;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *concrete.append.lock().await = Some(Box::new(ReviewWriteThenPause {
+            fs: Arc::clone(&fs),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            pause_once: true,
+        }));
+
+        let writer = {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move {
+                storage
+                    .append_entry(review_entry("parked-dyn"), "main")
+                    .await
+            })
+        };
+        entered.notified().await;
+
+        let drained =
+            tokio::time::timeout(std::time::Duration::from_millis(50), storage.drain()).await;
+        assert!(
+            drained.is_err(),
+            "the trait entry point returned while an append was still in flight"
+        );
+
+        release.notify_one();
+        writer.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), storage.drain())
+            .await
+            .expect("drain must complete once the append settled");
     }
 }
