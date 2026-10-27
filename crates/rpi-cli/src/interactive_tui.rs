@@ -3443,6 +3443,14 @@ pub async fn interactive_tui(
     }
 
     // ---- Shutdown ----
+    // Let anything the lane has already committed to writing reach the disk
+    // before the tasks that carry those writes are aborted. A turn's entries are
+    // appended by the harness rather than by the drain task, but the drain task
+    // is what acknowledges them to the UI, so aborting it first can leave a turn
+    // the user saw with no durable counterpart.
+    let _ = lane.wait_for_idle().await;
+    lane.drain_session().await;
+
     ask_user_bridge.shutdown();
     *running.lock().unwrap() = false;
     for handle in update_check_handles {
