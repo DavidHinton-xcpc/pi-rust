@@ -2803,10 +2803,11 @@ pub async fn interactive_tui(
             // 5a-ter. A bare Enter in a completion context (`/` or `@`)
             //     resolves the completion before submitting, mirroring the
             //     TS editor's `tui.select.confirm` (`editor.ts:757-815`):
-            //     apply the sole/highlighted item, then let a `/` completion
-            //     fall through to submit while an `@`-path one consumes the
-            //     Enter. Unambiguous only — a fresh ambiguous popup submits
-            //     the typed text, and unknown `/skill:name` still reaches
+            //     apply the highlighted item — the panel's first choice on a
+            //     fresh popup — then let a `/` completion fall through to
+            //     submit while an `@`-path one consumes the Enter (a path
+            //     popup therefore still needs a sole candidate or an explicit
+            //     ↑/↓). Unknown `/skill:name` has no popup and still reaches
             //     the model untouched.
             //
             //     Placement is load-bearing: this runs AFTER the Windows
