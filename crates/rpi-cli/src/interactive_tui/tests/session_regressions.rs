@@ -1224,3 +1224,137 @@ impl rpi_agent::AgentTool for BannerProbeTool {
         Ok(rpi_agent::types::AgentToolResult::text("probe"))
     }
 }
+
+// Local review probes for the footer freeze (user bug list #3). The user
+// reported the footer's numbers stopping after a save; the confirmed defect is
+// narrower but real: the counters are accumulated only from `MessageEnd`, and
+// that event is terminal, so an overflowing `AgentEvent` broadcast drops it
+// with nothing later to re-deliver it.
+
+/// An assistant turn with explicit usage, so a footer assertion can tell which
+/// turns were counted.
+fn assistant_with_usage(
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cost: f64,
+) -> rpi_ai::types::AssistantMessage {
+    let mut message = rpi_ai::types::AssistantMessage::empty(
+        rpi_ai::Api::AnthropicMessages,
+        "probe-provider",
+        "probe-model",
+        0,
+    );
+    message.stop_reason = rpi_ai::StopReason::Stop;
+    message.usage = rpi_ai::types::Usage {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        total_tokens: input + output + cache_read + cache_write,
+        cost: rpi_ai::types::UsageCost {
+            total: cost,
+            ..Default::default()
+        },
+        ..rpi_ai::types::Usage::zero()
+    };
+    message
+}
+
+/// The rendered footer, ANSI stripped, as one line.
+fn footer_text(state: &Arc<TuiState>) -> String {
+    rpi_tui::utils::strip_ansi(&state.footer.render(200).join(" "))
+}
+
+/// A dropped `MessageEnd` must not freeze the footer for the rest of the
+/// session: the end-of-run reconciliation rebuilds every counter from the
+/// durable log, which is the same source the replay path reads.
+#[tokio::test]
+async fn footer_reconcile_rebuilds_totals_after_a_dropped_message_end() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.append_message(user_message_with_images("first", vec![]))
+        .await
+        .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 100, 0.010,
+    ))))
+    .await
+    .unwrap();
+    lane.append_message(user_message_with_images("second", vec![]))
+        .await
+        .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        2_000, 300, 6_000, 0, 0.020,
+    ))))
+    .await
+    .unwrap();
+
+    let state = test_tui_state();
+    // Precondition: the footer saw only the FIRST turn's `MessageEnd`, exactly
+    // the state a `Lagged` broadcast leaves behind.
+    state.footer.set_context_window(200_000);
+    state.footer.add_usage(1_000, 200, 500, 100, 0.010);
+    let before = footer_text(&state);
+    assert!(
+        before.contains("↑1.0k"),
+        "precondition: only the first turn is counted: {before}"
+    );
+
+    reconcile_footer_from_lane(&lane, &state).await;
+
+    let after = footer_text(&state);
+    assert!(
+        after.contains("↑3.0k"),
+        "usage totals must be rebuilt from the log: {after}"
+    );
+    assert!(
+        after.contains("$0.030"),
+        "cost must be rebuilt from the log: {after}"
+    );
+    // The cache-hit rate follows the LATEST eligible turn (6000/8000 = 75.0%),
+    // the same rule the live handler and the replay path apply. The first turn
+    // alone would read 31.2% and a session average 62.5%, so this assertion
+    // pins the semantic rather than just "some rate is present".
+    assert!(
+        after.contains("CH75.0%"),
+        "cache-hit rate must follow the latest turn: {after}"
+    );
+}
+
+/// Reconciliation replaces the counters instead of adding to them. The live
+/// path usually already accumulated the same totals, so an accumulating
+/// implementation would double every number on a normal turn.
+#[tokio::test]
+async fn footer_reconcile_is_idempotent_on_top_of_the_live_totals() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 100, 0.010,
+    ))))
+    .await
+    .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        2_000, 300, 6_000, 0, 0.020,
+    ))))
+    .await
+    .unwrap();
+
+    let state = test_tui_state();
+    state.footer.set_context_window(200_000);
+    // The live drain saw BOTH turns before reconciliation ran.
+    state.footer.add_usage(1_000, 200, 500, 100, 0.010);
+    state.footer.add_usage(2_000, 300, 6_000, 0, 0.020);
+
+    reconcile_footer_from_lane(&lane, &state).await;
+    let once = footer_text(&state);
+    reconcile_footer_from_lane(&lane, &state).await;
+    let twice = footer_text(&state);
+
+    assert_eq!(once, twice, "reconciliation must not accumulate");
+    assert!(
+        once.contains("↑3.0k"),
+        "the live totals must survive unchanged: {once}"
+    );
+}
