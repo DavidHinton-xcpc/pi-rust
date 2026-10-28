@@ -1338,6 +1338,7 @@ mod invalid_tool_call_tests {
             arguments: serde_json::json!({}),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         }
     }
 
@@ -1635,5 +1636,6 @@ fn panicked_tool_call() -> ToolCall {
         arguments: serde_json::Value::Null,
         thought_signature: None,
         namespace: None,
+        recorded: None,
     }
 }

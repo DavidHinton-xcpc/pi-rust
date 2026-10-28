@@ -1282,6 +1282,7 @@ impl StreamMapper {
                         arguments: arguments.clone(),
                         thought_signature: None,
                         namespace: None,
+                        recorded: None,
                     },
                 };
                 self.tool_json.remove(&index);
