@@ -1152,6 +1152,12 @@ pub async fn interactive_tui(
         footer.set_context_window(m.context_window as i64);
     }
     footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+O: Expand/collapse tools | Ctrl+T: Show/hide thinking | /help");
+    // A restored session may already carry a name (`/name` in an earlier run, or
+    // an extension that names sessions). Line 1 reserves a slot for it, so a
+    // resume that left it blank showed less than the session actually knew.
+    if let Some(name) = lane.session_view().get_name().await.ok().flatten() {
+        footer.set_session_name(Some(&name));
+    }
 
     // Live git-branch refresh (native fs-watch on `.git/HEAD`): a checkout or
     // commit updates the footer's branch without a manual refresh.
@@ -3143,10 +3149,16 @@ pub async fn interactive_tui(
             Some(TuiMessage::SetSessionName(name)) => {
                 let outcome = harness.session().set_name(Some(&name)).await;
                 match outcome {
-                    Ok(_) => add_note_message(
-                        &chat_container,
-                        &format!("Session renamed to \"{name}\"."),
-                    ),
+                    Ok(_) => {
+                        // Line 1 of the footer renders `session_name`, but nothing
+                        // in production ever wrote it — the slot was always empty
+                        // and `/name` looked like a no-op on screen.
+                        state.footer.set_session_name(Some(&name));
+                        add_note_message(
+                            &chat_container,
+                            &format!("Session renamed to \"{name}\"."),
+                        );
+                    }
                     Err(e) => add_error_message(
                         &chat_container,
                         &format!("Could not rename session: {e}"),

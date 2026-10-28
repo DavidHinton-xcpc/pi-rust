@@ -1358,3 +1358,110 @@ async fn footer_reconcile_is_idempotent_on_top_of_the_live_totals() {
         "the live totals must survive unchanged: {once}"
     );
 }
+/// `/name` and a resumed session both have to reach the footer's line 1: the
+/// slot is rendered (`pwd_line`) but nothing in production ever wrote it, so
+/// the name was recorded in the log and then never shown.
+#[tokio::test]
+async fn a_sessions_name_reaches_footer_line_one() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_name(Some("named-session")).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = test_tui_state();
+    state.footer.set_cwd("/home/u/proj");
+
+    // A replay is the path a session switch and a resume both take.
+    render_session_history(
+        &harness,
+        &state.chat_container,
+        None,
+        Some(state.extension_session.clone()),
+        state.images_visible(),
+        Some(&state.footer),
+    )
+    .await;
+
+    let footer = footer_text(&state);
+    assert!(
+        footer.contains("named-session"),
+        "the recorded name must render on line 1: {footer}"
+    );
+
+    // Clearing the name (a `/name` with an empty argument) must clear the slot
+    // rather than leave the stale one behind.
+    harness.set_name(None).await.unwrap();
+    render_session_history(
+        &harness,
+        &state.chat_container,
+        None,
+        Some(state.extension_session.clone()),
+        state.images_visible(),
+        Some(&state.footer),
+    )
+    .await;
+    let cleared = footer_text(&state);
+    assert!(
+        !cleared.contains("named-session"),
+        "a cleared name must leave line 1: {cleared}"
+    );
+
+    // `lane` is unused by this probe's assertions but keeps the view wiring
+    // honest: the name must come from the lane's own session, not a copy.
+    assert_eq!(
+        lane.session_view().get_name().await.unwrap(),
+        None,
+        "the lane must observe the same session the footer was rendered from"
+    );
+}
+
+/// The defect, expressed with baseline-only API: once a `MessageEnd` is
+/// dropped, nothing in the run path re-derives the footer's totals, so the
+/// numbers stay at whatever the drain happened to observe.
+///
+/// This probe PASSES on both the baseline and the fixed head on purpose: it
+/// documents the frozen state that `reconcile_footer_from_lane` repairs, and
+/// keeps the sibling probes honest about what "fixed" means. It is NOT a
+/// fail-on-old probe — `footer_reconcile_rebuilds_totals_after_a_dropped_message_end`
+/// is the one that breaks if reconciliation is removed.
+#[tokio::test]
+async fn a_dropped_message_end_leaves_the_footer_frozen_without_reconciliation() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 100, 0.010,
+    ))))
+    .await
+    .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        2_000, 300, 6_000, 0, 0.020,
+    ))))
+    .await
+    .unwrap();
+
+    let state = test_tui_state();
+    state.footer.set_context_window(200_000);
+    // The drain observed only the first turn's `MessageEnd`.
+    state.footer.add_usage(1_000, 200, 500, 100, 0.010);
+    // The baseline's only end-of-run fallback: the badge, from the run outcome.
+    let last = assistant_with_usage(2_000, 300, 6_000, 0, 0.020);
+    record_context_usage(&state.footer, &last);
+
+    let frozen = footer_text(&state);
+    // The badge moves (it has a fallback), the totals do not — exactly the
+    // partial freeze the user described.
+    assert!(
+        frozen.contains("↑1.0k") && !frozen.contains("↑3.0k"),
+        "precondition: totals stay at the dropped-event value: {frozen}"
+    );
+    // The cache-hit rate is worse off than "stale": `set_cache_hit_rate` is
+    // called only from the dropped `MessageEnd`, so it never appears at all.
+    assert!(
+        !frozen.contains("CH"),
+        "precondition: the cache-hit rate never got set: {frozen}"
+    );
+    // The badge DID update, because it has its own fallback. That asymmetry is
+    // why the freeze reads as "only some of the footer stopped".
+    assert!(
+        frozen.contains("4.2%/200k"),
+        "precondition: the badge DID update, so the freeze looks partial: {frozen}"
+    );
+}
