@@ -119,6 +119,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_state",
     "get_commands",
     "execute_command",
+    "get_commands",
+    "execute_command",
     "get_messages",
     "get_history",
     "get_session_branch",
