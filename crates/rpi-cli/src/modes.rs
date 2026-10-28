@@ -24,6 +24,7 @@ use rpi_harness::agent_harness::{
     AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome,
 };
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
+use rpi_harness::session::session::SessionEntryCommit;
 use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
 
 use crate::args::Args;
@@ -325,6 +326,38 @@ where
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
     let (stdout, writer_task, writer_failed) = start_rpc_writer(output);
     let pump_stop = tokio_util::sync::CancellationToken::new();
+
+    // Publish generic commit metadata after successful Session appends. The
+    // event is intentionally not a durable-state payload: consumers reread
+    // the canonical branch and use this only as an invalidation signal.
+    let (commit_tx, mut commit_rx) = tokio::sync::broadcast::channel::<SessionEntryCommit>(256);
+    harness
+        .session()
+        .set_entry_commit_publisher(Some(commit_tx.clone()));
+    let commit_task = {
+        let out = stdout.clone();
+        tokio::spawn(async move {
+            loop {
+                match commit_rx.recv().await {
+                    Ok(commit) => {
+                        write_line(
+                            &out,
+                            &serde_json::json!({
+                                "type": "session_entry_committed",
+                                "entryId": commit.entry_id,
+                                "entryType": commit.entry_type,
+                                "customType": commit.custom_type,
+                                "lane": commit.lane,
+                            }),
+                        )
+                        .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    };
 
     // A completion response is queued only after its final events, so a
     // subsequent prompt cannot overtake the previous run's agent_end.
@@ -727,6 +760,14 @@ where
         }
     }
     pump_stop.cancel();
+    harness.session().set_entry_commit_publisher(None);
+    // Accepted writers have finished. Close the last local sender and let the
+    // receiver forward queued commits before the output writer is flushed.
+    drop(commit_tx);
+    if let Err(error) = commit_task.await {
+        eprintln!("[rpi] rpc commit event task failed: {error}");
+        exit_code = 1;
+    }
     let _ = dialog_task.await;
     if let Some(task) = event_task {
         let _ = task.await;
@@ -2249,6 +2290,131 @@ mod tests {
             message["type"] == "agent_settled" && message["outcome"] == "completed"
         }));
         assert!(!ui.is_attached());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_append_entry_publishes_generic_commit_event() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        client
+            .write_all(
+                br#"{"type":"append_entry","id":1,"customType":"durable-state","data":{"revision":1}}
+"#,
+            )
+            .await
+            .unwrap();
+
+        let event = output
+            .wait_for(|message| message["type"] == "session_entry_committed")
+            .await;
+        assert_eq!(event["customType"], "durable-state");
+        assert_eq!(event["entryType"], "custom");
+        assert_eq!(event["lane"], "main");
+        assert!(event["entryId"].as_str().is_some());
+
+        client
+            .write_all(
+                br#"{"type":"stop","id":2}
+"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_prompt_publishes_committed_message_event() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _) = rpc_test_harness("completed", 0.0).await;
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        client
+            .write_all(b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n")
+            .await
+            .unwrap();
+        let event = output
+            .wait_for(|message| {
+                message["type"] == "session_entry_committed" && message["entryType"] == "message"
+            })
+            .await;
+        assert_eq!(event["lane"], "main");
+        assert!(event["entryId"].as_str().is_some());
+        output
+            .wait_for(|message| message["type"] == "agent_settled")
+            .await;
+        client
+            .write_all(b"{\"type\":\"stop\",\"id\":2}\n")
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_stop_flushes_all_accepted_entry_invalidations() {
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let output = RpcOutput::default();
+        let mut input = String::new();
+        for id in 1..=4 {
+            input.push_str(&format!(
+                "{{\"type\":\"append_entry\",\"id\":{id},\"customType\":\"durable-state\"}}\n"
+            ));
+        }
+        input.push_str("{\"type\":\"stop\",\"id\":5}\n");
+        let result = rpc_with_io(
+            &harness,
+            None,
+            vec![],
+            rpi_extensions::UiDialogMailbox::new(),
+            None,
+            tokio::io::BufReader::new(input.as_bytes()),
+            output.clone(),
+        )
+        .await;
+        assert_eq!(result, 0);
+        let messages = output.messages();
+        let commits: std::collections::HashSet<_> = messages
+            .iter()
+            .filter(|m| m["type"] == "session_entry_committed")
+            .map(|m| m["entryId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commits.len(),
+            4,
+            "stop must flush every committed entry: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_eof_flushes_queued_entry_invalidations() {
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let output = RpcOutput::default();
+        let input = b"{\"type\":\"append_entry\",\"id\":1,\"customType\":\"durable-state\",\"data\":{\"revision\":1}}\n";
+        let result = rpc_with_io(
+            &harness,
+            None,
+            vec![],
+            rpi_extensions::UiDialogMailbox::new(),
+            None,
+            tokio::io::BufReader::new(&input[..]),
+            output.clone(),
+        )
+        .await;
+        assert_eq!(result, 0);
+        let messages = output.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["type"] == "response" && m["id"] == 1 && m["success"] == true),
+            "append succeeded: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["type"] == "session_entry_committed"),
+            "EOF must flush the queued commit event: {messages:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
