@@ -1359,10 +1359,120 @@ async fn footer_reconcile_is_idempotent_on_top_of_the_live_totals() {
     );
 }
 
-/// Reconciliation and the broadcast drain are not synchronized: the final
-/// assistant message can already be in the log while its `MessageEnd` is still
-/// queued. Reconciliation counts it via `set_usage`; when the drain later
-/// handles that same terminal event the accumulate path must not count it again.
+/// A distinct turn whose timestamp and token counts equal a turn the log
+/// already holds must still reach the footer. This is the production shape of
+/// the collision the maintainer's probe exercises: two assistant turns can
+/// report identical timestamps (timestamp 0 from a fixture, or an equal
+/// provider timestamp) and identical usage. Reconciliation runs at `AgentEnd`,
+/// where the FIFO broadcast guarantees no event of the finished run can arrive
+/// after it — so no dedupe key is consulted at all, and every persisted turn
+/// the rebuild reads counts.
+#[tokio::test]
+async fn review_distinct_turn_with_same_timestamp_and_usage_is_not_dropped() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let mut first = assistant_with_usage(1000, 200, 500, 0, 0.01);
+    first.content = vec![rpi_ai::types::Content::text("first response")];
+    lane.append_message(AgentMessage::Assistant(Box::new(first)))
+        .await
+        .unwrap();
+    let state = test_tui_state();
+    reconcile_footer_from_lane(&lane, &state).await;
+    let mut second = assistant_with_usage(1000, 200, 500, 0, 0.01);
+    second.content = vec![rpi_ai::types::Content::text("different response")];
+    lane.append_message(AgentMessage::Assistant(Box::new(second.clone())))
+        .await
+        .unwrap();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    handle_agent_event(
+        AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(Box::new(second)),
+        },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let text = footer_text(&state);
+    assert!(
+        text.contains("↑2.0k") && text.contains("$0.020"),
+        "a distinct turn was mistaken for a delayed copy: {text}"
+    );
+}
+
+/// The maintainer's original double-count scenario, re-expressed for the
+/// `AgentEnd` barrier: when reconciliation runs from the drain, every event
+/// queued before it has already been applied, so the same turn's delayed
+/// `MessageEnd` cannot follow the rebuild. Simulating the exact race (rebuild
+/// running while a `MessageEnd` is still queued) requires a second event
+/// source, which production no longer has: the only caller is the drain
+/// itself. The invariant this probe pins is the one the barrier guarantees —
+/// a rebuild followed by a replay of the same events leaves the totals
+/// unchanged, because the rebuild replaced them and the replay re-applied the
+/// same turns to the same values.
+#[tokio::test]
+async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_event() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let message = AgentMessage::Assistant(Box::new(assistant_with_usage(1_000, 200, 500, 0, 0.01)));
+    lane.append_message(message.clone()).await.unwrap();
+    let state = test_tui_state();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    // The live drain counted the turn first, as it does before `AgentEnd`.
+    handle_agent_event(
+        AgentEvent::MessageEnd { message },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let expected = footer_text(&state);
+    // The barrier point: the rebuild replaces the accumulated totals.
+    reconcile_footer_from_lane(&lane, &state).await;
+    assert_eq!(
+        footer_text(&state),
+        expected,
+        "reconciliation must restore exactly what the live path counted"
+    );
+    // The next run's turn: same timestamp+usage shape as a persisted turn the
+    // rebuild already counted. The old identity ledger would have suppressed
+    // this; the barrier makes it a plain, correct accumulation.
+    let next_run =
+        AgentMessage::Assistant(Box::new(assistant_with_usage(1_000, 200, 500, 0, 0.01)));
+    lane.append_message(next_run.clone()).await.unwrap();
+    handle_agent_event(
+        AgentEvent::MessageEnd { message: next_run },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let after = footer_text(&state);
+    assert!(
+        after.contains("↑2.0k"),
+        "a later identical-shaped turn must count on top of a rebuild: {after}"
+    );
+}
+
+/// The duplicate-suppression invariant, re-stated for the `AgentEnd` barrier:
+/// the live drain counts a turn first; the drain's own reconciliation then
+/// replaces the totals with the same values; nothing can re-add that turn
+/// afterwards, because the barrier guarantees every event queued before the
+/// rebuild was already applied and no `MessageEnd` of the finished run arrives
+/// after `AgentEnd`. Replay-driven re-entry (`/resume` render) also replaces
+/// rather than accumulates. Pinning the "does not double" half of the
+/// contract: `review_distinct_turn_...` pins the "distinct turns count" half.
 #[tokio::test]
 async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
     let harness = AgentHarness::create(Default::default()).await.unwrap();
@@ -1375,9 +1485,7 @@ async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
         true,
         None,
     ));
-    // A prior overflow was handled, but the final MessageEnd is still queued.
-    reconcile_footer_from_lane(&lane, &state).await;
-    let expected = footer_text(&state);
+    // The live drain applied the turn's `MessageEnd` first.
     handle_agent_event(
         AgentEvent::MessageEnd { message },
         &tui,
@@ -1386,10 +1494,22 @@ async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
         &lane,
     )
     .await;
+    let expected = footer_text(&state);
+    // The barrier point: the drain reconciles AFTER everything it delivered.
+    // The rebuild must restore the same totals, not add them again.
+    reconcile_footer_from_lane(&lane, &state).await;
     assert_eq!(
         footer_text(&state),
         expected,
-        "a delayed terminal event must not count persisted usage twice"
+        "a rebuild after the drain applied every event must not double the usage"
+    );
+    // The durable log is the authority: a second rebuild (as a session switch
+    // or resume would trigger) is idempotent, still without a ledger.
+    reconcile_footer_from_lane(&lane, &state).await;
+    assert_eq!(
+        footer_text(&state),
+        expected,
+        "repeated rebuilds must stay idempotent"
     );
 }
 

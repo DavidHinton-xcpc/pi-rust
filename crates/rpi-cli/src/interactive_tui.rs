@@ -60,7 +60,6 @@ mod tests;
 mod state;
 pub(crate) use state::configured_keybindings;
 use state::*;
-mod assistant_usage_key;
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -1276,7 +1275,6 @@ pub async fn interactive_tui(
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         events_lagged: std::sync::atomic::AtomicBool::new(false),
-        counted_usage: std::sync::Mutex::new(Vec::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(initial_transformer)),
         extension_claimed_keys: Mutex::new(Default::default()),

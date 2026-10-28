@@ -212,26 +212,21 @@ pub(super) async fn run_prompt_streaming(
     // `AgentEnd` event necessarily reaches the drain task.
     refresh_pending_messages(state, lane).await;
 
-    // Authoritative footer reconciliation. The streaming drain normally updates
-    // the counters from `MessageEnd`, but that event is terminal: an `AgentEvent`
-    // broadcast that overflows drops it outright, and nothing later in the stream
-    // re-sends it. (`MessageUpdate` does carry a full snapshot, which is why the
-    // transcript self-heals and the footer does not.)
-    //
-    // Rebuild every counter from the durable log once a gap was reported, rather
-    // than patching the one field that happened to be noticed: usage totals,
-    // cache-hit rate and the context badge must all survive a dropped event, and
-    // the badge's old single-field fallback is what made the freeze look partial.
-    // Gated on the flag so an ordinary turn pays nothing for a whole-branch read.
-    if state
-        .events_lagged
-        .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-        reconcile_footer_from_lane(lane, state).await;
-    } else if let Ok(result) = &outcome {
-        // Non-lagged path: the drain saw every event, so only the badge needs the
-        // run-outcome fallback — the broadcast is asynchronous and the harness
-        // result can resolve before the drain processes the final `MessageEnd`.
+    // Footer repair for a dropped `MessageEnd` used to live here, but that call
+    // raced the drain: the final assistant message can already be in the log
+    // while its `MessageEnd` is still queued, so the rebuild counted turns the
+    // drain was about to count again — and a distinct turn with the same
+    // timestamp and usage is indistinguishable from that delayed duplicate by
+    // content alone. Reconciliation now runs inside the drain's `AgentEnd`
+    // handler, which the FIFO broadcast turns into a consumption barrier: every
+    // event queued before it has been applied, so a `set_usage` rebuild can
+    // never be followed by a delayed duplicate of what it counted.
+    if let Ok(result) = &outcome {
+        // The context badge keeps its run-outcome fallback: it shows one turn's
+        // measurement (set semantics, nothing accumulated), so racing the drain
+        // costs nothing — the drain's own `MessageEnd` handling just overwrites
+        // it. On the non-streaming path there is no drain at all, and this is
+        // the only place the badge gets a value from.
         let final_message: Option<&AssistantMessage> = match &result.outcome {
             HarnessRunOutcome::Completed { final_message, .. }
             | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),

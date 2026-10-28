@@ -211,6 +211,21 @@ pub(super) async fn handle_agent_event(
             // The run drained the queue; refresh so consumed entries drop out
             // of the pending-messages display.
             refresh_pending_messages(state, lane).await;
+            // Authoritative footer reconciliation when the broadcast dropped
+            // events (`Lagged`). `AgentEnd` is the barrier that makes a rebuild
+            // here safe: the broadcast preserves order, so at this point every
+            // event queued before it — including every `MessageEnd` this run
+            // emitted — has already been through this handler, and no event of
+            // this run can arrive after it to be counted twice. Rebuilding only
+            // on the lagged path keeps an ordinary turn off the whole-branch
+            // read; a dropped `MessageEnd` is terminal, so the frozen counters
+            // have no later carrier to heal them and need the durable log.
+            if state
+                .events_lagged
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                reconcile_footer_from_lane(lane, state).await;
+            }
             tui.request_render(false);
         }
 
@@ -343,33 +358,25 @@ pub(super) async fn handle_agent_event(
                 // Uses the shared cache-stats logic (noise floor, idle gap,
                 // model change) and prices the miss when known.
                 let usage = &a.usage;
-                // Footer usage totals + cache hit rate (pi footer.ts).
-                //
-                // Skipped when run-end reconciliation already counted this
-                // turn: the broadcast is asynchronous, so a persisted
-                // `MessageEnd` can still be queued when reconciliation rebuilds
-                // the totals from the log. Adding it again would double the
-                // counter for a turn the durable log lists once.
-                if state.usage_was_counted(a) {
-                    tracing::debug!(
-                        timestamp = a.timestamp,
-                        "delayed MessageEnd arrived after footer reconciliation; \
-                         usage already counted"
-                    );
-                } else {
-                    state.footer.add_usage(
-                        usage.input,
-                        usage.output,
-                        usage.cache_read,
-                        usage.cache_write,
-                        usage.cost.total,
-                    );
-                    let denom = usage.input + usage.cache_read + usage.cache_write;
-                    if denom > 0 && (usage.cache_read + usage.cache_write) > 0 {
-                        state.footer.set_cache_hit_rate(Some(
-                            usage.cache_read as f64 / denom as f64 * 100.0,
-                        ));
-                    }
+                // Footer usage totals + cache hit rate (pi footer.ts). Unconditional
+                // accumulation: the duplicate-suppression problem is handled at the
+                // reconciliation site instead — reconciliation only runs inside this
+                // drain (see the `AgentEnd` arm), where the FIFO broadcast guarantees
+                // every event queued before it has already been through this handler.
+                // A rebuild that replaced the totals can therefore never be followed
+                // by a still-queued duplicate of a turn it already counted.
+                state.footer.add_usage(
+                    usage.input,
+                    usage.output,
+                    usage.cache_read,
+                    usage.cache_write,
+                    usage.cost.total,
+                );
+                let denom = usage.input + usage.cache_read + usage.cache_write;
+                if denom > 0 && (usage.cache_read + usage.cache_write) > 0 {
+                    state
+                        .footer
+                        .set_cache_hit_rate(Some(usage.cache_read as f64 / denom as f64 * 100.0));
                 }
                 // Context-window badge (`?/512k` → `63.2%/512k`): the provider
                 // reports the prompt token count for this request, which is the
@@ -501,7 +508,10 @@ pub(super) fn record_context_usage(
 }
 
 /// Fold the session's recorded usage into the footer, replacing whatever the
-/// live `MessageEnd` path accumulated.
+/// live `MessageEnd` path accumulated. Only called from the drain's `AgentEnd`
+/// handler: the FIFO broadcast makes that call a consumption barrier, so every
+/// event queued before it has already been applied and a rebuild here can never
+/// be followed by a delayed duplicate of a turn it counted.
 ///
 /// The live path (`handle_agent_event`) can only add what it actually observed.
 /// An `AgentEvent` broadcast that overflows reports `Lagged` and drops events
@@ -560,15 +570,6 @@ pub(super) async fn reconcile_footer_from_lane(lane: &Arc<dyn AgentLane>, state:
             a.usage.cache_write,
             a.usage.cost.total,
         );
-        // Record what this rebuild counted. The `AgentEvent` broadcast is
-        // asynchronous: the final assistant message can already be in the log
-        // while its `MessageEnd` is still queued. Without this ledger the drain
-        // would `add_usage` that turn a second time when it finally arrives.
-        state.record_counted_usage(assistant_usage_key::Key::new(
-            message_entry.base.seq,
-            a.timestamp,
-            &a.usage,
-        ));
         let denom = a.usage.input + a.usage.cache_read + a.usage.cache_write;
         if denom > 0 && (a.usage.cache_read + a.usage.cache_write) > 0 {
             hit_rate = Some(a.usage.cache_read as f64 / denom as f64 * 100.0);
