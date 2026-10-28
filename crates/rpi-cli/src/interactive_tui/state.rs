@@ -6,6 +6,12 @@ use super::*;
 // Streaming run status
 // ===========================================================================
 
+/// Upper bound on the footer's usage dedupe ledger. Reconciliation records one
+/// key per assistant turn it rebuilt from the log; a session that overflows this
+/// only stops deduplicating its oldest turns, whose events the drain delivered
+/// long ago.
+pub(super) const MAX_COUNTED_USAGE: usize = 256;
+
 /// The live status of the agent run, fed to the footer + status slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RunStatus {
@@ -319,6 +325,22 @@ pub(super) struct TuiState {
     /// rebuild is affordable; without it every turn would have to re-read the
     /// whole branch to notice a gap that almost never happens.
     pub(super) events_lagged: std::sync::atomic::AtomicBool,
+    /// Usage already counted in the footer, keyed by the assistant message's own
+    /// identity (`timestamp` + token counts).
+    ///
+    /// Run-end [reconciliation](crate::interactive_tui::reconcile_footer_from_lane)
+    /// replaces the counters with a rebuild from the durable log, but the
+    /// `AgentEvent` drain is asynchronous: a `MessageEnd` that was still queued
+    /// when reconciliation ran would arrive afterwards and `add_usage` the same
+    /// turn a second time (measured: `↑1.0k / $0.010` → `↑2.0k / $0.020`).
+    ///
+    /// Reconciliation records what it counted here; the live handler skips a
+    /// message whose identity is present. Only reconciled turns are recorded, so
+    /// a message that never reached the log (a refused write) still counts when
+    /// its event arrives. Retained across runs — dropping it at run start would
+    /// re-open the window for an event delayed past the boundary — and bounded by
+    /// [`MAX_COUNTED_USAGE`], which evicts the oldest entry.
+    pub(super) counted_usage: std::sync::Mutex<Vec<assistant_usage_key::Key>>,
     /// The in-progress scoped-models selection while the `/scoped-models`
     /// selector is open (toggle per item, Esc saves). `None` when not editing.
     pub(super) scoped_edit: std::sync::Mutex<Option<Vec<String>>>,
@@ -1230,6 +1252,37 @@ impl TuiState {
     pub(super) fn set_status(&self, status: RunStatus) {
         *self.status.lock().unwrap() = status;
         self.apply_status(status);
+    }
+
+    // =======================================================================
+    // Footer usage accounting across the live/reconcile race
+    // =======================================================================
+
+    /// Record that footer reconciliation already counted this turn in its rebuild
+    /// from the durable log.
+    pub(super) fn record_counted_usage(&self, key: assistant_usage_key::Key) {
+        let mut counted = self.counted_usage.lock().unwrap();
+        counted.push(key);
+        // Keep the ledger bounded: a session long enough to overflow it only loses
+        // the ability to deduplicate its very oldest turns, which the drain finished
+        // delivering long ago.
+        if counted.len() > MAX_COUNTED_USAGE {
+            let excess = counted.len() - MAX_COUNTED_USAGE;
+            counted.drain(..excess);
+        }
+    }
+
+    /// Whether a live `MessageEnd` would re-count a turn reconciliation already
+    /// applied. Deliberately non-destructive: a single turn can legitimately
+    /// deliver more than one terminal event, so the ledger is retained rather
+    /// than consumed.
+    pub(super) fn usage_was_counted(&self, message: &AssistantMessage) -> bool {
+        let live = assistant_usage_key::Key::from_message(message);
+        self.counted_usage
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|recorded| live.matches_recorded(recorded))
     }
 
     /// The dock container listing queued messages (upstream's

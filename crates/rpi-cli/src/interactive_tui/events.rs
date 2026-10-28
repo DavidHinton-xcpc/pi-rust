@@ -344,18 +344,32 @@ pub(super) async fn handle_agent_event(
                 // model change) and prices the miss when known.
                 let usage = &a.usage;
                 // Footer usage totals + cache hit rate (pi footer.ts).
-                state.footer.add_usage(
-                    usage.input,
-                    usage.output,
-                    usage.cache_read,
-                    usage.cache_write,
-                    usage.cost.total,
-                );
-                let denom = usage.input + usage.cache_read + usage.cache_write;
-                if denom > 0 && (usage.cache_read + usage.cache_write) > 0 {
-                    state
-                        .footer
-                        .set_cache_hit_rate(Some(usage.cache_read as f64 / denom as f64 * 100.0));
+                //
+                // Skipped when run-end reconciliation already counted this
+                // turn: the broadcast is asynchronous, so a persisted
+                // `MessageEnd` can still be queued when reconciliation rebuilds
+                // the totals from the log. Adding it again would double the
+                // counter for a turn the durable log lists once.
+                if state.usage_was_counted(a) {
+                    tracing::debug!(
+                        timestamp = a.timestamp,
+                        "delayed MessageEnd arrived after footer reconciliation; \
+                         usage already counted"
+                    );
+                } else {
+                    state.footer.add_usage(
+                        usage.input,
+                        usage.output,
+                        usage.cache_read,
+                        usage.cache_write,
+                        usage.cost.total,
+                    );
+                    let denom = usage.input + usage.cache_read + usage.cache_write;
+                    if denom > 0 && (usage.cache_read + usage.cache_write) > 0 {
+                        state.footer.set_cache_hit_rate(Some(
+                            usage.cache_read as f64 / denom as f64 * 100.0,
+                        ));
+                    }
                 }
                 // Context-window badge (`?/512k` → `63.2%/512k`): the provider
                 // reports the prompt token count for this request, which is the
@@ -546,6 +560,15 @@ pub(super) async fn reconcile_footer_from_lane(lane: &Arc<dyn AgentLane>, state:
             a.usage.cache_write,
             a.usage.cost.total,
         );
+        // Record what this rebuild counted. The `AgentEvent` broadcast is
+        // asynchronous: the final assistant message can already be in the log
+        // while its `MessageEnd` is still queued. Without this ledger the drain
+        // would `add_usage` that turn a second time when it finally arrives.
+        state.record_counted_usage(assistant_usage_key::Key::new(
+            message_entry.base.seq,
+            a.timestamp,
+            &a.usage,
+        ));
         let denom = a.usage.input + a.usage.cache_read + a.usage.cache_write;
         if denom > 0 && (a.usage.cache_read + a.usage.cache_write) > 0 {
             hit_rate = Some(a.usage.cache_read as f64 / denom as f64 * 100.0);

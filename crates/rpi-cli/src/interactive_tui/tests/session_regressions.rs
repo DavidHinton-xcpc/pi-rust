@@ -1358,6 +1358,91 @@ async fn footer_reconcile_is_idempotent_on_top_of_the_live_totals() {
         "the live totals must survive unchanged: {once}"
     );
 }
+
+/// Reconciliation and the broadcast drain are not synchronized: the final
+/// assistant message can already be in the log while its `MessageEnd` is still
+/// queued. Reconciliation counts it via `set_usage`; when the drain later
+/// handles that same terminal event the accumulate path must not count it again.
+#[tokio::test]
+async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let message = AgentMessage::Assistant(Box::new(assistant_with_usage(1_000, 200, 500, 0, 0.01)));
+    lane.append_message(message.clone()).await.unwrap();
+    let state = test_tui_state();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    // A prior overflow was handled, but the final MessageEnd is still queued.
+    reconcile_footer_from_lane(&lane, &state).await;
+    let expected = footer_text(&state);
+    handle_agent_event(
+        AgentEvent::MessageEnd { message },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    assert_eq!(
+        footer_text(&state),
+        expected,
+        "a delayed terminal event must not count persisted usage twice"
+    );
+}
+
+/// The dedupe ledger must only suppress turns reconciliation actually rebuilt
+/// from the log. A message whose append was refused never reaches session
+/// storage, so reconciliation cannot have counted it — its terminal event is the
+/// only chance the user's footer gets to see that usage.
+#[tokio::test]
+async fn review_unpersisted_message_after_reconcile_still_counts_once() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    // Persisted turn: reconciliation sees it.
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 0, 0.010,
+    ))))
+    .await
+    .unwrap();
+    let state = test_tui_state();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    reconcile_footer_from_lane(&lane, &state).await;
+    assert!(
+        footer_text(&state).contains("↑1.0k"),
+        "precondition: reconciliation rebuilt the persisted turn"
+    );
+
+    // A later turn that never made it into storage: same shape, different usage.
+    let unpersisted =
+        AgentMessage::Assistant(Box::new(assistant_with_usage(4_000, 300, 0, 0, 0.040)));
+    handle_agent_event(
+        AgentEvent::MessageEnd {
+            message: unpersisted,
+        },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let footer = footer_text(&state);
+    assert!(
+        footer.contains("↑5.0k"),
+        "an unpersisted turn must still be counted when its event arrives: {footer}"
+    );
+    assert!(
+        footer.contains("$0.050"),
+        "its cost must be counted too: {footer}"
+    );
+}
+
 /// `/name` and a resumed session both have to reach the footer's line 1: the
 /// slot is rendered (`pwd_line`) but nothing in production ever wrote it, so
 /// the name was recorded in the log and then never shown.
