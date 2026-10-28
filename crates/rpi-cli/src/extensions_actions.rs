@@ -660,6 +660,7 @@ impl RuntimeActionHost for HarnessActionHost {
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let new_session: Session = open_session_by_id_in_dir(&id, &cwd_str, &self.session_dir)
             .await
+            .map(|restored| restored.session)
             .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();
         crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;

@@ -1912,7 +1912,11 @@ pub async fn interactive(
         )
         .await
     } else {
-        // Fall back to simple REPL
+        // Fall back to simple REPL. No transcript container to hold notes, so
+        // the startup notices print as plain lines instead.
+        for notice in &reload_context.startup_notices {
+            eprintln!("note: {notice}");
+        }
         interactive_repl(harness, args, initial, extra_messages, initial_images).await
     };
 
