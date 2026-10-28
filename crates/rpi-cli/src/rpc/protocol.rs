@@ -119,6 +119,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_state",
     "get_commands",
     "execute_command",
+    "get_commands",
+    "execute_command",
     "get_messages",
     "get_history",
     "get_session_branch",
@@ -177,6 +179,7 @@ pub fn ready() -> Value {
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
+        "supportedEvents": ["session_entry_committed"],
         "semantics": {
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
