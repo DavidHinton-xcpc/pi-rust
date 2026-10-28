@@ -2284,6 +2284,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_append_entry_publishes_generic_commit_event() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        client
+            .write_all(
+                br#"{"type":"append_entry","id":1,"customType":"durable-state","data":{"revision":1}}
+"#,
+            )
+            .await
+            .unwrap();
+
+        let event = output
+            .wait_for(|message| message["type"] == "session_entry_committed")
+            .await;
+        assert_eq!(event["customType"], "durable-state");
+        assert_eq!(event["entryType"], "custom");
+        assert_eq!(event["lane"], "main");
+        assert!(event["entryId"].as_str().is_some());
+
+        client
+            .write_all(
+                br#"{"type":"stop","id":2}
+"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_compaction_settlement_identifies_its_durable_operation() {
         let (harness, _) = rpc_test_harness("unused", 0.0).await;
         let output = RpcOutput::default();
