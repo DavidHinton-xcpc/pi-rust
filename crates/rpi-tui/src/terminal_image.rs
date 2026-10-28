@@ -209,12 +209,17 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
         .map(|c| std::str::from_utf8(c).unwrap_or(""))
         .collect();
 
+    // Kitty caps one escape at 4096 bytes, so larger payloads must be split.
+    // The first chunk carries the control keys plus `m=1`; each following chunk
+    // carries `m=1` alone, and the final one closes the transfer with `m=0`.
+    // Without that flag a terminal decodes every chunk as a complete image, so
+    // a multi-chunk payload is read as truncated image data and dropped.
     for (i, chunk) in chunks.iter().enumerate() {
-        let _m = if i == chunks.len() - 1 { 0 } else { 1 };
-        parts.push(format!("\x1b_G{};{}\x1b\\", control, chunk));
-        // After first chunk, don't repeat control
+        let more = u8::from(i + 1 < chunks.len());
         if i == 0 {
-            control.clear();
+            parts.push(format!("\x1b_G{},m={more};{chunk}\x1b\\", control));
+        } else {
+            parts.push(format!("\x1b_Gm={more};{chunk}\x1b\\"));
         }
     }
 
@@ -538,6 +543,101 @@ mod tests {
         // let link = hyperlink("https://example.com", "Click here");
         // assert!(link.contains("https://example.com"));
         // assert!(link.contains("Click here"));
+    }
+
+    #[test]
+    fn kitty_chunks_carry_the_more_data_flag() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        // A payload the size of a real screenshot: base64 is far past the
+        // 4096-byte escape limit, so the encoder must split it.
+        let mut payload = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        payload.resize(44_181, 0);
+        let sequence = encode_kitty(
+            &payload,
+            &ImageRenderOptions {
+                id: Some(11),
+                width: Some(40),
+                height: Some(8),
+                ..Default::default()
+            },
+        );
+
+        // A payload that fits in one escape stays a single, self-terminated
+        // transfer: no continuation flag, but an explicit close.
+        let single = encode_kitty(b"png", &ImageRenderOptions::default());
+        assert_eq!(
+            single.split("\x1b_G").count() - 1,
+            1,
+            "a small payload must not be split"
+        );
+        assert!(
+            single.split(';').next().unwrap_or("").ends_with(",m=0"),
+            "the single chunk must close the transfer with m=0, got {single:?}"
+        );
+        assert!(
+            !single.contains("m=1"),
+            "the single chunk must not claim more data follows"
+        );
+
+        let chunks: Vec<&str> = sequence.split("\x1b_G").skip(1).collect();
+        assert!(
+            chunks.len() > 1,
+            "expected a multi-chunk transfer, got {} chunk(s)",
+            chunks.len()
+        );
+
+        let mut reassembled = String::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last = index == chunks.len() - 1;
+            let body = chunk
+                .strip_suffix("\x1b\\")
+                .unwrap_or_else(|| panic!("chunk {index} is not terminated by ESC \\"));
+            let (control, data) = body
+                .split_once(';')
+                .unwrap_or_else(|| panic!("chunk {index} has no data separator"));
+            assert!(
+                body.len() + 2 <= 4096,
+                "chunk {index} is {} bytes; kitty allows at most 4096",
+                body.len() + 2
+            );
+            // Every chunk but the last tells the terminal more data follows;
+            // the last one closes the transfer.
+            if last {
+                assert!(
+                    control.split(',').any(|field| field == "m=0"),
+                    "last chunk must carry m=0, control was {control:?}"
+                );
+            } else {
+                assert!(
+                    control.split(',').any(|field| field == "m=1"),
+                    "chunk {index} must carry m=1, control was {control:?}"
+                );
+            }
+            // Only the first chunk describes the image; continuations are
+            // limited to the more-data flag.
+            if index == 0 {
+                for key in ["a=T", "f=100", "i=11", "c=40", "r=8", "C=1"] {
+                    assert!(
+                        control.split(',').any(|field| field == key),
+                        "first chunk is missing {key}, control was {control:?}"
+                    );
+                }
+            } else {
+                let expected = if last { "m=0" } else { "m=1" };
+                assert_eq!(
+                    control, expected,
+                    "continuation chunk {index} must only carry the more-data flag"
+                );
+            }
+            reassembled.push_str(data);
+        }
+
+        assert_eq!(
+            reassembled,
+            STANDARD.encode(&payload),
+            "chunk payloads must concatenate back to the original base64"
+        );
     }
 
     #[test]
