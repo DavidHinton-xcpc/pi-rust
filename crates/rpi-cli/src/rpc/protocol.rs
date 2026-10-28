@@ -179,6 +179,7 @@ pub fn ready() -> Value {
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
+        "supportedEvents": ["session_entry_committed"],
         "semantics": {
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",

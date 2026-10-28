@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use rpi_agent::message::AgentMessage;
@@ -141,7 +142,18 @@ pub fn assert_json_serializable(value: &Value) -> SessionResult<()> {
 // Session — the facade. Mirrors TS `class Session`.
 // ---------------------------------------------------------------------------
 
-/// The session facade over a [`SessionStorage`] + [`IdGenerator`]. Mirrors TS
+/// Metadata published after a session entry has been committed.
+///
+/// The event is an invalidation signal only; consumers must reread the branch
+/// when they need the canonical entry data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEntryCommit {
+    pub entry_id: String,
+    pub entry_type: String,
+    pub custom_type: Option<String>,
+    pub lane: String,
+}
+
 /// `Session<TMetadata>`. Holds shared handles (`Arc`) so it is cheaply
 /// [`Clone`] — a `view` of any lane shares the same storage + id generator.
 pub struct Session {
@@ -153,6 +165,7 @@ pub struct Session {
 struct SessionBinding {
     storage: Arc<dyn SessionStorage>,
     volatile_progress: Option<crate::frame_progress::SharedVolatileProgress>,
+    entry_commit_publisher: Option<broadcast::Sender<SessionEntryCommit>>,
 }
 
 impl Clone for Session {
@@ -175,6 +188,7 @@ impl Session {
             binding: Arc::new(RwLock::new(SessionBinding {
                 storage,
                 volatile_progress: None,
+                entry_commit_publisher: None,
             })),
             id_generator: id_generator.unwrap_or_else(|| Arc::new(DefaultIdGenerator::new())),
         }
@@ -190,13 +204,21 @@ impl Session {
     /// TS `SessionManager.rebind` intent (swap the durable backing without
     /// rebuilding the harness).
     pub fn set_storage(&self, storage: Arc<dyn SessionStorage>) {
+        let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         *self.binding.write().unwrap() = SessionBinding {
             storage,
             volatile_progress: None,
+            entry_commit_publisher: publisher,
         };
     }
 
-    /// Pin both storage and recovery state while a harness validates a target.
+    pub fn set_entry_commit_publisher(
+        &self,
+        publisher: Option<broadcast::Sender<SessionEntryCommit>>,
+    ) {
+        self.binding.write().unwrap().entry_commit_publisher = publisher;
+    }
+
     /// Keep the harness's generator, as on the existing session-switch path.
     pub(crate) fn pin(&self, id_generator: Arc<dyn IdGenerator>) -> Self {
         let binding = self.binding.read().unwrap().clone();
@@ -209,7 +231,11 @@ impl Session {
     /// Publish the prepared target without changing the shared facade handles.
     /// The target's cache is adopted; the old session's cache is not carried over.
     pub(crate) fn rebind_to(&self, target: &Self) {
-        let binding = target.binding.read().unwrap().clone();
+        let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
+        let mut binding = target.binding.read().unwrap().clone();
+        if binding.entry_commit_publisher.is_none() {
+            binding.entry_commit_publisher = publisher;
+        }
         *self.binding.write().unwrap() = binding;
     }
 
@@ -677,8 +703,23 @@ impl Session {
         assert_json_serializable(&value)?;
         let diagnostics = agent_diagnostics_enabled();
         let entry_type = entry.type_tag();
+        let custom_type = match &entry.kind {
+            ProvisionedKind::Custom { custom_type, .. } => Some(custom_type.clone()),
+            _ => None,
+        };
         let started = diagnostics.then(Instant::now);
         let result = self.storage_arc().append_entry(entry, lane).await;
+        if let Ok(stamped) = &result {
+            let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
+            if let Some(publisher) = publisher {
+                let _ = publisher.send(SessionEntryCommit {
+                    entry_id: stamped.base().id.clone(),
+                    entry_type: stamped.base().entry_type.clone(),
+                    custom_type,
+                    lane: lane.to_string(),
+                });
+            }
+        }
         if let Some(started) = started {
             eprintln!(
                 "RPI_SESSION_DIAGNOSTICS kind=entry entry_type={} append_ns={}",
@@ -897,6 +938,33 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
         assert_eq!(id.as_bytes()[14], b'7');
+    }
+
+    #[tokio::test]
+    async fn committed_entry_publishes_metadata_after_success() {
+        let session = fixture_session();
+        let (publisher, mut events) = tokio::sync::broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+
+        session
+            .append_entry(
+                ProvisionedEntry {
+                    id: "durable-entry".into(),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: "durable-state".into(),
+                        data: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.entry_id, "durable-entry");
+        assert_eq!(event.entry_type, "custom");
+        assert_eq!(event.custom_type.as_deref(), Some("durable-state"));
+        assert_eq!(event.lane, "main");
     }
 
     #[tokio::test]

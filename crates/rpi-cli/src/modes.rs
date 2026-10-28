@@ -24,6 +24,7 @@ use rpi_harness::agent_harness::{
     AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome,
 };
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
+use rpi_harness::session::session::SessionEntryCommit;
 use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
 
 use crate::args::Args;
@@ -325,6 +326,38 @@ where
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
     let (stdout, writer_task, writer_failed) = start_rpc_writer(output);
     let pump_stop = tokio_util::sync::CancellationToken::new();
+
+    // Publish generic commit metadata after successful Session appends. The
+    // event is intentionally not a durable-state payload: consumers reread
+    // the canonical branch and use this only as an invalidation signal.
+    let (commit_tx, mut commit_rx) = tokio::sync::broadcast::channel::<SessionEntryCommit>(256);
+    harness
+        .session()
+        .set_entry_commit_publisher(Some(commit_tx.clone()));
+    let commit_task = {
+        let out = stdout.clone();
+        tokio::spawn(async move {
+            loop {
+                match commit_rx.recv().await {
+                    Ok(commit) => {
+                        write_line(
+                            &out,
+                            &serde_json::json!({
+                                "type": "session_entry_committed",
+                                "entryId": commit.entry_id,
+                                "entryType": commit.entry_type,
+                                "customType": commit.custom_type,
+                                "lane": commit.lane,
+                            }),
+                        )
+                        .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    };
 
     // A completion response is queued only after its final events, so a
     // subsequent prompt cannot overtake the previous run's agent_end.
@@ -727,6 +760,9 @@ where
         }
     }
     pump_stop.cancel();
+    harness.session().set_entry_commit_publisher(None);
+    commit_task.abort();
+    let _ = commit_task.await;
     let _ = dialog_task.await;
     if let Some(task) = event_task {
         let _ = task.await;
