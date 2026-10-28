@@ -466,9 +466,12 @@ impl Session {
             })?;
             assert_json_serializable(&value)?;
         }
-        self.storage_arc()
+        let result = self
+            .storage_arc()
             .append_record_and_entry(record, entry, lane)
-            .await
+            .await?;
+        self.publish_entry_commit(&result.1, lane);
+        Ok(result)
     }
 
     /// Append a record, an entry, and a following record in that exact order.
@@ -489,9 +492,12 @@ impl Session {
             })?;
             assert_json_serializable(&value)?;
         }
-        self.storage_arc()
+        let result = self
+            .storage_arc()
             .append_record_entry_and_record(before, entry, lane, after)
-            .await
+            .await?;
+        self.publish_entry_commit(&result.1, lane);
+        Ok(result)
     }
 
     /// Append a batch of records through the active storage backend.
@@ -703,22 +709,10 @@ impl Session {
         assert_json_serializable(&value)?;
         let diagnostics = agent_diagnostics_enabled();
         let entry_type = entry.type_tag();
-        let custom_type = match &entry.kind {
-            ProvisionedKind::Custom { custom_type, .. } => Some(custom_type.clone()),
-            _ => None,
-        };
         let started = diagnostics.then(Instant::now);
         let result = self.storage_arc().append_entry(entry, lane).await;
         if let Ok(stamped) = &result {
-            let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
-            if let Some(publisher) = publisher {
-                let _ = publisher.send(SessionEntryCommit {
-                    entry_id: stamped.base().id.clone(),
-                    entry_type: stamped.base().entry_type.clone(),
-                    custom_type,
-                    lane: lane.to_string(),
-                });
-            }
+            self.publish_entry_commit(stamped, lane);
         }
         if let Some(started) = started {
             eprintln!(
@@ -728,6 +722,24 @@ impl Session {
             );
         }
         result
+    }
+
+    /// Publish only after the storage operation succeeds. All entry-writing
+    /// paths, including record/entry batches, use the storage-stamped metadata.
+    fn publish_entry_commit(&self, entry: &Entry, lane: &str) {
+        let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
+        if let Some(publisher) = publisher {
+            let custom_type = match entry {
+                Entry::Custom(custom) => Some(custom.custom_type.clone()),
+                _ => None,
+            };
+            let _ = publisher.send(SessionEntryCommit {
+                entry_id: entry.base().id.clone(),
+                entry_type: entry.base().entry_type.clone(),
+                custom_type,
+                lane: lane.to_string(),
+            });
+        }
     }
 
     /// `commitRecord(record)` — `assertJsonSerializable` then
@@ -928,6 +940,169 @@ mod tests {
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::User(UserMessage::new(text, 1))
+    }
+
+    #[tokio::test]
+    async fn atomic_prompt_commit_also_publishes_invalidation() {
+        use crate::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
+        let session = fixture_session();
+        let (publisher, mut events) = tokio::sync::broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+        let record = LaneRecord::OperationStarted(OperationStartedRecord {
+            base: RecordBase {
+                id: "op-probe".into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
+            source_leaf_id: None,
+            intent: OperationIntent::Run {
+                original_prompt: vec![],
+                initial_messages: vec![],
+                system_prompt_override: None,
+                resume_data: None,
+            },
+        });
+        let (_, entry) = session
+            .append_record_and_entry(
+                record,
+                ProvisionedEntry {
+                    id: "prompt-probe".into(),
+                    kind: ProvisionedKind::Message {
+                        message: user("new prompt"),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        assert_eq!(entry.base().id, "prompt-probe");
+        let event = events
+            .try_recv()
+            .expect("a successfully committed prompt must invalidate RPC clients too");
+        assert_eq!(event.entry_id, "prompt-probe");
+        assert_eq!(event.entry_type, "message");
+        assert_eq!(event.lane, "main");
+        assert_eq!(event.custom_type, None);
+        assert!(session
+            .view("main")
+            .get_entry(&event.entry_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    fn notification_record(id: &str) -> LaneRecord {
+        use crate::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
+        LaneRecord::OperationStarted(OperationStartedRecord {
+            base: RecordBase {
+                id: id.into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
+            source_leaf_id: None,
+            intent: OperationIntent::Run {
+                original_prompt: vec![],
+                initial_messages: vec![],
+                system_prompt_override: None,
+                resume_data: None,
+            },
+        })
+    }
+
+    fn notification_finish() -> LaneRecord {
+        use crate::session::types::{OperationFinishedRecord, OperationOutcome, RecordBase};
+        LaneRecord::OperationFinished(OperationFinishedRecord {
+            base: RecordBase {
+                id: "finish".into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
+            run_id: "notification-op".into(),
+            outcome: OperationOutcome::Completed,
+            error: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn record_entry_record_commit_publishes_stamped_metadata_once() {
+        let session = fixture_session();
+        let (publisher, mut events) = broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+        let (_, entry, _) = session
+            .append_record_entry_and_record(
+                notification_record("notification-op"),
+                ProvisionedEntry {
+                    id: "custom-notification".into(),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: "state-update".into(),
+                        data: None,
+                    },
+                },
+                "main",
+                notification_finish(),
+            )
+            .await
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.entry_id, entry.base().id);
+        assert_eq!(event.entry_type, "custom");
+        assert_eq!(event.custom_type.as_deref(), Some("state-update"));
+        assert_eq!(event.lane, "main");
+        assert!(session
+            .view("main")
+            .get_entry(&event.entry_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_atomic_entry_writes_do_not_publish_commits() {
+        for with_after in [false, true] {
+            let session = fixture_session();
+            let (publisher, mut events) = broadcast::channel(4);
+            session.set_entry_commit_publisher(Some(publisher));
+            let entry = ProvisionedEntry {
+                id: "refused".into(),
+                kind: ProvisionedKind::Message {
+                    message: user("refused"),
+                    terminate: None,
+                },
+            };
+            let before = notification_record("notification-op");
+            if with_after {
+                assert!(session
+                    .append_record_entry_and_record(
+                        before,
+                        entry,
+                        "missing-lane",
+                        notification_finish()
+                    )
+                    .await
+                    .is_err());
+            } else {
+                assert!(session
+                    .append_record_and_entry(before, entry, "missing-lane")
+                    .await
+                    .is_err());
+            }
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[tokio::test]

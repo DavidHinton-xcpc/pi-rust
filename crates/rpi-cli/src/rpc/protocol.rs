@@ -119,8 +119,6 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_state",
     "get_commands",
     "execute_command",
-    "get_commands",
-    "execute_command",
     "get_messages",
     "get_history",
     "get_session_branch",
@@ -207,6 +205,12 @@ pub fn model_descriptor(model: &rpi_ai::Model) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_commands_are_unique() {
+        let commands: std::collections::HashSet<_> = SUPPORTED_COMMANDS.iter().collect();
+        assert_eq!(commands.len(), SUPPORTED_COMMANDS.len());
+    }
 
     #[test]
     fn extension_commands_are_advertised_and_args_default_to_empty() {

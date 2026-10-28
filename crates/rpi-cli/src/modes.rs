@@ -2316,6 +2316,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_prompt_publishes_committed_message_event() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _) = rpc_test_harness("completed", 0.0).await;
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        client
+            .write_all(b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n")
+            .await
+            .unwrap();
+        let event = output
+            .wait_for(|message| {
+                message["type"] == "session_entry_committed" && message["entryType"] == "message"
+            })
+            .await;
+        assert_eq!(event["lane"], "main");
+        assert!(event["entryId"].as_str().is_some());
+        output
+            .wait_for(|message| message["type"] == "agent_settled")
+            .await;
+        client
+            .write_all(b"{\"type\":\"stop\",\"id\":2}\n")
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_compaction_settlement_identifies_its_durable_operation() {
         let (harness, _) = rpc_test_harness("unused", 0.0).await;
         let output = RpcOutput::default();
