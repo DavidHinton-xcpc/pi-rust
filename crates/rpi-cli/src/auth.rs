@@ -26,6 +26,7 @@ use crate::config::{
     self, delete_credential, read_auth, upsert_credential, Credential, DEFAULT_PROVIDER_ID,
 };
 use crate::credentials::CredentialSource;
+use rpi_runtime::credentials::{oauth_needs_refresh, OAuthRefresher, RefreshedOAuth};
 /// Exit code for a missing-credential `auth check` (mirrors upstream's
 /// non-zero `auth check` when not ready).
 const EXIT_NOT_READY: i32 = 1;
@@ -166,52 +167,145 @@ async fn run_refresh(
         eprintln!("error: no OAuth extensions are loaded");
         return EXIT_ERROR;
     };
+    match refresh_stored_oauth(snapshot, provider, false) {
+        Ok(_) => {
+            println!("OAuth credentials refreshed for \"{provider}\".");
+            0
+        }
+        Err(RefreshError::NotStored) => {
+            eprintln!("error: no stored OAuth credentials for \"{provider}\"");
+            EXIT_NOT_READY
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            EXIT_ERROR
+        }
+    }
+}
+
+/// Refresh errors must never put provider output or credential JSON in a transcript.
+enum RefreshError {
+    NotStored,
+    Read,
+    Plugin(rpi_extensions::OAuthExtensionError),
+    Invalid,
+    Save,
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStored => f.write_str("no stored OAuth credentials"),
+            Self::Read => f.write_str("could not read stored OAuth credentials"),
+            Self::Plugin(rpi_extensions::OAuthExtensionError::PluginStatus(status, _)) => {
+                write!(f, "the provider package returned status {status}")
+            }
+            Self::Plugin(_) => f.write_str("the provider package could not refresh the login"),
+            Self::Invalid => f.write_str("OAuth refresh returned an invalid or expired credential"),
+            Self::Save => f.write_str("could not save refreshed OAuth credentials"),
+        }
+    }
+}
+
+/// Refresh `provider`'s stored OAuth credential through its package and save
+/// the result. Shared by `rpi auth refresh` and request-time renewal.
+fn refresh_stored_oauth(
+    snapshot: &Arc<rpi_extensions::RegistrySnapshot>,
+    provider: &str,
+    only_if_needed: bool,
+) -> Result<RefreshedOAuth, RefreshError> {
+    // Share renewal across independently resolved sessions and manual refresh.
+    // This serializes one process only: auth.json has no cross-process lock, so
+    // two processes may still both refresh, as two `rpi auth refresh` runs can.
+    static RENEWING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _renewing = RENEWING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(Credential::Oauth {
         access,
         refresh,
         expires,
-    }) = config::read_oauth_token(provider).ok().flatten()
+    }) = config::read_oauth_token(provider).map_err(|_| RefreshError::Read)?
     else {
-        eprintln!("error: no stored OAuth credentials for \"{provider}\"");
-        return EXIT_NOT_READY;
+        return Err(RefreshError::NotStored);
     };
-    let response = match rpi_extensions::request_oauth(
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(i64::MAX, |duration| duration.as_secs() as i64)
+    };
+    // A different binding or process may have renewed the credential already.
+    if only_if_needed && !access.trim().is_empty() && !oauth_needs_refresh(expires, now()) {
+        return Ok(RefreshedOAuth { access, expires });
+    }
+    if refresh.trim().is_empty() {
+        return Err(RefreshError::Invalid);
+    }
+    let response = rpi_extensions::request_oauth(
         snapshot,
         provider,
         "refresh",
         serde_json::json!({"credential": {"access": access, "refresh": refresh, "expires_at": expires}}),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("error: OAuth refresh failed: {error}");
-            return EXIT_ERROR;
-        }
-    };
-    let response = match rpi_extensions::OAuthActionResponse::parse(response) {
-        Ok(response) => response,
-        Err(error) => {
-            eprintln!("error: invalid OAuth refresh response: {error}");
-            return EXIT_ERROR;
-        }
-    };
-    let Some(token) = (match response.credential() {
-        Ok(token) => token,
-        Err(error) => {
-            eprintln!("error: invalid OAuth refresh credential: {error}");
-            return EXIT_ERROR;
-        }
-    }) else {
-        eprintln!("error: OAuth refresh returned no credential");
-        return EXIT_ERROR;
-    };
-    if let Err(error) =
-        config::upsert_oauth_token(provider, token.access, token.refresh, token.expires_at)
+    )
+    .map_err(RefreshError::Plugin)?;
+    let response =
+        rpi_extensions::OAuthActionResponse::parse(response).map_err(|_| RefreshError::Invalid)?;
+    if response
+        .payload
+        .get("expires_at")
+        .is_some_and(|value| value.as_i64().is_none())
+        || response
+            .payload
+            .get("refresh")
+            .is_some_and(|value| !value.is_string())
     {
-        eprintln!("error: could not save refreshed OAuth credentials: {error}");
-        return EXIT_ERROR;
+        return Err(RefreshError::Invalid);
     }
-    println!("OAuth credentials refreshed for \"{provider}\".");
-    0
+    let token = response
+        .credential()
+        .map_err(|_| RefreshError::Invalid)?
+        .ok_or(RefreshError::Invalid)?;
+    if token.access.trim().is_empty() || (token.expires_at != 0 && token.expires_at <= now()) {
+        return Err(RefreshError::Invalid);
+    }
+    // Providers need not rotate the refresh token on every renewal.
+    let refresh = if token.refresh.trim().is_empty() {
+        refresh
+    } else {
+        token.refresh
+    };
+    config::upsert_oauth_token(provider, token.access.clone(), refresh, token.expires_at)
+        .map_err(|_| RefreshError::Save)?;
+    Ok(RefreshedOAuth {
+        access: token.access,
+        expires: token.expires_at,
+    })
+}
+
+/// Renews stored OAuth credentials through the loaded provider packages before
+/// a request sends them.
+pub(crate) struct PackageOAuthRefresher {
+    snapshot: Arc<rpi_extensions::RegistrySnapshot>,
+    _keepalive: Arc<rpi_extensions::PluginKeepalive>,
+}
+
+impl PackageOAuthRefresher {
+    pub(crate) fn new(session: &rpi_extensions::ExtensionSession) -> Option<Self> {
+        Some(Self {
+            snapshot: session.snapshot_arc()?,
+            _keepalive: session.keepalive(),
+        })
+    }
+}
+
+impl OAuthRefresher for PackageOAuthRefresher {
+    fn supports(&self, provider: &str) -> bool {
+        self.snapshot.oauth_provider(provider).is_some()
+    }
+
+    fn refresh(&self, provider: &str) -> Result<RefreshedOAuth, String> {
+        refresh_stored_oauth(&self.snapshot, provider, true).map_err(|error| error.to_string())
+    }
 }
 
 async fn run_logout(

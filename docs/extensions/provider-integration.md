@@ -148,8 +148,8 @@ Provider 负责“怎样请求模型”，auth 负责“以谁的凭据请求”
 同时实现 OAuth；API key package 声明认证策略后即可使用通用 `auth` 命令。
 
 宿主按 provider ID 解析默认凭据：选中 provider 的 `--api-key` → `auth.json` 的有效 key
-或未过期 OAuth token → `models.json` 的 `apiKey` → package 声明的环境变量 → 显式允许的匿名。
-空白值、无法解析的引用与过期 token 不算可用凭据；显式认证请求头也参与就绪判断。
+或可用 OAuth token → `models.json` 的 `apiKey` → package 声明的环境变量 → 显式允许的匿名。
+空白值、无法解析的引用与无法刷新的过期 token 不算可用凭据；显式认证请求头也参与就绪判断。
 只有内置 Anthropic、OpenAI 保留自己的默认环境变量规则；DeepSeek 也通过 package 声明认证，新 provider 不会因为
 使用 `openai-completions` 而继承 `OPENAI_API_KEY`，也不会根据 ID 自动推导环境变量名。
 
@@ -178,6 +178,12 @@ rpi auth logout --provider vendor-example
 # 尚未安装的动态库：显式路径写在 auth 子命令后
 rpi auth check --provider vendor-example --extension /path/to/provider.dll --json
 ```
+
+加载匹配 OAuth 扩展且存储项含 refresh token 时，过期凭据仍可用于选择 provider。
+宿主在每次请求前检查到期时间，在到期前 60 秒内调用扩展的 `refresh`，先保存成功结果再发送请求；
+同一进程的并发请求共享刷新结果。省略新 refresh token 时保留原值，`expires_at: 0` 表示无已知到期时间。
+刷新或保存失败会终止请求并提示重新登录，不会发送旧 token。显式 API key 保持原有优先级。
+刷新沿用同步 OAuth callback；跨进程写入锁及 OAuth callback 取消不属于此机制。
 
 `refresh` 需要对应 OAuth 实现；API key 不通过它刷新。`auth check` 只检查本地就绪状态，
 不访问服务端、不刷新 token，不能证明 key 在服务端有效。JSON 的 `source` 可能是

@@ -582,12 +582,14 @@ provider / API / model ID 恢复；修改公开描述不能重定向绑定的凭
 
 默认凭据由宿主按 provider ID 解析：选中 provider 的 `--api-key` → `auth.json`
 有效 key / OAuth → `models.json` → 声明的 `apiKeyEnv` → 显式允许的匿名。
-协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和过期 token 不算可用。
+协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和无法刷新的过期 token 不算可用。
 目录不得含凭据；请求参数、token 与私密请求头不得进入日志、普通事件或错误文本。
 OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负责通用命令与存储。
 
-`auth check`、`/provider` 与实际请求使用同一认证解析。`auth check` 只检查本地状态，
-不访问服务端或刷新 token；退出码为就绪 0、缺少凭据 1、配置错误 2。
+加载匹配 OAuth 扩展且存储项含 refresh token 时，宿主可选择过期登录对应的 provider，
+并在每次请求前自动刷新已过期或 60 秒内到期的 token，先保存再使用；刷新失败不发送旧 token。
+`auth check` 只检查本地未过期凭据，不访问服务端或刷新 token，可能在请求仍可自动刷新时报告缺少凭据；
+退出码为就绪 0、缺少凭据 1、配置错误 2。
 `/provider <id>` 与列表选择会即时切换当前会话并保存默认模型；缺少认证或切换失败时
 保留原会话与默认值。`/model` 选择具体模型；`/provider remove` 删除配置，
 卸载 package 使用 `rpi package unlink`。API-key logout 不会清除环境变量或 models.json。
