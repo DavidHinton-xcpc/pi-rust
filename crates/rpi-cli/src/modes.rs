@@ -761,8 +761,13 @@ where
     }
     pump_stop.cancel();
     harness.session().set_entry_commit_publisher(None);
-    commit_task.abort();
-    let _ = commit_task.await;
+    // Accepted writers have finished. Close the last local sender and let the
+    // receiver forward queued commits before the output writer is flushed.
+    drop(commit_tx);
+    if let Err(error) = commit_task.await {
+        eprintln!("[rpi] rpc commit event task failed: {error}");
+        exit_code = 1;
+    }
     let _ = dialog_task.await;
     if let Some(task) = event_task {
         let _ = task.await;
@@ -2340,6 +2345,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_stop_flushes_all_accepted_entry_invalidations() {
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let output = RpcOutput::default();
+        let mut input = String::new();
+        for id in 1..=4 {
+            input.push_str(&format!(
+                "{{\"type\":\"append_entry\",\"id\":{id},\"customType\":\"durable-state\"}}\n"
+            ));
+        }
+        input.push_str("{\"type\":\"stop\",\"id\":5}\n");
+        let result = rpc_with_io(
+            &harness,
+            None,
+            vec![],
+            rpi_extensions::UiDialogMailbox::new(),
+            None,
+            tokio::io::BufReader::new(input.as_bytes()),
+            output.clone(),
+        )
+        .await;
+        assert_eq!(result, 0);
+        let messages = output.messages();
+        let commits: std::collections::HashSet<_> = messages
+            .iter()
+            .filter(|m| m["type"] == "session_entry_committed")
+            .map(|m| m["entryId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commits.len(),
+            4,
+            "stop must flush every committed entry: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_eof_flushes_queued_entry_invalidations() {
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let output = RpcOutput::default();
+        let input = b"{\"type\":\"append_entry\",\"id\":1,\"customType\":\"durable-state\",\"data\":{\"revision\":1}}\n";
+        let result = rpc_with_io(
+            &harness,
+            None,
+            vec![],
+            rpi_extensions::UiDialogMailbox::new(),
+            None,
+            tokio::io::BufReader::new(&input[..]),
+            output.clone(),
+        )
+        .await;
+        assert_eq!(result, 0);
+        let messages = output.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["type"] == "response" && m["id"] == 1 && m["success"] == true),
+            "append succeeded: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["type"] == "session_entry_committed"),
+            "EOF must flush the queued commit event: {messages:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
