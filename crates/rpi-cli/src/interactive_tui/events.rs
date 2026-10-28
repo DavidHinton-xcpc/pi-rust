@@ -543,7 +543,9 @@ pub(super) fn report_write_failures(chat: &Arc<Container>, lane: &Arc<dyn AgentL
             chat,
             &format!(
                 "Session not saved: could not persist {} ({}). \
-                 Your messages are still on screen; use /export before exiting.",
+                 Your messages are still on screen, and /export now writes the \
+                 unsaved ones into the exported file — do that before exiting: \
+                 the session log cannot be repaired.",
                 failure.what, failure.message
             ),
         );

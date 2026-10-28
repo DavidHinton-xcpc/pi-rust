@@ -684,6 +684,10 @@ pub struct AgentHarness {
     /// screen reaches nobody, and a conversation that silently stopped being
     /// saved is the one failure a user has to act on before exiting.
     write_failures: Arc<Mutex<Vec<HarnessWriteFailure>>>,
+    /// Messages whose append was refused, kept verbatim so `/export` can still
+    /// write them. Session-backed export reads applied entries only, so without
+    /// this the refused content would exist nowhere but the screen.
+    unsaved_messages: Arc<Mutex<Vec<UnsavedMessage>>>,
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
@@ -699,6 +703,22 @@ pub struct HarnessWriteFailure {
     /// The backend's message, verbatim.
     pub message: String,
     /// When the failure was recorded (`Clock` milliseconds).
+    pub at: i64,
+}
+
+/// An unsaved message kept as a recovery copy for the host's export path.
+///
+/// JSONL storage applies an entry to its in-memory view only after the append
+/// succeeds, so a refused write leaves *no* copy of that message anywhere the
+/// session-backed `/export` can read. Without this the guidance to export before
+/// exiting would promise a recovery the export cannot deliver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsavedMessage {
+    /// The message whose append was refused, verbatim.
+    pub message: AgentMessage,
+    /// What could not be persisted, matching the [`HarnessWriteFailure`] `what`.
+    pub what: String,
+    /// When the refusal was recorded (`Clock` milliseconds).
     pub at: i64,
 }
 
@@ -859,6 +879,7 @@ impl AgentHarness {
             lane: "main".to_string(),
             message_writes: Arc::new(tokio::sync::Mutex::new(())),
             write_failures: Arc::new(Mutex::new(Vec::new())),
+            unsaved_messages: Arc::new(Mutex::new(Vec::new())),
             child_scope,
             is_child: false,
             max_turns: None,
@@ -1167,6 +1188,44 @@ impl AgentHarness {
         record_write_failure(&self.write_failures, what, message);
     }
 
+    /// Keep a message whose append was refused so the export path can still
+    /// write it.
+    ///
+    /// The recovery guidance tells the user to export before exiting, but
+    /// `export_session` reads session entries and a refused append never becomes
+    /// one. Retaining the message here is what makes that guidance true rather
+    /// than merely hopeful. Bounded like [`MAX_WRITE_FAILURES`]: a backend that
+    /// refuses every write during a long run must not grow this without limit.
+    fn keep_unsaved_message(&self, what: &str, message: AgentMessage) {
+        let mut unsaved = self
+            .unsaved_messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if unsaved.len() >= MAX_WRITE_FAILURES {
+            return;
+        }
+        unsaved.push(UnsavedMessage {
+            message,
+            what: what.to_string(),
+            at: now_ms(),
+        });
+    }
+
+    /// Every message whose append was refused and that storage therefore never
+    /// applied, oldest first.
+    ///
+    /// Read-only on purpose: the host consults it while building an export,
+    /// which must stay repeatable (a user who exports twice after one failure
+    /// gets the same file, and a second export after another failure includes
+    /// both). The copy lives as long as the harness, which is the same window in
+    /// which the transcript is still on screen.
+    pub fn unsaved_messages(&self) -> Vec<UnsavedMessage> {
+        self.unsaved_messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Take the write failures recorded since the last drain.
     ///
     /// The host calls this at `AgentEnd` and when a run finishes, then renders
@@ -1191,6 +1250,7 @@ impl AgentHarness {
             lane: name.to_string(),
             message_writes: Arc::clone(&self.message_writes),
             write_failures: Arc::clone(&self.write_failures),
+            unsaved_messages: Arc::clone(&self.unsaved_messages),
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
@@ -1265,7 +1325,7 @@ impl AgentHarness {
     /// `get_entry` may return `None` until the message has been committed.
     pub async fn append_message(&self, message: AgentMessage) -> HarnessResult<String> {
         let gate = self.message_writes.lock().await;
-        let result = self.append_message_locked(message).await;
+        let result = self.append_message_locked(message.clone()).await;
         drop(gate);
         let (id, _, appended) = match result {
             Ok(appended) => appended,
@@ -1275,6 +1335,10 @@ impl AgentHarness {
                 // and the write was refused. Record it for the host and keep the
                 // error flowing to the caller.
                 self.record_write_failure_message("a message you sent", &error.to_string());
+                // Keep a copy the export path can read: JSONL storage applies an
+                // entry only after the append succeeds, so a refused message has
+                // no representation in the session view `/export` reads.
+                self.keep_unsaved_message("a message you sent", message);
                 return Err(error);
             }
         };
@@ -5403,6 +5467,7 @@ pub struct LaneHandle {
     bus: HarnessEventBus,
     message_writes: Arc<tokio::sync::Mutex<()>>,
     write_failures: Arc<Mutex<Vec<HarnessWriteFailure>>>,
+    unsaved_messages: Arc<Mutex<Vec<UnsavedMessage>>>,
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
@@ -5417,6 +5482,7 @@ impl LaneHandle {
             lane: self.lane.clone(),
             message_writes: Arc::clone(&self.message_writes),
             write_failures: Arc::clone(&self.write_failures),
+            unsaved_messages: Arc::clone(&self.unsaved_messages),
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
@@ -6087,6 +6153,36 @@ mod session_switch_tests {
         assert!(
             reported.iter().any(|f| f.message.contains("disk full")),
             "a refused append must be queued for the host, got {reported:?}"
+        );
+
+        // The warning tells the user to export before exiting. That promise is
+        // only true if the refused message has a copy somewhere the export can
+        // read: JSONL storage applies an entry only after the append succeeds, so
+        // the session view has none.
+        let entries = harness
+            .view()
+            .find_entries(&EntryQuery {
+                entry_type: None,
+                custom_type: None,
+                order: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !format!("{entries:?}").contains("must not be saved"),
+            "precondition: a refused write must not appear in the session view: {entries:?}"
+        );
+        let unsaved = harness.unsaved_messages();
+        assert_eq!(unsaved.len(), 1, "the recovery copy must be retained");
+        assert!(
+            format!("{:?}", unsaved[0].message).contains("must not be saved"),
+            "the retained copy must carry the refused message itself: {unsaved:?}"
+        );
+        assert!(
+            unsaved[0].what.contains("a message you sent"),
+            "the copy must say what could not be persisted: {unsaved:?}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
