@@ -154,6 +154,7 @@ pub struct SessionEntryCommit {
     pub lane: String,
 }
 
+/// The session facade over a [`SessionStorage`] and [`IdGenerator`]. Mirrors TS
 /// `Session<TMetadata>`. Holds shared handles (`Arc`) so it is cheaply
 /// [`Clone`] — a `view` of any lane shares the same storage + id generator.
 pub struct Session {
@@ -212,6 +213,9 @@ impl Session {
         };
     }
 
+    /// Install or clear the optional publisher for successful entry commits.
+    /// Subscribers receive invalidation metadata, not message contents, and
+    /// must reread the canonical branch when they need current entry data.
     pub fn set_entry_commit_publisher(
         &self,
         publisher: Option<broadcast::Sender<SessionEntryCommit>>,
