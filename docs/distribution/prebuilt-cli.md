@@ -1,8 +1,10 @@
 # Prebuilt CLI distribution protocol v1
 
 `rpi update` normally resolves the latest stable `rpi-cli` version through crates.io and
-downloads its prebuilt executable from the official GitHub repository. Cargo compilation is an
-explicit alternative: `rpi update --build`.
+downloads its prebuilt executable from the official GitHub repository. When crates.io cannot be
+reached, the version lookup falls back to the GitHub Releases API for the newest stable tag, so a
+reachable GitHub channel is enough to update; a definitive crates.io answer is never overridden.
+Cargo compilation is an explicit alternative: `rpi update --build`.
 
 Preview builds are published only as GitHub prereleases from the `preview` branch; they are not
 published to crates.io. Select that channel explicitly with `rpi update preview`. Stable startup

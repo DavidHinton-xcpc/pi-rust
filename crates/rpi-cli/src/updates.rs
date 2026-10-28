@@ -21,6 +21,10 @@ const UPDATE_CHECK_CONCURRENCY: usize = 4;
 const CRATES_IO_API: &str = "https://crates.io/api/v1/crates/rpi-cli";
 const GITHUB_RELEASES_API: &str =
     "https://api.github.com/repos/bigfish1913/pi-rust/releases?per_page=100";
+/// The single-release endpoint for the newest non-draft, non-prerelease tag.
+/// `rpi update`'s stable channel falls back here when crates.io cannot answer.
+const GITHUB_RELEASES_LATEST_API: &str =
+    "https://api.github.com/repos/bigfish1913/pi-rust/releases/latest";
 const STAGED_RPI_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_STAGED_RPI_OUTPUT_BYTES: usize = 4 * 1024;
 const MAX_SELF_UPDATE_STATUS_BYTES: u64 = 64 * 1024;
@@ -459,7 +463,81 @@ fn windows_paths_equal(left: &Path, right: &Path) -> bool {
 }
 
 async fn fetch_rpi_latest(client: &reqwest::Client) -> RegistryLookup {
-    fetch_crates_url(client, CRATES_IO_API).await
+    fetch_rpi_latest_from(client, CRATES_IO_API, GITHUB_RELEASES_LATEST_API).await
+}
+
+/// Resolve the latest stable version, preferring crates.io and falling back to
+/// GitHub.
+///
+/// The two endpoints are parameters so the fallback can be exercised offline
+/// against local servers, the same way `fetch_crates_url` is.
+///
+/// crates.io is the authoritative version source, so a definitive answer is
+/// never second-guessed. Only a transient failure — a timeout, a 5xx, or a body
+/// we could not parse — falls back. The download itself already comes from
+/// GitHub, so leaving the version lookup on one host is what makes a working
+/// GitHub channel unusable whenever crates.io is unreachable.
+///
+/// The worst-case latency of the startup check doubles, from one request
+/// timeout to two, but that check already runs in a background task that only
+/// posts a notice when it finishes, so nothing on screen waits for it.
+async fn fetch_rpi_latest_from(
+    client: &reqwest::Client,
+    crates_url: &str,
+    github_latest_url: &str,
+) -> RegistryLookup {
+    let crates = fetch_crates_url(client, crates_url).await;
+    if crates != RegistryLookup::TransientFailure {
+        return crates;
+    }
+    fetch_stable_from_github(client, github_latest_url).await
+}
+
+/// The stable version a `/releases/latest` body names, or `None` when the body
+/// is not a usable stable release.
+///
+/// `/releases/latest` already excludes drafts and prereleases, but the flags are
+/// re-checked here so a GitHub API behaviour change cannot silently hand the
+/// stable channel a prerelease. This is deliberately separate from
+/// `latest_preview_version`, which selects prereleases from the full list.
+fn stable_version_from_release(release: &GithubRelease) -> Option<String> {
+    if release.prerelease || release.draft {
+        return None;
+    }
+    let version = release.tag_name.strip_prefix('v')?;
+    let parsed = semver::Version::parse(version).ok()?;
+    parsed.pre.is_empty().then(|| version.to_string())
+}
+
+async fn fetch_stable_from_github(client: &reqwest::Client, url: &str) -> RegistryLookup {
+    let response = match client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return RegistryLookup::TransientFailure,
+    };
+    // Every failure of the fallback is transient, `404` included. A `404` here
+    // means "this repository has no published release", which is a failure of
+    // the fallback source rather than a definitive answer about `rpi-cli`;
+    // reporting `Missing` would cancel the cache fallback in
+    // `lookup_with_cache_fallback` and turn a recoverable blip into "no version
+    // known at all".
+    if !response.status().is_success() {
+        return RegistryLookup::TransientFailure;
+    }
+    let release = match response.json::<GithubRelease>().await {
+        Ok(release) => release,
+        Err(_) => return RegistryLookup::TransientFailure,
+    };
+    // A body that is not a usable stable release is an unanswered lookup too,
+    // for the same reason: keep a fresh cache able to serve the request.
+    match stable_version_from_release(&release) {
+        Some(version) => RegistryLookup::Found(version),
+        None => RegistryLookup::TransientFailure,
+    }
 }
 
 fn latest_preview_version(releases: impl IntoIterator<Item = GithubRelease>) -> RegistryLookup {
@@ -612,10 +690,11 @@ fn print_self_update_help() {
 
 /// The latest release this process already knows about.
 ///
-/// `registry_lookup: true` means a crates.io request just answered *in this
-/// process*, so using it to short-circuit cannot hide a newer release. A value
-/// read from the 6-hour cache is only trusted for the offline report, where
-/// there is no alternative and the output says so.
+/// `registry_lookup: true` means a live request just answered *in this process*
+/// — from crates.io, or from the GitHub fallback when crates.io could not — so
+/// using it to short-circuit cannot hide a newer release. A value read from the
+/// 6-hour cache is only trusted for the offline report, where there is no
+/// alternative and the output says so.
 fn known_latest_rpi(registry_lookup: Option<&str>, cached: Option<&str>) -> Option<(String, bool)> {
     registry_lookup
         .map(|latest| (latest.to_string(), false))
@@ -623,6 +702,18 @@ fn known_latest_rpi(registry_lookup: Option<&str>, cached: Option<&str>) -> Opti
 }
 
 async fn lookup_latest_rpi() -> Option<(String, bool)> {
+    lookup_latest_rpi_from(CRATES_IO_API, GITHUB_RELEASES_LATEST_API).await
+}
+
+/// Resolve the latest stable version and report whether it came from a live
+/// answer.
+///
+/// The endpoints are parameters so the whole decision — including `verified`
+/// and the cache fallback — can be exercised offline.
+async fn lookup_latest_rpi_from(
+    crates_url: &str,
+    github_latest_url: &str,
+) -> Option<(String, bool)> {
     let cache_path = crate::config::agent_dir()
         .ok()
         .map(|dir| dir.join(CACHE_FILE));
@@ -632,12 +723,14 @@ async fn lookup_latest_rpi() -> Option<(String, bool)> {
         .user_agent(format!("rpi/{}", crate::VERSION))
         .build()
     {
-        Ok(client) => fetch_rpi_latest(&client).await,
+        Ok(client) => fetch_rpi_latest_from(&client, crates_url, github_latest_url).await,
         Err(_) => RegistryLookup::TransientFailure,
     };
-    // Only a live registry answer counts as verified; a value that came back
-    // from the cache means the request failed and the version is up to six
-    // hours old.
+    // Only a live answer from an authoritative source counts as verified; a
+    // value that came back from the cache means every request failed and the
+    // version is up to six hours old. The fallback in `fetch_rpi_latest` is live
+    // too — GitHub is where the binary comes from — so it verifies just as a
+    // crates.io answer does.
     let verified = matches!(result, RegistryLookup::Found(_));
     let previous = cached
         .as_ref()
@@ -3709,5 +3802,339 @@ mod tests {
             (Some("9.9.9".to_string()), true)
         );
         assert_eq!(lookup("404 Not Found", "").await, RegistryLookup::Missing);
+    }
+
+    /// One-shot HTTP server: answers the first request with `status`/`body`.
+    ///
+    /// Returns the URL, a stop flag, and the thread handle. The fallback
+    /// deliberately leaves one of two servers unused, so a blocking `accept`
+    /// would hang the test; `stop_and_join` wakes it with a self-connect.
+    fn serve_once(
+        status: String,
+        body: String,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<usize>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // The fallback deliberately leaves one of two servers unused, so the
+        // accept must be able to time out on its own: a blocking accept that no
+        // client ever reaches would hang the test, and a self-connect cannot
+        // unblock `accept` on this platform.
+        listener.set_nonblocking(true).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let thread_hits = hits.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break Some(stream),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if thread_stop.load(Ordering::SeqCst)
+                            || std::time::Instant::now() > deadline
+                        {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(mut stream) = stream else {
+                return thread_hits.load(Ordering::SeqCst);
+            };
+            // `accept` inherited non-blocking from the listener; the request read
+            // below must block, so put the stream back into blocking mode.
+            stream.set_nonblocking(false).unwrap();
+            thread_hits.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}
+Content-Length: {}
+Connection: close
+
+{body}",
+                body.len()
+            )
+            .unwrap();
+            thread_hits.load(Ordering::SeqCst)
+        });
+        (format!("http://{address}/release"), stop, handle)
+    }
+
+    fn stop_and_join(
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<usize>,
+        url: &str,
+    ) -> usize {
+        use std::sync::atomic::Ordering;
+        stop.store(true, Ordering::SeqCst);
+        let _ = url;
+        handle.join().unwrap()
+    }
+
+    /// A crates.io endpoint that always answers with `status`, plus a GitHub
+    /// endpoint that serves one release body. Both are local so the fallback
+    /// can be exercised without the network.
+    ///
+    /// Returns the resolved lookup and how many requests each server saw, which
+    /// is what makes "crates.io was authoritative" observable rather than
+    /// inferred.
+    async fn lookup_with_fallback(
+        crates_status: &str,
+        crates_body: &str,
+        github_status: &str,
+        github_body: &str,
+    ) -> (RegistryLookup, usize, usize) {
+        let (crates_url, crates_stop, crates_server) =
+            serve_once(crates_status.to_string(), crates_body.to_string());
+        let (github_url, github_stop, github_server) =
+            serve_once(github_status.to_string(), github_body.to_string());
+        let client = reqwest::Client::builder().build().unwrap();
+        let result = super::fetch_rpi_latest_from(&client, &crates_url, &github_url).await;
+        let crates_hits = stop_and_join(crates_stop, crates_server, &crates_url);
+        let github_hits = stop_and_join(github_stop, github_server, &github_url);
+        (result, crates_hits, github_hits)
+    }
+
+    fn stable_release(tag: &str) -> String {
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": false,
+            "prerelease": false,
+        })
+        .to_string()
+    }
+
+    fn crates_release(version: &str) -> String {
+        serde_json::json!({"crate": {"max_version": version}}).to_string()
+    }
+
+    /// Axis A: the fallback fires only when crates.io could not answer.
+    ///
+    /// A definitive answer from crates.io must never be second-guessed, and a
+    /// definitive "no such crate" must not turn into a GitHub lookup either.
+    #[tokio::test]
+    async fn registry_fallback_only_fires_on_transient_failure() {
+        let (found, _, github_hits) = lookup_with_fallback(
+            "200 OK",
+            &crates_release("0.12.0"),
+            "200 OK",
+            &stable_release("v0.11.0"),
+        )
+        .await;
+        assert_eq!(found, RegistryLookup::Found("0.12.0".to_string()));
+        assert_eq!(
+            github_hits, 0,
+            "a live crates.io answer must not be second-guessed by GitHub"
+        );
+
+        let (missing, _, github_hits) =
+            lookup_with_fallback("404 Not Found", "", "200 OK", &stable_release("v0.11.0")).await;
+        assert_eq!(missing, RegistryLookup::Missing);
+        assert_eq!(
+            github_hits, 0,
+            "a definitive crates.io answer must not trigger the fallback"
+        );
+
+        let (fallback, _, github_hits) = lookup_with_fallback(
+            "503 Service Unavailable",
+            "",
+            "200 OK",
+            &stable_release("v0.11.0"),
+        )
+        .await;
+        assert_eq!(fallback, RegistryLookup::Found("0.11.0".to_string()));
+        assert_eq!(
+            github_hits, 1,
+            "a transient failure must consult GitHub once"
+        );
+    }
+
+    /// Axis B: the fallback only ever adopts a stable tag.
+    ///
+    /// `/releases/latest` excludes prereleases, but the flags are re-checked so
+    /// an API behaviour change cannot hand the stable channel a prerelease.
+    #[tokio::test]
+    async fn github_fallback_rejects_prereleases_and_drafts() {
+        for body in [
+            serde_json::json!({"tag_name": "v0.12.0-preview.1", "draft": false, "prerelease": true}),
+            serde_json::json!({"tag_name": "v0.12.0", "draft": true, "prerelease": false}),
+            serde_json::json!({"tag_name": "0.12.0", "draft": false, "prerelease": false}),
+        ] {
+            let (result, _, _) =
+                lookup_with_fallback("503 Service Unavailable", "", "200 OK", &body.to_string())
+                    .await;
+            assert_eq!(
+                result,
+                RegistryLookup::TransientFailure,
+                "an unusable stable release body must stay unanswered: {body}"
+            );
+        }
+
+        // A prerelease tag on the stable path is the failure this axis exists to
+        // prevent: it would install a preview build on a stable channel.
+        assert_eq!(
+            super::stable_version_from_release(&super::GithubRelease {
+                tag_name: "v1.0.0-rc.1".into(),
+                draft: false,
+                prerelease: true,
+            }),
+            None
+        );
+        assert_eq!(
+            super::stable_version_from_release(&super::GithubRelease {
+                tag_name: "v1.0.0".into(),
+                draft: false,
+                prerelease: false,
+            }),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    /// Axis D (second half): every way the fallback can fail stays transient, so
+    /// the cache keeps working.
+    ///
+    /// A `Missing` from the fallback would be worse than no fallback at all:
+    /// `lookup_with_cache_fallback` only consults the cache for
+    /// `TransientFailure`, so a `404` from GitHub would cancel the 6-hour cache
+    /// and leave the user with no version at all.
+    #[tokio::test]
+    async fn a_failing_fallback_never_cancels_the_cache() {
+        for (status, body) in [
+            ("404 Not Found", ""),
+            ("500 Internal Server Error", ""),
+            ("200 OK", "{not-json"),
+            ("200 OK", &stable_release("v0.12.0-preview.1")),
+        ] {
+            let (result, _, _) =
+                lookup_with_fallback("503 Service Unavailable", "", status, body).await;
+            assert_eq!(
+                result,
+                RegistryLookup::TransientFailure,
+                "the fallback must stay transient for {status} {body}"
+            );
+            assert_eq!(
+                super::lookup_with_cache_fallback(result, Some("0.10.0"), true),
+                (Some("0.10.0".to_string()), true),
+                "a fresh cache must still answer after a failed fallback"
+            );
+        }
+    }
+
+    /// Axis C: crates.io wins whenever it answers, even if GitHub reports a
+    /// newer tag. The fallback is a fallback, not a second opinion.
+    #[tokio::test]
+    async fn crates_io_stays_authoritative_when_it_answers() {
+        let (result, _, _) = lookup_with_fallback(
+            "200 OK",
+            &crates_release("0.11.0"),
+            "200 OK",
+            &stable_release("v9.9.9"),
+        )
+        .await;
+        assert_eq!(result, RegistryLookup::Found("0.11.0".to_string()));
+    }
+
+    /// Axis D: two dead sources stay a transient failure. No version may be
+    /// invented, and the caller keeps its existing "could not reach" path.
+    #[tokio::test]
+    async fn both_registries_failing_stays_transient() {
+        let (result, crates_hits, github_hits) = lookup_with_fallback(
+            "503 Service Unavailable",
+            "",
+            "500 Internal Server Error",
+            "",
+        )
+        .await;
+        assert_eq!(result, RegistryLookup::TransientFailure);
+        assert_eq!(crates_hits, 1);
+        assert_eq!(github_hits, 1);
+    }
+
+    /// Axis E: an answer obtained through the fallback is live, so it counts as
+    /// verified — the same way a crates.io answer does. Only a value served from
+    /// the cache stays unverified.
+    ///
+    /// `verified` decides whether the user reads "is the latest release" or
+    /// "last known release …, unverified". A live GitHub answer is the project's
+    /// own release channel, so calling it unverified would understate what the
+    /// command knows.
+    #[tokio::test]
+    async fn a_github_fallback_answer_counts_as_verified() {
+        let (crates_url, crates_stop, crates_server) =
+            serve_once("503 Service Unavailable".to_string(), String::new());
+        let (github_url, github_stop, github_server) =
+            serve_once("200 OK".to_string(), stable_release("v0.11.0"));
+        let resolved = super::lookup_latest_rpi_from(&crates_url, &github_url).await;
+        stop_and_join(crates_stop, crates_server, &crates_url);
+        stop_and_join(github_stop, github_server, &github_url);
+
+        assert_eq!(
+            resolved,
+            Some(("0.11.0".to_string(), true)),
+            "a live GitHub fallback answer must be reported as verified"
+        );
+    }
+
+    /// Axis F: a fallback answer must leave the cache usable — the same value a
+    /// crates.io answer would have written, so the 6-hour window starts fresh.
+    #[tokio::test]
+    async fn a_fallback_answer_refreshes_the_cache_timestamp() {
+        let _guard = crate::config::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = tempfile::tempdir().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, agent.path());
+
+        let now = super::now_ms();
+        // An expired cache: without a live answer this lookup reports nothing.
+        let stale = super::UpdateCache {
+            checked_at: now - 48 * 60 * 60 * 1000,
+            rpi_latest: Some("0.10.0".to_string()),
+            freshness: super::UpdateCacheFreshness {
+                rpi: now - 48 * 60 * 60 * 1000,
+                native_packages: Default::default(),
+            },
+            ..Default::default()
+        };
+        std::fs::write(
+            agent.path().join(super::CACHE_FILE),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let (crates_url, crates_stop, crates_server) =
+            serve_once("503 Service Unavailable".to_string(), String::new());
+        let (github_url, github_stop, github_server) =
+            serve_once("200 OK".to_string(), stable_release("v0.11.0"));
+        let resolved = super::lookup_latest_rpi_from(&crates_url, &github_url).await;
+        stop_and_join(crates_stop, crates_server, &crates_url);
+        stop_and_join(github_stop, github_server, &github_url);
+
+        assert_eq!(
+            resolved,
+            Some(("0.11.0".to_string(), true)),
+            "a fallback answer must replace an expired cached version"
+        );
     }
 }
