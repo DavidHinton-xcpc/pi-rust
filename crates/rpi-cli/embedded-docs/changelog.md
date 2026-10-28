@@ -11,6 +11,26 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/bigfish1913/pi-rust/compare/v0.10.1...v0.11.0) - 2026-10-27
+
+### Added
+
+- *(rpc)* expose registered extension commands
+
+### Fixed
+
+- *(harness)* let the host wait for a session's durable writes
+- *(cli)* take the highlighted slash completion on Enter
+- *(prompt)* state each guideline once
+- *(harness)* run requests carry the session id, so providers can key caching on it
+- *(openai-responses)* send the session id as prompt_cache_key
+- *(tui)* keep a rewritten Shift+Enter from being dropped
+
+### Other
+
+- rustfmt the new prompt test
+- make stable release preparation manual
+
 ## [0.10.1](https://github.com/bigfish1913/pi-rust/compare/v0.10.0...v0.10.1) - 2026-10-27
 
 ### Added
