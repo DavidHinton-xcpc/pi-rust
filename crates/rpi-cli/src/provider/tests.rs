@@ -107,6 +107,8 @@ mod package_oauth_refresh {
     use std::sync::{Arc, Mutex};
 
     static FAIL_REFRESH: AtomicBool = AtomicBool::new(false);
+    static SLOW_ENTERED: AtomicBool = AtomicBool::new(false);
+    static SLOW_RELEASE: AtomicBool = AtomicBool::new(false);
     static CORRUPT_ON_REFRESH: AtomicBool = AtomicBool::new(false);
     static REFRESH_INPUTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
     static REFRESH_RESPONSE: Mutex<Option<Value>> = Mutex::new(None);
@@ -125,6 +127,13 @@ mod package_oauth_refresh {
     ) -> i32 {
         // SAFETY: the host keeps the request buffer valid for this call.
         let request: Value = serde_json::from_str(unsafe { request.as_str() }).unwrap_or_default();
+        // "blocked-refresh" models a hung OAuth endpoint until the test releases it.
+        if request["input"]["credential"]["refresh"] == "blocked-refresh" {
+            SLOW_ENTERED.store(true, SeqCst);
+            while !SLOW_RELEASE.load(SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
         REFRESH_INPUTS.lock().unwrap().push(request);
         if FAIL_REFRESH.load(SeqCst) {
             reply(
@@ -285,6 +294,108 @@ mod package_oauth_refresh {
         ask(&resolved).await;
         assert_eq!(refreshes(), 1, "a fresh credential is reused");
         assert_eq!(sent()[1].as_deref(), Some("fresh-access"));
+    }
+
+    /// Two OAuth provider identities, `acme` and `beta`, served by the same fixture.
+    fn two_oauth_providers() -> Arc<crate::auth::PackageOAuthRefresher> {
+        let mut registry = ExtensionRegistry::new();
+        for id in ["acme", "beta"] {
+            registry.register_oauth_provider(RegisteredOAuthProvider {
+                plugin: id.into(),
+                manifest_json: json!({"id": id, "displayName": id}).to_string(),
+                request_fn: oauth,
+                plugin_free_string: free_string,
+                user_data: std::ptr::null_mut(),
+            });
+        }
+        let session = ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            PluginKeepalive::empty(),
+            vec![],
+            None,
+        );
+        Arc::new(crate::auth::PackageOAuthRefresher::new(&session).unwrap())
+    }
+
+    #[test]
+    fn a_slow_refresh_does_not_block_another_provider() {
+        use rpi_runtime::credentials::OAuthRefresher;
+        let _env = TestEnv::new();
+        let _reset = session(true);
+        SLOW_ENTERED.store(false, SeqCst);
+        SLOW_RELEASE.store(false, SeqCst);
+        let refresher = two_oauth_providers();
+        config::upsert_oauth_token("acme", "old-a".into(), "blocked-refresh".into(), 1).unwrap();
+        config::upsert_oauth_token("beta", "old-b".into(), "healthy-refresh".into(), 1).unwrap();
+
+        let a = refresher.clone();
+        let slow = std::thread::spawn(move || a.refresh("acme"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !SLOW_ENTERED.load(SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let entered = SLOW_ENTERED.load(SeqCst);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b = refresher.clone();
+        let healthy = std::thread::spawn(move || {
+            tx.send(b.refresh("beta").is_ok()).unwrap();
+        });
+        let independent = rx.recv_timeout(std::time::Duration::from_secs(1));
+
+        // Release the hung callback before asserting so no worker is left behind.
+        SLOW_RELEASE.store(true, SeqCst);
+        assert!(slow.join().unwrap().is_ok());
+        healthy.join().unwrap();
+        assert!(entered, "slow callback was not entered");
+        assert_eq!(
+            independent.ok(),
+            Some(true),
+            "a slow acme OAuth endpoint must not prevent beta renewal"
+        );
+    }
+
+    #[test]
+    fn two_providers_renewing_at_once_both_keep_their_credentials() {
+        use rpi_runtime::credentials::OAuthRefresher;
+        let _env = TestEnv::new();
+        let _reset = session(true);
+        let refresher = two_oauth_providers();
+        // Each commit is a read-modify-write of the whole store, so a race shows
+        // up as one provider's stale entry surviving the other's commit.
+        for round in 0..50 {
+            config::upsert_oauth_token("acme", "old-a".into(), "refresh-a".into(), 1).unwrap();
+            config::upsert_oauth_token("beta", "old-b".into(), "refresh-b".into(), 1).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let workers: Vec<_> = ["acme", "beta"]
+                .into_iter()
+                .map(|id| {
+                    let (refresher, barrier) = (refresher.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        refresher.refresh(id)
+                    })
+                })
+                .collect();
+            for worker in workers {
+                assert!(worker.join().unwrap().is_ok(), "round {round}");
+            }
+            for id in ["acme", "beta"] {
+                match config::read_oauth_token(id).unwrap() {
+                    Some(config::Credential::Oauth {
+                        access, expires, ..
+                    }) => {
+                        assert_eq!(access, "fresh-access", "round {round}, {id}");
+                        assert_eq!(expires, FRESH_EXPIRY, "round {round}, {id}");
+                    }
+                    other => panic!(
+                        "round {round}, {id}: lost its credential: {}",
+                        other.is_some()
+                    ),
+                }
+            }
+        }
+        assert_eq!(refreshes(), 100);
     }
 
     #[tokio::test(flavor = "multi_thread")]

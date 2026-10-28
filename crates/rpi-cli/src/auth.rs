@@ -207,6 +207,20 @@ impl std::fmt::Display for RefreshError {
     }
 }
 
+/// Renewal lock for one provider id, created on first use. Renewals of the same
+/// provider serialize on it, so the second waits and then re-reads the store
+/// the first one saved. Renewals of different providers never share a lock.
+fn renewal_lock(provider: &str) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(Default::default);
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(locks.entry(provider.to_owned()).or_default())
+}
+
 /// Refresh `provider`'s stored OAuth credential through its package and save
 /// the result. Shared by `rpi auth refresh` and request-time renewal.
 fn refresh_stored_oauth(
@@ -214,11 +228,13 @@ fn refresh_stored_oauth(
     provider: &str,
     only_if_needed: bool,
 ) -> Result<RefreshedOAuth, RefreshError> {
-    // Share renewal across independently resolved sessions and manual refresh.
-    // This serializes one process only: auth.json has no cross-process lock, so
-    // two processes may still both refresh, as two `rpi auth refresh` runs can.
-    static RENEWING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _renewing = RENEWING
+    // Serialize renewal of this provider across independently resolved sessions
+    // and manual refresh. The lock is held across the package callback, which may
+    // hang, so it is per provider and never shared with another one. It serializes
+    // one process only: auth.json has no cross-process lock, so two processes may
+    // still both refresh, as two `rpi auth refresh` runs can.
+    let renewal = renewal_lock(provider);
+    let _renewing = renewal
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(Credential::Oauth {

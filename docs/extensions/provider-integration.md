@@ -181,7 +181,7 @@ rpi auth check --provider vendor-example --extension /path/to/provider.dll --jso
 
 加载匹配 OAuth 扩展且存储项含 refresh token 时，过期凭据仍可用于选择 provider。
 宿主在每次请求前检查到期时间，在到期前 60 秒内调用扩展的 `refresh`，先保存成功结果再发送请求；
-同一进程的并发请求共享刷新结果。省略新 refresh token 时保留原值，`expires_at: 0` 表示无已知到期时间。
+同一进程中，同一 provider 的并发请求共享一次刷新结果；不同 provider 的刷新互不等待，即使另一个 provider 的 `refresh` 尚未返回。省略新 refresh token 时保留原值，`expires_at: 0` 表示无已知到期时间。
 刷新或保存失败会终止请求并提示重新登录，不会发送旧 token。显式 API key 保持原有优先级。
 刷新沿用同步 OAuth callback；跨进程写入锁及 OAuth callback 取消不属于此机制。
 

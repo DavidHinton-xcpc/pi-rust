@@ -22,8 +22,11 @@
 //! v1 is a single-process CLI, so we use **atomic rename** instead of upstream's
 //! `proper-lockfile`: write a sibling temp file, `fs::rename` over the target,
 //! then `chmod 0o600` on Unix (Windows chmod is a no-op, matching Node).
-//! Concurrent `rpi auth login` from two shells could lose one update — that's
-//! accepted and documented; adding a file lock is deferred.
+//! Within one process, auth.json read-modify-write updates (upsert and delete)
+//! run under a short in-memory lock, so concurrent provider renewals cannot
+//! drop each other's entries. Across processes, two `rpi auth login` runs from
+//! two shells could still lose one update — that's accepted and documented;
+//! adding a file lock is deferred.
 //!
 //! # Config-value expansion
 //!
@@ -216,8 +219,17 @@ pub fn read_auth() -> Result<AuthStore, ConfigError> {
     }
 }
 
+/// Serializes this process's read-modify-write updates of the auth store. It is
+/// held only for the read and the write, never while calling a provider
+/// package, so two providers committing at once cannot drop each other's entry.
+fn auth_store_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 /// Atomically write the whole auth store (ensures the dir exists, writes a
 /// temp sibling, `rename`s over the target, then `chmod 0o600` on Unix).
+/// Callers that read-modify-write must hold the internal store lock.
 pub fn write_auth(store: &AuthStore) -> Result<(), ConfigError> {
     let path = auth_path()?;
     let dir = agent_dir()?;
@@ -228,8 +240,12 @@ pub fn write_auth(store: &AuthStore) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Read-modify-write: upsert a credential for `provider_id`.
+/// Read-modify-write: upsert a credential for `provider_id`. Re-reads the
+/// latest store under the lock, so other providers' entries are preserved.
 pub fn upsert_credential(provider_id: &str, cred: Credential) -> Result<(), ConfigError> {
+    let _store_guard = auth_store_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut store = read_auth()?;
     store.insert(provider_id.to_string(), cred);
     write_auth(&store)
@@ -274,6 +290,9 @@ pub fn read_oauth_token(provider_id: &str) -> Result<Option<Credential>, ConfigE
 /// the file when the provider existed (so `auth logout` reflects the new state
 /// on disk even if the map isn't empty).
 pub fn delete_credential(provider_id: &str) -> Result<bool, ConfigError> {
+    let _store_guard = auth_store_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut store = read_auth()?;
     if store.remove(provider_id).is_some() {
         write_auth(&store)?;
