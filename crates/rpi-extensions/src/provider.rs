@@ -1254,6 +1254,9 @@ impl StreamMapper {
                 let index = self.content_index(&chunk);
                 let id = chunk_string(&chunk, "id");
                 let name = chunk_string(&chunk, "name");
+                // Presence, not truthiness: an explicit `null` is a malformed
+                // recording and must reach the agent loop as one.
+                let recorded = chunk.get("recorded").cloned();
                 let arguments = chunk
                     .get("arguments")
                     .cloned()
@@ -1273,6 +1276,7 @@ impl StreamMapper {
                             call.name = name.clone();
                         }
                         call.arguments = arguments.clone();
+                        call.recorded = recorded;
                         call.clone()
                     }
                     _ => ToolCall {
@@ -1282,7 +1286,7 @@ impl StreamMapper {
                         arguments: arguments.clone(),
                         thought_signature: None,
                         namespace: None,
-                        recorded: None,
+                        recorded,
                     },
                 };
                 self.tool_json.remove(&index);
@@ -1856,5 +1860,48 @@ mod tests {
         };
         assert_eq!(tool_call.name, "echo");
         assert_eq!(tool_call.arguments["text"], "hi");
+    }
+
+    /// A plugin replaying a call the remote agent already ran must reach the
+    /// host with its recording intact: dropping it would let the local loop run
+    /// the call a second time.
+    #[test]
+    fn tool_call_end_keeps_the_recording_of_an_already_executed_call() {
+        let recording = serde_json::json!({
+            "version": 1,
+            "isError": false,
+            "result": {
+                "content": [{ "type": "text", "text": "recorded output" }],
+                "details": {},
+                "terminate": true
+            }
+        });
+        let mut mapper = StreamMapper::new(rpi_ai::types::Api::Faux, "pluggy".into(), "m".into());
+        let mut ends = Vec::new();
+        for chunk in [
+            serde_json::json!({"type":"toolcall_start","contentIndex":0,"id":"c1","name":"shell"}),
+            serde_json::json!({"type":"toolcall_end","contentIndex":0,"id":"c1","name":"shell","arguments":{"command":"rm -rf target"},"recorded":recording}),
+        ] {
+            if let Some(event) = mapper.apply(chunk) {
+                if let AssistantMessageEvent::ToolCallEnd { tool_call, .. } = event {
+                    ends.push(tool_call);
+                }
+            }
+            while let Some(deferred) = mapper.take_deferred() {
+                if let Some(AssistantMessageEvent::ToolCallEnd { tool_call, .. }) =
+                    mapper.apply(deferred)
+                {
+                    ends.push(tool_call);
+                }
+            }
+        }
+        let [tool_call] = ends.as_slice() else {
+            panic!("expected one ToolCallEnd, got {}", ends.len());
+        };
+        assert_eq!(
+            serde_json::to_value(tool_call).unwrap()["recorded"],
+            recording
+        );
+        assert_eq!(tool_call.arguments["command"], "rm -rf target");
     }
 }

@@ -242,6 +242,9 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 `toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 会被忽略
 （向前兼容）。
 
+`toolcall_end` 可带可选的 `recorded` 字段，表示该调用已在远端执行过：宿主把它当作已完成的
+工具结果，绝不在本地再次执行（形状与版本规则见 `docs/rpi-tool/extension-authoring.md`）。
+
 两点约定：
 
 - **`out` 仍是最终消息。** 回调只负责增量；插件返回时写入 `out` 的完整

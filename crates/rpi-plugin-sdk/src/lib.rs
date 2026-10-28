@@ -1372,6 +1372,11 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// Unknown `type` values are ignored (forward compatibility). A `*_delta` may
 /// carry an optional `partial` object (a full assistant message) to override the
 /// host-side accumulated snapshot; otherwise the host accumulates deltas itself.
+///
+/// A `toolcall_end` may carry `recorded` when the call already ran upstream: the
+/// host then uses the recording as the tool result and never executes the call
+/// locally. Its shape is `{"version":1,"isError":false,"result":{"content":[...],"terminate":false}}`,
+/// and a call without the key executes as usual.
 pub type ProviderStreamRequestFn = extern "C" fn(
     req_json: StbStringRef,
     emit: Option<ProviderStreamEmitFn>,

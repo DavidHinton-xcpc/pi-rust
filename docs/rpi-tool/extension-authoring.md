@@ -351,6 +351,17 @@ extern "C" fn on_before_agent_start(
 `thinking_start`/`thinking_delta`/`thinking_end`、
 `toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 忽略（向前兼容）。
 
+`toolcall_end` 可以带一个可选的 `recorded` 字段，表示这次工具调用**已经在远端执行过**
+（例如远程 agent 自己跑了工具，再把调用和结果一起流回来）。宿主把 `recorded` 当作已完成的
+工具结果，**绝不会在本地再次执行这个调用**，包括审批钩子和工具 `execute` 在内都不会被触发。
+`recorded` 的形状与 Cursor replay worker 发出的一致：
+`{"version":1,"isError":false,"result":{"content":[{"type":"text","text":"..."}],"details":{},"terminate":true}}`。
+`result.content` 只允许 `text` 和 `image` 块；`result.details` 与 `result.terminate` 可省略。
+`terminate: true` 会像实时工具结果一样结束这一批工具调用。只有 `{"version":1}` 这类残缺记录
+（崩溃前写入）、版本不是 `1` 的记录、字段为 `null`、含未知顶层字段或形状不合法的记录，都会被
+宿主当作错误工具结果返回，同样不执行。只有在调用确实已经发生
+过时才能带 `recorded`；不带该字段的调用行为与以前完全一致。
+
 约定：
 
 - **`out` 仍是最终消息。** 回调只送增量；插件返回时写入 `out` 的完整
