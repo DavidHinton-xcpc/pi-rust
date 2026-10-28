@@ -1025,6 +1025,13 @@ pub async fn interactive_tui(
     } else {
         None
     };
+    // Startup notices from the launch (a restored session whose directory fell
+    // back, an untrusted adopted directory). Notes in the transcript rather than
+    // stderr: the TUI is already in the alternate screen by the time it draws
+    // this, and a stray write would corrupt the layout (issue #115).
+    for notice in &reload_context.startup_notices {
+        add_note_message(&chat_container, notice);
+    }
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
     // banner once, then write the sentinel. The banner covers the theme hint;
