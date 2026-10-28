@@ -11,6 +11,28 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- *(cli)* restoring a session (`-c`, `-r`, `--session`, an existing `--session-id`) now runs in the session's recorded working directory instead of the launch directory, and announces the switch (naming both directories) because tools, context files, and extensions follow it; when that directory no longer exists the launch directory is kept and the fallback is announced. Project trust is re-resolved against the adopted directory, so an untrusted project's settings, skills, and context files stay off until allowed
+
+### Fixed
+
+- *(tui)* switching to a session from another directory says where the session belongs instead of implying the tools moved
+
+## [0.11.1](https://github.com/bigfish1913/pi-rust/compare/v0.11.0...v0.11.1) - 2026-10-28
+
+### Added
+
+- *(rpc)* publish session entry commit invalidations ([#147](https://github.com/bigfish1913/pi-rust/pull/147))
+
+### Fixed
+
+- *(cli)* resolve CLI updates from GitHub releases ([#146](https://github.com/bigfish1913/pi-rust/pull/146))
+
+### Other
+
+- *(agent)* cover provider cache invalidation ([#148](https://github.com/bigfish1913/pi-rust/pull/148))
+
 ## [0.11.0](https://github.com/bigfish1913/pi-rust/compare/v0.10.1...v0.11.0) - 2026-10-27
 
 ### Added

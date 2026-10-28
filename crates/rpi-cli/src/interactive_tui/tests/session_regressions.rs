@@ -158,7 +158,8 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
         crate::session::open_session_by_id_in_dir(&expected, &cwd.to_string_lossy(), &root)
             .await
             .map_err(|error| error.to_string())
-            .unwrap();
+            .unwrap()
+            .session;
     assert_eq!(
         restored.get_name().await.unwrap().as_deref(),
         Some("Imported history")

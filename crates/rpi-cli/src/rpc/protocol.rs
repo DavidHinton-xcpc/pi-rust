@@ -177,6 +177,7 @@ pub fn ready() -> Value {
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
+        "supportedEvents": ["session_entry_committed"],
         "semantics": {
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
@@ -204,6 +205,12 @@ pub fn model_descriptor(model: &rpi_ai::Model) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_commands_are_unique() {
+        let commands: std::collections::HashSet<_> = SUPPORTED_COMMANDS.iter().collect();
+        assert_eq!(commands.len(), SUPPORTED_COMMANDS.len());
+    }
 
     #[test]
     fn extension_commands_are_advertised_and_args_default_to_empty() {

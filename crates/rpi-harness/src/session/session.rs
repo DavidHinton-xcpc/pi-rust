@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use rpi_agent::message::AgentMessage;
@@ -141,7 +142,19 @@ pub fn assert_json_serializable(value: &Value) -> SessionResult<()> {
 // Session — the facade. Mirrors TS `class Session`.
 // ---------------------------------------------------------------------------
 
-/// The session facade over a [`SessionStorage`] + [`IdGenerator`]. Mirrors TS
+/// Metadata published after a session entry has been committed.
+///
+/// The event is an invalidation signal only; consumers must reread the branch
+/// when they need the canonical entry data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEntryCommit {
+    pub entry_id: String,
+    pub entry_type: String,
+    pub custom_type: Option<String>,
+    pub lane: String,
+}
+
+/// The session facade over a [`SessionStorage`] and [`IdGenerator`]. Mirrors TS
 /// `Session<TMetadata>`. Holds shared handles (`Arc`) so it is cheaply
 /// [`Clone`] — a `view` of any lane shares the same storage + id generator.
 pub struct Session {
@@ -153,6 +166,7 @@ pub struct Session {
 struct SessionBinding {
     storage: Arc<dyn SessionStorage>,
     volatile_progress: Option<crate::frame_progress::SharedVolatileProgress>,
+    entry_commit_publisher: Option<broadcast::Sender<SessionEntryCommit>>,
 }
 
 impl Clone for Session {
@@ -175,6 +189,7 @@ impl Session {
             binding: Arc::new(RwLock::new(SessionBinding {
                 storage,
                 volatile_progress: None,
+                entry_commit_publisher: None,
             })),
             id_generator: id_generator.unwrap_or_else(|| Arc::new(DefaultIdGenerator::new())),
         }
@@ -190,13 +205,24 @@ impl Session {
     /// TS `SessionManager.rebind` intent (swap the durable backing without
     /// rebuilding the harness).
     pub fn set_storage(&self, storage: Arc<dyn SessionStorage>) {
+        let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         *self.binding.write().unwrap() = SessionBinding {
             storage,
             volatile_progress: None,
+            entry_commit_publisher: publisher,
         };
     }
 
-    /// Pin both storage and recovery state while a harness validates a target.
+    /// Install or clear the optional publisher for successful entry commits.
+    /// Subscribers receive invalidation metadata, not message contents, and
+    /// must reread the canonical branch when they need current entry data.
+    pub fn set_entry_commit_publisher(
+        &self,
+        publisher: Option<broadcast::Sender<SessionEntryCommit>>,
+    ) {
+        self.binding.write().unwrap().entry_commit_publisher = publisher;
+    }
+
     /// Keep the harness's generator, as on the existing session-switch path.
     pub(crate) fn pin(&self, id_generator: Arc<dyn IdGenerator>) -> Self {
         let binding = self.binding.read().unwrap().clone();
@@ -209,7 +235,11 @@ impl Session {
     /// Publish the prepared target without changing the shared facade handles.
     /// The target's cache is adopted; the old session's cache is not carried over.
     pub(crate) fn rebind_to(&self, target: &Self) {
-        let binding = target.binding.read().unwrap().clone();
+        let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
+        let mut binding = target.binding.read().unwrap().clone();
+        if binding.entry_commit_publisher.is_none() {
+            binding.entry_commit_publisher = publisher;
+        }
         *self.binding.write().unwrap() = binding;
     }
 
@@ -440,9 +470,21 @@ impl Session {
             })?;
             assert_json_serializable(&value)?;
         }
-        self.storage_arc()
-            .append_record_and_entry(record, entry, lane)
-            .await
+        let storage = self.storage_arc();
+        let entry_id = entry.id.clone();
+        let was_absent = self
+            .batch_entry_was_absent(storage.as_ref(), &entry_id)
+            .await;
+        let result = storage.append_record_and_entry(record, entry, lane).await;
+        self.publish_batch_commit(
+            storage.as_ref(),
+            &entry_id,
+            was_absent,
+            result.as_ref().ok().map(|(_, entry)| entry),
+            lane,
+        )
+        .await;
+        result
     }
 
     /// Append a record, an entry, and a following record in that exact order.
@@ -463,9 +505,23 @@ impl Session {
             })?;
             assert_json_serializable(&value)?;
         }
-        self.storage_arc()
+        let storage = self.storage_arc();
+        let entry_id = entry.id.clone();
+        let was_absent = self
+            .batch_entry_was_absent(storage.as_ref(), &entry_id)
+            .await;
+        let result = storage
             .append_record_entry_and_record(before, entry, lane, after)
-            .await
+            .await;
+        self.publish_batch_commit(
+            storage.as_ref(),
+            &entry_id,
+            was_absent,
+            result.as_ref().ok().map(|(_, entry, _)| entry),
+            lane,
+        )
+        .await;
+        result
     }
 
     /// Append a batch of records through the active storage backend.
@@ -679,6 +735,9 @@ impl Session {
         let entry_type = entry.type_tag();
         let started = diagnostics.then(Instant::now);
         let result = self.storage_arc().append_entry(entry, lane).await;
+        if let Ok(stamped) = &result {
+            self.publish_entry_commit(stamped, lane);
+        }
         if let Some(started) = started {
             eprintln!(
                 "RPI_SESSION_DIAGNOSTICS kind=entry entry_type={} append_ns={}",
@@ -687,6 +746,56 @@ impl Session {
             );
         }
         result
+    }
+
+    /// Only observers need the preflight read. Some backends use the ordered
+    /// fallback rather than an atomic transaction, so a later record can fail
+    /// after the entry has committed. Remember whether this id was absent to
+    /// avoid reporting an old entry when a duplicate-id append is refused.
+    async fn batch_entry_was_absent(&self, storage: &dyn SessionStorage, id: &str) -> bool {
+        let observed = self
+            .binding
+            .read()
+            .unwrap()
+            .entry_commit_publisher
+            .is_some();
+        observed && matches!(storage.get_entry(id).await, Ok(None))
+    }
+
+    async fn publish_batch_commit(
+        &self,
+        storage: &dyn SessionStorage,
+        id: &str,
+        was_absent: bool,
+        committed: Option<&Entry>,
+        lane: &str,
+    ) {
+        if let Some(entry) = committed {
+            self.publish_entry_commit(entry, lane);
+        } else if was_absent {
+            // Preserve the original batch error. If the backend is unreadable,
+            // do not invent a commit; a recovery read is best-effort.
+            if let Ok(Some(entry)) = storage.get_entry(id).await {
+                self.publish_entry_commit(&entry, lane);
+            }
+        }
+    }
+
+    /// Publish confirmed entry commits using storage-stamped metadata.
+    fn publish_entry_commit(&self, entry: &Entry, lane: &str) {
+        let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
+        if let Some(publisher) = publisher {
+            let custom_type = match entry {
+                Entry::Custom(custom) => Some(custom.custom_type.clone()),
+                _ => None,
+            };
+            let _ = publisher.send(SessionEntryCommit {
+                entry_id: entry.base().id.clone(),
+                entry_type: entry.base().entry_type.clone(),
+                custom_type,
+                lane: lane.to_string(),
+            });
+        }
     }
 
     /// `commitRecord(record)` — `assertJsonSerializable` then
@@ -890,6 +999,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn atomic_prompt_commit_also_publishes_invalidation() {
+        use crate::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
+        let session = fixture_session();
+        let (publisher, mut events) = tokio::sync::broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+        let record = LaneRecord::OperationStarted(OperationStartedRecord {
+            base: RecordBase {
+                id: "op-probe".into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
+            source_leaf_id: None,
+            intent: OperationIntent::Run {
+                original_prompt: vec![],
+                initial_messages: vec![],
+                system_prompt_override: None,
+                resume_data: None,
+            },
+        });
+        let (_, entry) = session
+            .append_record_and_entry(
+                record,
+                ProvisionedEntry {
+                    id: "prompt-probe".into(),
+                    kind: ProvisionedKind::Message {
+                        message: user("new prompt"),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        assert_eq!(entry.base().id, "prompt-probe");
+        let event = events
+            .try_recv()
+            .expect("a successfully committed prompt must invalidate RPC clients too");
+        assert_eq!(event.entry_id, "prompt-probe");
+        assert_eq!(event.entry_type, "message");
+        assert_eq!(event.lane, "main");
+        assert_eq!(event.custom_type, None);
+        assert!(session
+            .view("main")
+            .get_entry(&event.entry_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    fn notification_record(id: &str) -> LaneRecord {
+        use crate::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
+        LaneRecord::OperationStarted(OperationStartedRecord {
+            base: RecordBase {
+                id: id.into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
+            source_leaf_id: None,
+            intent: OperationIntent::Run {
+                original_prompt: vec![],
+                initial_messages: vec![],
+                system_prompt_override: None,
+                resume_data: None,
+            },
+        })
+    }
+
+    fn notification_finish() -> LaneRecord {
+        use crate::session::types::{OperationFinishedRecord, OperationOutcome, RecordBase};
+        LaneRecord::OperationFinished(OperationFinishedRecord {
+            base: RecordBase {
+                id: "finish".into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
+            run_id: "notification-op".into(),
+            outcome: OperationOutcome::Completed,
+            error: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn rejected_duplicate_batch_does_not_notify_an_existing_entry() {
+        for with_after in [false, true] {
+            let session = fixture_session();
+            let entry = || ProvisionedEntry {
+                id: "existing".into(),
+                kind: ProvisionedKind::Message {
+                    message: user("old"),
+                    terminate: None,
+                },
+            };
+            session.append_entry(entry(), "main").await.unwrap();
+            let (publisher, mut events) = broadcast::channel(4);
+            session.set_entry_commit_publisher(Some(publisher));
+            let before = notification_record("notification-op");
+            let result = if with_after {
+                session
+                    .append_record_entry_and_record(before, entry(), "main", notification_finish())
+                    .await
+                    .map(|_| ())
+            } else {
+                session
+                    .append_record_and_entry(before, entry(), "main")
+                    .await
+                    .map(|_| ())
+            };
+            assert!(result.is_err());
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_batch_failure_still_notifies_committed_entry() {
+        let session = fixture_session();
+        let (publisher, mut events) = broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+        let mut after = notification_finish();
+        if let LaneRecord::OperationFinished(record) = &mut after {
+            record.base.id = "notification-op".into(); // Reject only the final record.
+        }
+        let result = session
+            .append_record_entry_and_record(
+                notification_record("notification-op"),
+                ProvisionedEntry {
+                    id: "actually-committed".into(),
+                    kind: ProvisionedKind::Message {
+                        message: user("saved"),
+                        terminate: None,
+                    },
+                },
+                "main",
+                after,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            session
+                .view("main")
+                .get_entry("actually-committed")
+                .await
+                .unwrap()
+                .is_some(),
+            "default storage fallback has already committed the entry"
+        );
+        let event = events.try_recv().expect("an entry that exists must not be omitted from invalidation just because the following record failed");
+        assert_eq!(event.entry_id, "actually-committed");
+    }
+
+    #[tokio::test]
+    async fn record_entry_record_commit_publishes_stamped_metadata_once() {
+        let session = fixture_session();
+        let (publisher, mut events) = broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+        let (_, entry, _) = session
+            .append_record_entry_and_record(
+                notification_record("notification-op"),
+                ProvisionedEntry {
+                    id: "custom-notification".into(),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: "state-update".into(),
+                        data: None,
+                    },
+                },
+                "main",
+                notification_finish(),
+            )
+            .await
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.entry_id, entry.base().id);
+        assert_eq!(event.entry_type, "custom");
+        assert_eq!(event.custom_type.as_deref(), Some("state-update"));
+        assert_eq!(event.lane, "main");
+        assert!(session
+            .view("main")
+            .get_entry(&event.entry_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_atomic_entry_writes_do_not_publish_commits() {
+        for with_after in [false, true] {
+            let session = fixture_session();
+            let (publisher, mut events) = broadcast::channel(4);
+            session.set_entry_commit_publisher(Some(publisher));
+            let entry = ProvisionedEntry {
+                id: "refused".into(),
+                kind: ProvisionedKind::Message {
+                    message: user("refused"),
+                    terminate: None,
+                },
+            };
+            let before = notification_record("notification-op");
+            if with_after {
+                assert!(session
+                    .append_record_entry_and_record(
+                        before,
+                        entry,
+                        "missing-lane",
+                        notification_finish()
+                    )
+                    .await
+                    .is_err());
+            } else {
+                assert!(session
+                    .append_record_and_entry(before, entry, "missing-lane")
+                    .await
+                    .is_err());
+            }
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn default_id_generator_yields_uuidv7_shaped_ids() {
         let g = DefaultIdGenerator::new();
         let id = g.next();
@@ -897,6 +1240,33 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
         assert_eq!(id.as_bytes()[14], b'7');
+    }
+
+    #[tokio::test]
+    async fn committed_entry_publishes_metadata_after_success() {
+        let session = fixture_session();
+        let (publisher, mut events) = tokio::sync::broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+
+        session
+            .append_entry(
+                ProvisionedEntry {
+                    id: "durable-entry".into(),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: "durable-state".into(),
+                        data: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.entry_id, "durable-entry");
+        assert_eq!(event.entry_type, "custom");
+        assert_eq!(event.custom_type.as_deref(), Some("durable-state"));
+        assert_eq!(event.lane, "main");
     }
 
     #[tokio::test]
