@@ -11,6 +11,10 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- *(tui)* keep the editor's wrap width independent of the caret's row: a row used to wrap one column earlier while the caret sat on it, so the same draft reflowed (and the input box grew a line) once the caret moved away
+
 ## [0.12.0](https://github.com/bigfish1913/pi-rust/compare/v0.11.1...v0.12.0) - 2026-10-28
 
 ### Fixed
