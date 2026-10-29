@@ -645,6 +645,9 @@ impl TuiAltScreen {
             terminal.write("\x1b[?1049h\x1b[?7l");
             // Clear screen and hide cursor
             terminal.write("\x1b[2J\x1b[H\x1b[?25l");
+            // A fresh alternate buffer holds no images: the next frame has to
+            // carry each payload again instead of placing it by id.
+            crate::terminal_image::clear_uploaded_kitty_images();
             terminal.flush();
         }
     }
@@ -780,6 +783,7 @@ impl TuiAltScreen {
         {
             terminal.write("\x1b[?2026h");
             terminal.write("\x1b[2J\x1b[H\x1b[3J");
+            crate::terminal_image::clear_uploaded_kitty_images();
             terminal.write(&lines.join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
@@ -1055,6 +1059,9 @@ impl TuiAltScreen {
                 // whole width, and a terminal that reset the mode on resize
                 // would wrap the last cell and shift every following row.
                 buffer.push_str("\x1b[2J");
+                // A clear drops every image the terminal holds, so the next
+                // image row has to carry its payload again.
+                crate::terminal_image::clear_uploaded_kitty_images();
                 buffer.push_str("\x1b[?7l");
             }
 
@@ -1066,19 +1073,35 @@ impl TuiAltScreen {
                 if !full_redraw && row < previous.len() && &previous[row] == line {
                     continue; // Skip unchanged lines
                 }
-                // Overwrite before clearing any leftover tail. Clearing the
-                // whole row first blanks stationary sidebars during scroll on
-                // terminals that do not implement synchronized output.
-                if let Some((column, text)) = (!full_redraw)
-                    .then(|| crate::line_diff::patch(&previous[row], line))
-                    .flatten()
-                {
-                    buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
-                } else {
-                    buffer.push_str(&format!("\x1b[{};1H{}", row + 1, line));
-                    if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
-                        buffer.push_str("\x1b[K");
+                // A repainted image row carries the whole PNG payload. Once the
+                // data is in the terminal, the placement alone is enough, which
+                // keeps scrolling a transcript full of screenshots cheap. The
+                // rewrite is decided before the row is marked, so the frame that
+                // transmits the data is never turned into a placement.
+                let is_image = crate::terminal_image::is_image_line(line);
+                let placement = crate::terminal_image::kitty_placement_line(line);
+                let rendered = placement.as_deref().unwrap_or(line.as_str());
+                if let Some(id) = crate::terminal_image::kitty_transmission_id(line) {
+                    crate::terminal_image::mark_kitty_image_uploaded(id);
+                }
+                // Image rows are never patched: their prefix is the escape that
+                // changes, so a partial write buys nothing and a full row keeps
+                // the placement anchored at column 1.
+                if !is_image {
+                    // Overwrite before clearing any leftover tail. Clearing the
+                    // whole row first blanks stationary sidebars during scroll on
+                    // terminals that do not implement synchronized output.
+                    if let Some((column, text)) = (!full_redraw)
+                        .then(|| crate::line_diff::patch(&previous[row], line))
+                        .flatten()
+                    {
+                        buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
+                        continue;
                     }
+                }
+                buffer.push_str(&format!("\x1b[{};1H{}", row + 1, rendered));
+                if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
+                    buffer.push_str("\x1b[K");
                 }
             }
 

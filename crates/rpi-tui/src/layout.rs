@@ -9,12 +9,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use super::hstack::HStack;
 use super::layout_node::LayoutViewport;
 use super::scroll_view::ScrollView;
 use super::vstack::{layout_vstack_constrained_with, VStack};
 use crate::ansi::{slice_by_column, visible_width, CURSOR_MARKER};
+use crate::terminal_image::{
+    crop_kitty_image_line, is_image_line, kitty_image_metadata, max_kitty_image_rows,
+};
 
 /// A rectangle in the layout.
 #[derive(Debug, Clone, Copy, Default)]
@@ -76,8 +79,9 @@ pub struct LayoutBox {
     pub layer: usize,
     /// ScrollView reference if this is a scroll view.
     pub scroll_view: Option<Arc<ScrollView>>,
-    /// Scroll content lines (pre-rendered).
-    pub scroll_content_lines: Option<Vec<String>>,
+    /// Full scrollable document, retained for placements that scrolled out of
+    /// the viewport (see `paint_box`).
+    pub scroll_document: Option<Arc<RenderedDocument>>,
 }
 
 impl LayoutBox {
@@ -92,7 +96,7 @@ impl LayoutBox {
             line_offset: 0,
             layer: 0,
             scroll_view: None,
-            scroll_content_lines: None,
+            scroll_document: None,
         }
     }
 }
@@ -293,7 +297,7 @@ fn layout_component(
         line_offset,
         layer: 0,
         scroll_view: None,
-        scroll_content_lines: None,
+        scroll_document: None,
     }
 }
 
@@ -474,7 +478,7 @@ fn layout_scroll_view(
         line_offset,
         layer: 0,
         scroll_view: Some(sv_arc),
-        scroll_content_lines: None,
+        scroll_document: sv.rendered_document(),
     }
 }
 
@@ -524,15 +528,27 @@ fn paint_box(lbox: &LayoutBox, screen: &mut [String], total_width: usize) {
 
             let source_line = &lines[source_idx];
 
+            // A Kitty placement is anchored to a screen cell: the terminal
+            // paints `r` rows downward from it and cannot see this clip rect.
+            // Crop the placement to the rows that fit, otherwise an image near
+            // the end of the viewport paints over the dock below it.
+            let clipped = clip_placement_below(
+                source_line,
+                row,
+                lbox.clip.y + lbox.clip.height,
+                screen.len(),
+            );
+            let line = clipped.as_deref().unwrap_or(source_line.as_str());
+
             // Composite the line into the screen
             if lbox.rect.x == 0 && lbox.rect.width >= total_width {
                 // Fast path: full-width box at left edge
-                screen[row] = source_line.clone();
+                screen[row] = line.to_string();
             } else {
                 // Composite at the correct position
                 screen[row] = composite_tui_line(
                     &screen[row],
-                    source_line,
+                    line,
                     lbox.rect.x,
                     lbox.rect.width,
                     total_width,
@@ -544,6 +560,82 @@ fn paint_box(lbox: &LayoutBox, screen: &mut [String], total_width: usize) {
     // Paint children
     for child in &lbox.children {
         paint_box(child, screen, total_width);
+    }
+
+    // A placement that scrolled above the viewport has to be re-anchored to the
+    // first visible row: its escape lives on the image's first row, which the
+    // visible slice no longer contains, so the image would vanish while most of
+    // it is still on screen. Paint the cropped remainder here, after the
+    // children, so it lands on top of the (blank) placeholder rows.
+    paint_scrolled_placement(lbox, screen, total_width);
+}
+
+/// Crop a placement so it cannot paint below `clip_bottom`.
+///
+/// Returns `None` when the placement fits and the line can be used as is.
+fn clip_placement_below(
+    line: &str,
+    row: usize,
+    clip_bottom: usize,
+    screen_len: usize,
+) -> Option<String> {
+    let metadata = kitty_image_metadata(line)?;
+    let bottom = clip_bottom.min(screen_len);
+    let room = bottom.saturating_sub(row).min(usize::from(u16::MAX)) as u16;
+    let visible = metadata.rows.min(room);
+    (visible < metadata.rows).then(|| crop_kitty_image_line(line, 0, visible))
+}
+
+/// Paint the visible remainder of a placement whose first row scrolled above
+/// the viewport.
+fn paint_scrolled_placement(lbox: &LayoutBox, screen: &mut [String], total_width: usize) {
+    let (Some(scroll_view), Some(document)) =
+        (lbox.scroll_view.as_ref(), lbox.scroll_document.as_ref())
+    else {
+        return;
+    };
+    let scroll_top = scroll_view.scroll_top();
+    let top = lbox.rect.y.max(lbox.clip.y);
+    let bottom = (lbox.clip.y + lbox.clip.height).min(screen.len());
+    if scroll_top == 0 || lbox.rect.height == 0 || bottom <= top {
+        return;
+    }
+    // An ancestor clip may hide the first rows of the viewport; the placement
+    // has to skip those as well.
+    let clip_offset = top.saturating_sub(lbox.rect.y);
+    // Rows above the viewport can only reach into it if they belong to a
+    // placement no taller than the tallest one registered, so the search is
+    // bounded instead of scanning the whole history.
+    let min_row = scroll_top.saturating_sub(max_kitty_image_rows());
+    for image_row in (min_row..scroll_top).rev() {
+        let Some(line) = document.line(image_row) else {
+            continue;
+        };
+        if !is_image_line(line) {
+            continue;
+        }
+        let Some(metadata) = kitty_image_metadata(line) else {
+            continue;
+        };
+        let hidden = (scroll_top - image_row + clip_offset).min(usize::from(u16::MAX)) as u16;
+        if hidden >= metadata.rows {
+            continue;
+        }
+        let viewport_rows = (bottom - top).min(usize::from(u16::MAX)) as u16;
+        let visible = metadata.rows.saturating_sub(hidden).min(viewport_rows);
+        let cropped = crop_kitty_image_line(line, hidden, visible);
+        screen[top] = if lbox.rect.x == 0 && lbox.rect.width >= total_width {
+            cropped
+        } else {
+            composite_tui_line(
+                &screen[top],
+                &cropped,
+                lbox.rect.x,
+                lbox.rect.width,
+                total_width,
+            )
+        };
+        return;
     }
 }
 
