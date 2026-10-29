@@ -1237,6 +1237,16 @@ impl AgentHarness {
         });
     }
 
+    /// Test-only entry point for [`Self::keep_unsaved_message`].
+    ///
+    /// The production path is `append_message` failing, which needs a hostile
+    /// backend; callers that want to check what the *host* does with a recovery
+    /// copy (the export) should not have to rebuild that backend.
+    #[doc(hidden)]
+    pub fn keep_unsaved_message_for_test(&self, what: &str, message: AgentMessage) {
+        self.keep_unsaved_message(what, message);
+    }
+
     /// Every message whose append was refused and that storage therefore never
     /// applied, oldest first, scoped to the session and lane this harness is
     /// currently bound to.
