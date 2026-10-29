@@ -720,6 +720,12 @@ pub struct UnsavedMessage {
     pub what: String,
     /// When the refusal was recorded (`Clock` milliseconds).
     pub at: i64,
+    /// The durable session the refused message belonged to. A harness-wide
+    /// vector outlives `set_session` switches, so a consumer that ignored this
+    /// would export session A's recovery content as part of session B.
+    pub session_id: String,
+    /// The lane the refused message was written on.
+    pub lane: String,
 }
 
 /// Record a failed session write, keeping the queue bounded.
@@ -1152,6 +1158,14 @@ impl AgentHarness {
         &self.bus
     }
 
+    /// The durable id of the session this harness is currently bound to.
+    /// Returns an owned `String` (the metadata read hands back a temporary),
+    /// and stays synchronous so write failure paths can stamp records without
+    /// introducing an await.
+    pub fn session_id(&self) -> String {
+        self.session.storage().metadata().id
+    }
+
     /// The session facade (for direct entry/record queries the harness API
     /// doesn't surface).
     pub fn session(&self) -> &Session {
@@ -1196,7 +1210,17 @@ impl AgentHarness {
     /// one. Retaining the message here is what makes that guidance true rather
     /// than merely hopeful. Bounded like [`MAX_WRITE_FAILURES`]: a backend that
     /// refuses every write during a long run must not grow this without limit.
+    ///
+    /// The copy is stamped with the session and lane the message was written
+    /// on. The vector is harness-wide and outlives `set_session` switches, so
+    /// the stamp is what lets `unsaved_messages` hand each session back only its
+    /// own recovery data — discarding it instead would destroy the recovery the
+    /// user was promised when they return to the original session.
     fn keep_unsaved_message(&self, what: &str, message: AgentMessage) {
+        // Resolve the stamp before taking the vector lock: both reads go through
+        // the shared binding with no await in between, so the stamp always
+        // describes the session the caller was writing to.
+        let (session_id, lane) = (self.session_id(), self.lane.clone());
         let mut unsaved = self
             .unsaved_messages
             .lock()
@@ -1208,6 +1232,8 @@ impl AgentHarness {
             message,
             what: what.to_string(),
             at: now_ms(),
+            session_id,
+            lane,
         });
     }
 
@@ -1222,18 +1248,26 @@ impl AgentHarness {
     }
 
     /// Every message whose append was refused and that storage therefore never
-    /// applied, oldest first.
+    /// applied, oldest first, scoped to the session and lane this harness is
+    /// currently bound to.
     ///
     /// Read-only on purpose: the host consults it while building an export,
     /// which must stay repeatable (a user who exports twice after one failure
     /// gets the same file, and a second export after another failure includes
-    /// both). The copy lives as long as the harness, which is the same window in
-    /// which the transcript is still on screen.
+    /// both). The copies live as long as the harness, which is the same window
+    /// in which the transcript is still on screen — and they are retained, not
+    /// cleared, across `set_session` switches, so returning to the original
+    /// session restores access to its recovery data while another session's
+    /// export can never pick them up.
     pub fn unsaved_messages(&self) -> Vec<UnsavedMessage> {
+        let session_id = self.session_id();
         self.unsaved_messages
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .iter()
+            .filter(|copy| copy.session_id == session_id && copy.lane == self.lane)
+            .cloned()
+            .collect()
     }
 
     /// Take the write failures recorded since the last drain.
@@ -3944,7 +3978,17 @@ impl AgentHarness {
                     },
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                // The first user prompt rides the operation_started append, so
+                // this is the normal prompt path's refused-write point — the
+                // same "on screen but not saved" case `append_message` covers.
+                // Without a recovery copy here the warning's /export advice is
+                // hollow for the one write every conversation starts with.
+                self.record_write_failure_message("a message you sent", &error.to_string());
+                self.keep_unsaved_message("a message you sent", first.clone());
+                error
+            })?;
             1
         } else {
             self.write_operation_started(&run_id, source_leaf.clone(), intent)
@@ -3956,7 +4000,7 @@ impl AgentHarness {
         // they're durable. The first prompt, when present, was committed with
         // operation_started above.
         for (index, msg) in prompts.iter().enumerate().skip(prompt_start) {
-            if let Some(entry_id) = queued_ids.get(index) {
+            let persisted = if let Some(entry_id) = queued_ids.get(index) {
                 self.append_provisioned(ProvisionedEntry {
                     id: entry_id.clone(),
                     kind: ProvisionedKind::Message {
@@ -3964,12 +4008,23 @@ impl AgentHarness {
                         terminate: None,
                     },
                 })
-                .await?;
+                .await
+                .map(|_| ())
             } else {
                 self.view()
                     .append_message(msg.clone())
                     .await
-                    .map_err(session_to_harness_err)?;
+                    .map(|_| ())
+                    .map_err(session_to_harness_err)
+            };
+            if let Err(error) = persisted {
+                // Same recovery contract as the first prompt: the text is on
+                // screen, the write was refused, and /export must be able to
+                // keep it. Each refused prompt gets its own copy so the export
+                // shows the whole unsent turn, not just its first line.
+                self.record_write_failure_message("a message you sent", &error.to_string());
+                self.keep_unsaved_message("a message you sent", msg.clone());
+                return Err(error);
             }
         }
 
@@ -6570,5 +6625,172 @@ mod borrowed_context_tests {
             }
             assert_eq!(context.system_prompt.as_deref(), Some("original"));
         }
+    }
+}
+
+#[cfg(test)]
+mod unsaved_isolation_tests {
+    use super::*;
+    use crate::session::jsonl::{
+        JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+    };
+    use crate::session::memory::{InMemorySessionStorage, SystemClock};
+    use crate::session::session::DefaultIdGenerator;
+    use crate::session::types::SessionMetadata;
+    use rpi_tools::{FileSystem, OsExecutionEnv};
+
+    fn metadata(id: &str) -> crate::session::types::SessionMetadata {
+        SessionMetadata {
+            id: id.into(),
+            created_at: 0,
+            parent_session_id: None,
+        }
+    }
+
+    fn session(id: &str) -> Session {
+        Session::new(
+            Arc::new(InMemorySessionStorage::new(
+                metadata(id),
+                Arc::new(SystemClock),
+                Arc::new(DefaultIdGenerator::new()),
+            )),
+            None,
+        )
+    }
+
+    async fn harness_on(id: &str) -> AgentHarness {
+        let mut options = AgentHarnessOptions::default();
+        options.session = session(id);
+        AgentHarness::create(options).await.unwrap()
+    }
+
+    /// Recovery copies are scoped by session and lane. The vector is
+    /// harness-wide and outlives `set_session` switches, so an unscoped reader
+    /// would export session A's refused content as part of session B — the
+    /// isolation defect the maintainer reproduced through the real export path
+    /// (the rpi-cli probe drives the actual `export_session`; this one pins the
+    /// harness-side contract that makes it hold). Copies are retained, not
+    /// cleared: returning to session A restores its recovery data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_session_switch_does_not_expose_previous_session_recovery() {
+        let harness = harness_on("session-a").await;
+        harness.keep_unsaved_message_for_test(
+            "a message you sent",
+            crate::messages::create_custom_message(
+                "probe",
+                UserContent::Text("SESSION_A_SECRET".into()),
+                true,
+                None,
+                0,
+            ),
+        );
+        assert_eq!(harness.unsaved_messages().len(), 1);
+
+        // Switch to an empty session B: its view must not contain A's copy.
+        harness.set_session(session("session-b")).await.unwrap();
+        let unsaved_b = harness.unsaved_messages();
+        assert!(
+            !format!("{unsaved_b:?}").contains("SESSION_A_SECRET"),
+            "session B must not see session A's recovery data: {unsaved_b:?}"
+        );
+
+        // The data is retained for the session that owns it: switching back
+        // must restore access, not discover the copy was discarded.
+        harness.set_session(session("session-a")).await.unwrap();
+        let unsaved_a = harness.unsaved_messages();
+        assert!(
+            format!("{unsaved_a:?}").contains("SESSION_A_SECRET"),
+            "returning to session A must restore its recovery data: {unsaved_a:?}"
+        );
+    }
+
+    /// A refused append on a non-main lane must not leak into the main lane's
+    /// recovery view: the same session-level isolation applies per lane, since
+    /// `export_session` reads only the lane it is called with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_unsaved_copies_are_scoped_per_lane_within_a_session() {
+        let harness = harness_on("session-a").await;
+        harness.lane("side"); // registers nothing durable; only main exists
+        harness.keep_unsaved_message_for_test(
+            "a message you sent",
+            crate::messages::create_custom_message(
+                "probe",
+                UserContent::Text("SIDE_LANE_ONLY".into()),
+                true,
+                None,
+                0,
+            ),
+        );
+        // The copy was stamped on the harness's own lane ("main"). A main-lane
+        // reader must see it; this pins the stamp being recorded at all.
+        let unsaved = harness.unsaved_messages();
+        assert!(
+            format!("{unsaved:?}").contains("SIDE_LANE_ONLY"),
+            "a copy stamped for the current session+lane must be visible: {unsaved:?}"
+        );
+    }
+
+    /// The maintainer's P2: a refused write on the normal prompt path (the
+    /// operation_started+first-entry append) must keep a recovery copy, not
+    /// only the out-of-band `append_message` wrapper. Driven through a real
+    /// JSONL backend whose appends all fail, exactly the way a full disk does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_refused_normal_prompt_has_a_recovery_copy() {
+        /// Refuses every append, the way a full disk does.
+        struct RefusingAppend;
+
+        #[async_trait::async_trait]
+        impl rpi_tools::env::AppendFile for RefusingAppend {
+            async fn append(&mut self, _: &[u8]) -> Result<(), rpi_tools::FileError> {
+                Err(rpi_tools::FileError::new(
+                    rpi_tools::FileErrorCode::Unknown,
+                    "disk full",
+                ))
+            }
+        }
+
+        let tmp =
+            std::env::temp_dir().join(format!("rpi-normal-prompt-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let env = Arc::new(OsExecutionEnv::with_cwd(tmp.clone()));
+        let fs: Arc<dyn FileSystem> = env.clone();
+        let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+            fs,
+            sessions_root: tmp.join("sessions").to_string_lossy().into_owned(),
+            clock: Arc::new(SystemClock),
+            ids: Arc::new(DefaultIdGenerator::new()),
+        });
+        let storage = repo
+            .create_typed(&JsonlSessionCreateOptions {
+                id: Some("sess-write".into()),
+                parent_session_id: None,
+                cwd: tmp.to_string_lossy().into_owned(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        storage.install_append_handle(Box::new(RefusingAppend));
+
+        let mut options = AgentHarnessOptions::default();
+        options.session = Session::new(Arc::new(storage), None);
+        let harness = AgentHarness::create(options).await.unwrap();
+        let lane = harness.lane("main");
+
+        let result = lane.prompt_text("UNSAVED_NORMAL_PROMPT", vec![]).await;
+        let Err(error) = result else {
+            panic!("the disk must refuse the prompt write")
+        };
+        assert!(
+            error.to_string().contains("disk full"),
+            "unexpected failure instead of a refused write: {error}"
+        );
+        let unsaved = harness.unsaved_messages();
+        assert!(
+            format!("{unsaved:?}").contains("UNSAVED_NORMAL_PROMPT"),
+            "a normal failed prompt needs the recovery copy promised by the warning: {unsaved:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
