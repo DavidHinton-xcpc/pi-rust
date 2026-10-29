@@ -586,8 +586,13 @@ fn clip_placement_below(
     (visible < metadata.rows).then(|| crop_kitty_image_line(line, 0, visible))
 }
 
-/// Paint the visible remainder of a placement whose first row scrolled above
-/// the viewport.
+/// Paint the visible remainder of a placement whose anchor row is above the
+/// first row this box actually paints.
+///
+/// That happens when the placement scrolled above the viewport, and also when
+/// an ancestor clip hides the top of an unscrolled viewport: either way the
+/// escape lives on a row `paint_box` never emits, so the image would vanish
+/// while most of it is still on screen.
 fn paint_scrolled_placement(lbox: &LayoutBox, screen: &mut [String], total_width: usize) {
     let (Some(scroll_view), Some(document)) =
         (lbox.scroll_view.as_ref(), lbox.scroll_document.as_ref())
@@ -597,7 +602,7 @@ fn paint_scrolled_placement(lbox: &LayoutBox, screen: &mut [String], total_width
     let scroll_top = scroll_view.scroll_top();
     let top = lbox.rect.y.max(lbox.clip.y);
     let bottom = (lbox.clip.y + lbox.clip.height).min(screen.len());
-    if scroll_top == 0 || lbox.rect.height == 0 || bottom <= top {
+    if lbox.rect.height == 0 || bottom <= top {
         return;
     }
     // An ancestor clip may hide the first rows of the viewport; the placement
@@ -610,6 +615,9 @@ fn paint_scrolled_placement(lbox: &LayoutBox, screen: &mut [String], total_width
     let visible_source_top = scroll_top
         .saturating_add(lbox.line_offset)
         .saturating_add(clip_offset);
+    // Nothing can be above the first row of the document: the search range is
+    // empty and the loop below is a no-op, which is also the common unscrolled,
+    // unclipped case.
     // Rows above the viewport can only reach into it if they belong to a
     // placement no taller than the tallest one registered, so the search is
     // bounded instead of scanning the whole history.
@@ -1124,6 +1132,74 @@ mod scroll_layout_tests {
 
         // The box starts at row 0 but an ancestor clips it to rows 3..10, so
         // rows 0..3 of the viewport (document rows 5..8) are never painted.
+        let mut lbox = LayoutBox::new(
+            Arc::new(Text::new("", 0, 0)),
+            LayoutRect::new(0, 0, 40, 10),
+            LayoutRect::new(0, 3, 40, 7),
+        );
+        lbox.lines = Some(viewport);
+        lbox.scroll_view = Some(scroll.clone());
+        lbox.scroll_document = scroll.rendered_document();
+
+        let mut screen = vec![String::new(); 10];
+        paint_box(&lbox, &mut screen, 40);
+
+        assert!(
+            screen[3].contains(",y=300,h=500,r=5;"),
+            "the placement must resume at the first visible row with the rows \
+             hidden by the ancestor clip cropped away, got {:?}",
+            screen[3]
+        );
+        assert!(
+            screen[4..].iter().all(|row| !row.contains("\x1b_G")),
+            "the placement must be emitted once, on the row it is anchored to"
+        );
+    }
+
+    /// The same ancestor clip can hide the anchor of an image that never
+    /// scrolled: the boundary is the first *visible* source row, so
+    /// `scroll_top == 0` must not short-circuit the re-anchor.
+    #[test]
+    fn a_placement_under_an_ancestor_clip_is_reanchored_without_scrolling() {
+        const ID: u32 = 9_904;
+        crate::terminal_image::register_kitty_image(crate::terminal_image::KittyImageMetadata {
+            id: ID,
+            columns: 20,
+            rows: 8,
+            width_px: 400,
+            height_px: 800,
+        });
+
+        // The image is anchored on document row 0 and covers rows 0..8.
+        let mut rows: Vec<String> = (0..30).map(|row| format!("row {row}")).collect();
+        rows[0] = format!("\x1b_Ga=T,f=100,C=1,q=2,i={ID},p=1,c=20,r=8,m=0;AAAA\x1b\\");
+        for row in &mut rows[1..8] {
+            row.clear();
+        }
+
+        struct FixedRows(Vec<String>);
+        impl Component for FixedRows {
+            fn render(&self, _width: usize) -> Vec<String> {
+                self.0.clone()
+            }
+            fn invalidate(&self) {}
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let scroll = Arc::new(ScrollView::new(
+            Arc::new(FixedRows(rows)),
+            ScrollViewOptions {
+                follow: crate::FollowMode::None,
+                ..Default::default()
+            },
+        ));
+        let viewport = scroll.render_with_viewport(40, 10);
+        assert_eq!(scroll.scroll_top(), 0, "the viewport must not be scrolled");
+
+        // rect rows 0..10, clip rows 3..10: the image's first three rows
+        // (document rows 0..3) are never painted.
         let mut lbox = LayoutBox::new(
             Arc::new(Text::new("", 0, 0)),
             LayoutRect::new(0, 0, 40, 10),
