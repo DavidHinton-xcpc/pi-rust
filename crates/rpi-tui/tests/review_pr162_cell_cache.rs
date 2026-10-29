@@ -109,6 +109,10 @@ fn an_existing_image_shrinks_when_the_cells_get_taller() {
 ///
 /// Without this half, "invalidate on every render" would pass the two tests
 /// above while silently dropping the cache the component exists to provide.
+/// The equality of the output cannot prove a cache hit (a re-derivation of the
+/// same geometry produces the same string), so the assertion also pins the row
+/// count: a 6-column request must yield strictly fewer rows than the 40-column
+/// one, which a stale placement would violate.
 #[test]
 fn the_cache_still_hits_at_an_unchanged_geometry_and_misses_on_a_new_width() {
     let _g = lock();
@@ -123,7 +127,12 @@ fn the_cache_still_hits_at_an_unchanged_geometry_and_misses_on_a_new_width() {
     // A narrower width must re-derive, not reuse the 40-column placement.
     let very_narrow = image.render(6);
     assert_ne!(narrow, very_narrow);
-    assert!(very_narrow.len() <= narrow.len().max(very_narrow.len()));
+    assert!(
+        very_narrow.len() < narrow.len(),
+        "a 6-column placement must be shorter than a 40-column one: {} vs {}",
+        very_narrow.len(),
+        narrow.len()
+    );
 }
 
 /// An image that has never been rendered picks up the geometry reported at

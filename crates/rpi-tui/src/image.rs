@@ -85,6 +85,14 @@ pub struct Image {
     image_id: Mutex<Option<u32>>,
     cached_render: Mutex<Option<(RenderKey, String)>>,
     inline_visible: Mutex<bool>,
+    /// Number of times `render_image` had to derive a placement instead of
+    /// returning the cached one.
+    ///
+    /// A test that only compares the rendered strings cannot tell a cache hit
+    /// from a re-derivation that produced identical output, so the assertions
+    /// on "the cache still works" read this counter instead.
+    #[cfg(test)]
+    derives: std::sync::atomic::AtomicUsize,
 }
 
 impl Image {
@@ -98,6 +106,8 @@ impl Image {
             image_id: Mutex::new(None),
             cached_render: Mutex::new(None),
             inline_visible: Mutex::new(true),
+            #[cfg(test)]
+            derives: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -112,6 +122,8 @@ impl Image {
             image_id: Mutex::new(Some(id)),
             cached_render: Mutex::new(None),
             inline_visible: Mutex::new(true),
+            #[cfg(test)]
+            derives: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -125,6 +137,8 @@ impl Image {
             image_id: Mutex::new(None),
             cached_render: Mutex::new(None),
             inline_visible: Mutex::new(true),
+            #[cfg(test)]
+            derives: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -186,6 +200,14 @@ impl Image {
         Some((dims.width, dims.height))
     }
 
+    /// How many times a render had to be derived instead of served from the
+    /// cache. Test-only: it exists so a "the cache still hits" assertion can
+    /// fail when the cache is dropped on every render.
+    #[cfg(test)]
+    pub(crate) fn derive_count(&self) -> usize {
+        self.derives.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Render the image.
     fn render_image(&self, width: usize) -> String {
         if width == 0 {
@@ -216,6 +238,9 @@ impl Image {
         }
 
         // Calculate dimensions
+        #[cfg(test)]
+        self.derives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dimensions = self.get_dimensions();
         let (img_width, img_height) = if let Some((w, h)) = dimensions {
             // Calculate cell dimensions
@@ -421,6 +446,18 @@ impl Component for Image {
 mod tests {
     use super::*;
 
+    /// A PNG header with the given pixel size.
+    ///
+    /// `Image` only reads the header to derive the row count, so 24 bytes are
+    /// enough and the test needs no terminal to decode anything.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut png = vec![0u8; 24];
+        png[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        png
+    }
+
     #[test]
     fn image_visibility_retains_placeholder_and_resizing_rebuilds_layout() {
         let image = Image::new();
@@ -433,6 +470,54 @@ mod tests {
         let narrow = image.render(3);
         assert_ne!(wide, narrow);
         assert!(narrow.iter().all(|line| visible_width(line) <= 3));
+    }
+
+    /// The render cache must actually hit: a repeat render at the same width
+    /// and geometry may not re-derive.
+    ///
+    /// The integration probe that compares rendered strings cannot prove this
+    /// (a re-derivation of the same inputs produces the same bytes), so the
+    /// assertion reads the per-image derive counter instead.
+    #[test]
+    fn a_repeat_render_is_served_from_the_cache() {
+        let _g = crate::terminal_image::capability_test_lock();
+        let saved = crate::terminal_image::get_capabilities();
+        struct Restore(crate::terminal_image::TerminalCapabilities);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::terminal_image::set_capabilities(self.0.clone());
+            }
+        }
+        let _restore = Restore(saved);
+        let mut caps = crate::terminal_image::get_capabilities();
+        caps.protocol = ImageProtocol::Kitty;
+        caps.cell_width = 10;
+        caps.cell_height = 20;
+        crate::terminal_image::set_capabilities(caps);
+
+        // A PNG header is enough: only the pixel size is read.
+        let image = Image::from_data(png_header(400, 200), ImageOptions::default());
+
+        let first = image.render(80);
+        assert_eq!(image.derive_count(), 1, "the first render derives");
+        let again = image.render(80);
+        assert_eq!(again, first);
+        assert_eq!(
+            image.derive_count(),
+            1,
+            "a repeat render at the same width and geometry must hit the cache"
+        );
+
+        // A geometry change must invalidate it, or an image already on screen
+        // keeps the row count of the previous cell size.
+        crate::terminal_image::set_cell_dimensions(10, 10);
+        let rederived = image.render(80);
+        assert_eq!(image.derive_count(), 2, "a geometry change must re-derive");
+        assert_ne!(rederived.len(), first.len());
+
+        // A width change must invalidate it too.
+        image.render(40);
+        assert_eq!(image.derive_count(), 3, "a width change must re-derive");
     }
 
     #[test]

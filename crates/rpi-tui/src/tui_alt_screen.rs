@@ -792,6 +792,14 @@ impl TuiAltScreen {
         terminal.refresh_size();
         let width = terminal.columns();
         let height = terminal.rows();
+        // The main screen is the other half of the same invariant: an image's
+        // row count is derived from the cell geometry, so a document laid out
+        // for a stale geometry is wrong even when the columns did not move.
+        // Polling here too means a host that renders without a periodic tick
+        // still picks up a font zoom / DPI change instead of only noticing it
+        // through `ensure_size`.
+        crate::terminal_image::refresh_cell_dimensions();
+        let cells = crate::terminal_image::get_cell_dimensions();
         let root: Arc<dyn Component> = self
             .get_layout_root()
             .unwrap_or_else(|| Arc::new(self.container.clone()));
@@ -812,7 +820,6 @@ impl TuiAltScreen {
         // The previous frame's geometry, recorded by whichever renderer ran
         // last. A mismatch means the terminal reflowed its rows.
         let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
-        let cells = crate::terminal_image::get_cell_dimensions();
         let previous_cells = *self.painted_cells.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
         terminal.write(&crate::terminal_image::removed_kitty_placements(
@@ -1969,7 +1976,7 @@ mod tests {
 
         let frame = output.lock().unwrap().clone();
         assert!(
-            frame.contains("[2J"),
+            frame.contains("\x1b[2J"),
             "a cell geometry change must repaint every row, got: {frame:?}"
         );
         assert_eq!(tui.full_redraws(), redraws + 1);
@@ -2323,6 +2330,100 @@ mod tests {
         tui.request_render(false);
 
         assert!(output.lock().unwrap().is_empty());
+    }
+
+    /// The main-screen renderer must poll the cell geometry before it lays the
+    /// document out, not just inherit whatever `ensure_size` last wrote.
+    ///
+    /// The alt-screen path already re-polls right before layout; the main
+    /// screen returned to `do_render_main_screen()` first, so a host that
+    /// renders without a periodic watchdog would keep the geometry from
+    /// startup. The pixel size is faked through the test override because
+    /// `crossterm::terminal::window_size()` has no injection point; the assert
+    /// is on the capability the renderer itself wrote.
+    #[test]
+    fn the_main_screen_polls_the_cell_geometry_before_laying_out() {
+        let _g = crate::terminal_image::capability_test_lock();
+        let saved = crate::terminal_image::get_capabilities();
+        struct Restore(crate::terminal_image::TerminalCapabilities);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::terminal_image::set_capabilities(self.0.clone());
+                crate::terminal_image::set_window_size_override(None);
+            }
+        }
+        let _restore = Restore(saved);
+
+        // The grid the fake terminal reports is 40x8; the window is 400x160
+        // pixels, so one cell is 10x20.
+        crate::terminal_image::set_window_size_override(Some(
+            crate::terminal_image::WindowSizeOverride::Reported {
+                columns: 40,
+                rows: 8,
+                width: 400,
+                height: 160,
+            },
+        ));
+        crate::terminal_image::set_cell_dimensions(8, 16);
+
+        let output = Arc::new(Mutex::new(String::new()));
+        let tui = TuiAltScreen::new(
+            Box::new(RecordingTerminal {
+                output: output.clone(),
+            }),
+            true,
+            None,
+        );
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(Arc::new(Text::new("main screen frame", 0, 0))));
+        tui.start_readerless();
+
+        // `start_readerless` paints the first frame; the renderer must have
+        // polled the pixel size instead of trusting the 8x16 default.
+        assert_eq!(
+            crate::terminal_image::get_cell_dimensions(),
+            crate::terminal_image::CellDimensions {
+                width: 10,
+                height: 20
+            },
+            "the main-screen renderer must poll the cell geometry before layout"
+        );
+
+        // A later font zoom (new pixel size, same grid) must be picked up by a
+        // plain render too, without waiting for `ensure_size`.
+        crate::terminal_image::set_window_size_override(Some(
+            crate::terminal_image::WindowSizeOverride::Reported {
+                columns: 40,
+                rows: 8,
+                width: 800,
+                height: 160,
+            },
+        ));
+        tui.do_render(false);
+        assert_eq!(
+            crate::terminal_image::get_cell_dimensions(),
+            crate::terminal_image::CellDimensions {
+                width: 20,
+                height: 20
+            },
+            "a direct main-screen render must re-poll the cell geometry"
+        );
+
+        // The Windows / zero-pixel fallback: a terminal that cannot report a
+        // pixel size must leave the last known geometry in place instead of
+        // resetting it to the 8x16 default mid-session.
+        crate::terminal_image::set_window_size_override(Some(
+            crate::terminal_image::WindowSizeOverride::Unsupported,
+        ));
+        tui.do_render(false);
+        assert_eq!(
+            crate::terminal_image::get_cell_dimensions(),
+            crate::terminal_image::CellDimensions {
+                width: 20,
+                height: 20
+            },
+            "an unsupported pixel query must keep the cached geometry"
+        );
     }
 
     #[test]
