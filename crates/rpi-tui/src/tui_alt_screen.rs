@@ -2107,6 +2107,119 @@ mod tests {
         );
     }
 
+    /// Two renderers with different cell geometries must not see each other.
+    ///
+    /// This is the isolation the previous head lacked: the injected pixel size
+    /// and the geometry derived from it were process-wide, so a probe running
+    /// in parallel could move another renderer's cell size between two frames.
+    /// Each renderer now polls its own terminal, so this holds with no lock at
+    /// all — the assertion is that interleaved renders keep their own geometry.
+    #[test]
+    fn two_renderers_keep_their_own_cell_geometry() {
+        let small = ResizableTerminal::new(40, 8);
+        let small_pixels = small.pixels();
+        *small_pixels.lock().unwrap() = Some((400, 160)); // 10x20 per cell
+        let small_out = small.output();
+        let small_tui = TuiAltScreen::new(Box::new(small), false, None);
+        small_tui.set_layout_root(Some(Arc::new(Text::new("small", 0, 0))));
+        small_tui.start_readerless();
+        small_out.lock().unwrap().clear();
+
+        let large = ResizableTerminal::new(40, 8);
+        let large_pixels = large.pixels();
+        *large_pixels.lock().unwrap() = Some((800, 160)); // 20x20 per cell
+        let large_out = large.output();
+        let large_tui = TuiAltScreen::new(Box::new(large), false, None);
+        large_tui.set_layout_root(Some(Arc::new(Text::new("large", 0, 0))));
+        large_tui.start_readerless();
+        large_out.lock().unwrap().clear();
+
+        assert_eq!(
+            *small_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            })
+        );
+        assert_eq!(
+            *large_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            })
+        );
+
+        // Interleave the watchdogs: each renderer re-polls its own terminal and
+        // neither adopts the other's geometry.
+        for _ in 0..3 {
+            small_tui.ensure_size();
+            large_tui.ensure_size();
+        }
+        assert_eq!(
+            *small_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            }),
+            "the smaller-cell renderer must keep its own geometry"
+        );
+        assert_eq!(
+            *large_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            }),
+            "the larger-cell renderer must keep its own geometry"
+        );
+    }
+
+    /// A font zoom the terminal reports on its own must reach the watchdog.
+    ///
+    /// The previous probes faked the *cached* geometry, so they never proved
+    /// the poll: this one changes what the terminal answers and asserts the
+    /// repaint follows, which is the path a real font zoom takes.
+    #[test]
+    fn the_watchdog_follows_a_geometry_the_terminal_starts_reporting() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let pixels = terminal.pixels();
+        *pixels.lock().unwrap() = Some((400, 160)); // 10x20 per cell
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // A steady tick stays free.
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "an unchanged geometry must not repaint, got: {:?}",
+            output.lock().unwrap()
+        );
+
+        // Font zoom: same 40x8 grid, half the pixels per cell. No resize event
+        // arrives for this, so the watchdog poll is the only thing that can
+        // notice.
+        *pixels.lock().unwrap() = Some((400, 80));
+        let redraws = tui.full_redraws();
+        tui.ensure_size();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a geometry-only change the terminal reports must repaint every row, got: {frame:?}"
+        );
+        assert_eq!(tui.full_redraws(), redraws + 1);
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 10
+            }),
+            "the watchdog must adopt the geometry the terminal now reports"
+        );
+    }
+
     #[test]
     fn changed_rows_overwrite_without_blanking_sidebar_and_clear_shorter_tails_afterwards() {
         for main_screen in [false, true] {
