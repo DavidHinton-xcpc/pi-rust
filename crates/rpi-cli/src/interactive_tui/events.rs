@@ -199,6 +199,11 @@ pub(super) async fn handle_agent_event(
             // The run drained the queue; refresh so consumed entries drop out
             // of the pending-messages display.
             refresh_pending_messages(state, lane).await;
+            // A write that failed mid-run is not a run failure, so it cannot ride
+            // the run outcome. Report it here: inside the alternate screen a
+            // `tracing::warn!` reaches nobody, and "the conversation stopped
+            // being saved" is something the user has to know before exiting.
+            report_write_failures(chat, lane);
             tui.request_render(false);
         }
 
@@ -515,4 +520,34 @@ pub(super) fn tool_result_requests_markdown(details: Option<&serde_json::Value>)
         .and_then(|details| details.get("markdown"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+/// Render the session writes that failed since the last call.
+///
+/// Deduplicated by (`what`, `message`) so a backend failing the same way on every
+/// turn shows one line rather than one per turn: the queue is drained every
+/// `AgentEnd`, and the same disk-full error would otherwise repeat forever.
+pub(super) fn report_write_failures(chat: &Arc<Container>, lane: &Arc<dyn AgentLane>) {
+    let failures = lane.take_write_failures();
+    if failures.is_empty() {
+        return;
+    }
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for failure in failures {
+        let key = (failure.what.clone(), failure.message.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        add_error_message(
+            chat,
+            &format!(
+                "Session not saved: could not persist {} ({}). \
+                 Your messages are still on screen, and /export now writes the \
+                 unsaved ones into the exported file — do that before exiting: \
+                 the session log cannot be repaired.",
+                failure.what, failure.message
+            ),
+        );
+    }
 }

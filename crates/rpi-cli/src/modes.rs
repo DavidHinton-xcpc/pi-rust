@@ -84,7 +84,17 @@ pub async fn print(
 
     let mut images = initial_images;
     for prompt in prompts {
-        match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
+        let outcome = lane.prompt_text(&prompt, std::mem::take(&mut images)).await;
+        // Print mode has no transcript to report into, so a write failure goes to
+        // stderr. Silence here is what let a conversation stop being saved while
+        // the run looked fine.
+        for failure in lane.take_write_failures() {
+            eprintln!(
+                "session not saved: could not persist {} ({})",
+                failure.what, failure.message
+            );
+        }
+        match outcome {
             Ok(result) => {
                 last_exit = outcome_exit_code(&result.outcome);
                 match &result.outcome {
