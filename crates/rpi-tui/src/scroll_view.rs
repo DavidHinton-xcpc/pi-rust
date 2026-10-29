@@ -755,6 +755,10 @@ mod tests {
             }
         }
 
+        // The capability cache is process-wide, so this probe has to hold the
+        // shared lock: without it a parallel test can observe the geometry swap
+        // mid-assertion (or this one can observe theirs).
+        let _g = crate::terminal_image::capability_test_lock();
         let saved = crate::terminal_image::get_capabilities();
         struct Restore(crate::terminal_image::TerminalCapabilities);
         impl Drop for Restore {

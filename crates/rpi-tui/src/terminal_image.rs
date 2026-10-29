@@ -180,6 +180,12 @@ pub fn query_cell_dimensions(
 /// to every other test in the same binary. Geometry-sensitive assertions in
 /// `image.rs` and `scroll_view.rs` take this lock so one test's swap cannot
 /// invalidate another test's cached render mid-assertion.
+///
+/// Renderers no longer read the geometry through this cache: [`crate::tui_alt_screen::TuiAltScreen`]
+/// polls its own terminal and keeps the result on the instance, which is what
+/// isolates the renderer tests without any shared lock. This lock remains only
+/// for the component-level probes that deliberately drive `Image` and
+/// `ScrollView` through the cache.
 #[cfg(test)]
 pub(crate) fn capability_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -198,75 +204,13 @@ pub(crate) fn capability_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// cannot infer a geometry change from columns and rows: they compare
 /// [`get_cell_dimensions`] against what they last painted.
 pub fn refresh_cell_dimensions() {
-    #[cfg(test)]
-    let injected = WINDOW_SIZE_OVERRIDE
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone());
-    #[cfg(test)]
-    let (window, size) = match injected {
-        Some(WindowSizeOverride::Reported {
-            columns,
-            rows,
-            width,
-            height,
-        }) => (
-            Some(crossterm::terminal::WindowSize {
-                rows,
-                columns,
-                width,
-                height,
-            }),
-            Some((columns, rows)),
-        ),
-        Some(WindowSizeOverride::Unsupported) => (None, crossterm::terminal::size().ok()),
-        None => (
-            crossterm::terminal::window_size().ok(),
-            crossterm::terminal::size().ok(),
-        ),
-    };
-    #[cfg(not(test))]
-    let (window, size) = (
+    if let Some(cell) = query_cell_dimensions(
         crossterm::terminal::window_size().ok(),
         crossterm::terminal::size().ok(),
-    );
-    if let Some(cell) = query_cell_dimensions(window, size) {
+    ) {
         set_cell_dimensions(cell.width, cell.height);
     }
 }
-
-/// A faked reply from the terminal's pixel-size query.
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) enum WindowSizeOverride {
-    /// The terminal reported this pixel size for this character grid.
-    Reported {
-        columns: u16,
-        rows: u16,
-        width: u16,
-        height: u16,
-    },
-    /// The terminal cannot report a pixel size (crossterm on Windows, a Unix
-    /// terminal that leaves `ws_xpixel` / `ws_ypixel` at zero).
-    Unsupported,
-}
-
-/// Fakes the pixel size a terminal reports, so a test can drive
-/// [`refresh_cell_dimensions`] without a real ioctl.
-///
-/// `crossterm::terminal::window_size()` has no injection point, which left the
-/// refresh path itself unprobeable: the tests could only set the cached cell
-/// size directly and therefore never proved that a renderer *polls*. The
-/// override makes the poll observable; `None` restores the real query.
-#[cfg(test)]
-pub(crate) fn set_window_size_override(window: Option<WindowSizeOverride>) {
-    if let Ok(mut slot) = WINDOW_SIZE_OVERRIDE.lock() {
-        *slot = window;
-    }
-}
-
-#[cfg(test)]
-static WINDOW_SIZE_OVERRIDE: Mutex<Option<WindowSizeOverride>> = Mutex::new(None);
 
 fn detect_image_protocol(env: impl Fn(&str) -> Option<String>) -> ImageProtocol {
     let program = env("TERM_PROGRAM").unwrap_or_default().to_lowercase();

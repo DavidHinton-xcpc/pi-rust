@@ -48,6 +48,19 @@ fn merge_pending_render(parked: Option<bool>, reuse_scroll_content: bool) -> Opt
     }
 }
 
+/// Ask one terminal for its cell size in pixels.
+///
+/// The answer comes from the terminal object rather than the process-wide
+/// capability cache, so a renderer's geometry belongs to the terminal it is
+/// drawing to. `None` means "this terminal cannot report pixels" (Windows, or
+/// a Unix terminal that leaves the ioctl fields at zero).
+fn poll_cell_dimensions_of(terminal: &dyn Terminal) -> Option<CellDimensions> {
+    crate::terminal_image::query_cell_dimensions(
+        terminal.window_size(),
+        Some((terminal.columns() as u16, terminal.rows() as u16)),
+    )
+}
+
 /// Coalescing render-scheduler state — the Rust port of upstream's
 /// `TuiBase.{renderRequested, renderTimer, lastRenderAt}` trio.
 struct RenderSchedulerState {
@@ -148,6 +161,14 @@ pub struct TuiAltScreen {
     /// `painted_size` because the character grid can stay identical while the
     /// pixels per cell change (font zoom, another monitor's DPI).
     painted_cells: Mutex<CellDimensions>,
+    /// The cell geometry this renderer last polled, or `None` until it polls.
+    ///
+    /// The polled value lives on the instance rather than only in the
+    /// process-wide capability cache so that a renderer always compares and
+    /// lays out against geometry it read itself. Tests then isolate by
+    /// construction: a fake terminal reports its own pixel size and nothing
+    /// another test does can move this renderer's geometry between two frames.
+    cell_geometry: Mutex<Option<CellDimensions>>,
     /// Set when a resize event reaches the loop. The window can end up at the
     /// size it already had (dragged out and back) while every intermediate
     /// resize reflowed the terminal's rows, so the next frame repaints whole.
@@ -215,6 +236,7 @@ impl TuiAltScreen {
             previous_screen: Mutex::new(Vec::new()),
             painted_size: Mutex::new((0, 0)),
             painted_cells: Mutex::new(crate::terminal_image::get_cell_dimensions()),
+            cell_geometry: Mutex::new(None),
             resize_dirty: AtomicBool::new(false),
             scroll_top: Mutex::new(0),
             stick_to_bottom: Mutex::new(true),
@@ -626,7 +648,7 @@ impl TuiAltScreen {
         // monitor with a different DPI). Image sizing divides the source image
         // by the cell size, so a stale cache would keep the old geometry. This
         // is a no-op on terminals that do not report pixel sizes.
-        crate::terminal_image::refresh_cell_dimensions();
+        self.poll_cell_dimensions();
         self.resize_dirty.store(true, Ordering::Release);
         self.request_render(false);
     }
@@ -657,7 +679,7 @@ impl TuiAltScreen {
             return;
         }
         let size_changed = *self.painted_size.lock().unwrap() != (columns, rows);
-        crate::terminal_image::refresh_cell_dimensions();
+        self.poll_cell_dimensions();
         let cells_changed = self.cell_geometry_changed();
         if !size_changed && !cells_changed {
             return;
@@ -674,13 +696,58 @@ impl TuiAltScreen {
         self.request_render(false);
     }
 
-    /// Whether the cached cell geometry differs from the frame on screen.
+    /// The cell geometry this renderer has polled, polling once if it has not.
+    ///
+    /// Reading through this instead of [`crate::terminal_image::get_cell_dimensions`]
+    /// keeps the renderer's own view of the geometry separate from the
+    /// process-wide cache, which other terminals (and, in tests, other
+    /// renderers) also write.
+    fn current_cell_dimensions(&self) -> CellDimensions {
+        if let Some(cells) = *self.cell_geometry.lock().unwrap() {
+            return cells;
+        }
+        self.poll_cell_dimensions()
+    }
+
+    /// Poll the terminal's pixel size and record it on this renderer.
+    ///
+    /// A terminal that cannot report a pixel size leaves the previously polled
+    /// geometry in place, so a transient `Unsupported` reply cannot reset an
+    /// established geometry mid-session. Before the first successful poll the
+    /// process-wide cache supplies the fallback, which keeps a terminal that
+    /// never reports pixels rendering at the historical default.
+    fn poll_cell_dimensions(&self) -> CellDimensions {
+        let polled = self
+            .terminal
+            .lock()
+            .ok()
+            .and_then(|terminal| poll_cell_dimensions_of(terminal.as_ref()));
+        self.record_cell_dimensions(polled)
+    }
+
+    /// Poll through a terminal lock the caller already holds.
+    ///
+    /// Renderers take the terminal lock for the whole frame; re-locking here
+    /// would deadlock against themselves.
+    fn poll_cell_dimensions_with(&self, terminal: &dyn Terminal) -> CellDimensions {
+        self.record_cell_dimensions(poll_cell_dimensions_of(terminal))
+    }
+
+    fn record_cell_dimensions(&self, polled: Option<CellDimensions>) -> CellDimensions {
+        let mut slot = self.cell_geometry.lock().unwrap();
+        if let Some(polled) = polled {
+            *slot = Some(polled);
+        }
+        slot.unwrap_or_else(crate::terminal_image::get_cell_dimensions)
+    }
+
+    /// Whether the polled cell geometry differs from the frame on screen.
     ///
     /// Compared against `painted_cells` (what the last frame was laid out for),
     /// not against the previous poll: a geometry change that arrived while a
     /// repaint was parked must still be picked up by the next tick.
     fn cell_geometry_changed(&self) -> bool {
-        let current = crate::terminal_image::get_cell_dimensions();
+        let current = self.current_cell_dimensions();
         *self.painted_cells.lock().unwrap() != current
     }
 
@@ -797,9 +864,9 @@ impl TuiAltScreen {
         // for a stale geometry is wrong even when the columns did not move.
         // Polling here too means a host that renders without a periodic tick
         // still picks up a font zoom / DPI change instead of only noticing it
-        // through `ensure_size`.
-        crate::terminal_image::refresh_cell_dimensions();
-        let cells = crate::terminal_image::get_cell_dimensions();
+        // through `ensure_size`. The terminal lock is already held, so this
+        // polls through it rather than re-locking.
+        let cells = self.poll_cell_dimensions_with(terminal.as_ref());
         let root: Arc<dyn Component> = self
             .get_layout_root()
             .unwrap_or_else(|| Arc::new(self.container.clone()));
@@ -1067,8 +1134,7 @@ impl TuiAltScreen {
         // from it, so a frame laid out for a stale cell size is wrong even when
         // the columns did not move. Doing it here (not only in `ensure_size`)
         // covers a host that renders without a periodic tick.
-        crate::terminal_image::refresh_cell_dimensions();
-        let cells = crate::terminal_image::get_cell_dimensions();
+        let cells = self.poll_cell_dimensions();
 
         // Get layout root or use container
         let root = self.get_layout_root();
@@ -1632,6 +1698,10 @@ impl Terminal for TerminalProxy {
         let _ = self.with(|terminal| terminal.refresh_size());
     }
 
+    fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+        self.with(|terminal| terminal.window_size()).flatten()
+    }
+
     fn start(
         &self,
         on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
@@ -1669,6 +1739,9 @@ mod tests {
     struct ResizableTerminal {
         output: Arc<Mutex<String>>,
         size: Arc<Mutex<(usize, usize)>>,
+        /// The pixel size this fake terminal reports for its current grid.
+        /// `None` means "cannot report pixels", the Windows / zero-ioctl case.
+        pixels: Arc<Mutex<Option<(u16, u16)>>>,
     }
 
     impl ResizableTerminal {
@@ -1676,6 +1749,7 @@ mod tests {
             Self {
                 output: Arc::new(Mutex::new(String::new())),
                 size: Arc::new(Mutex::new((columns, rows))),
+                pixels: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1685,6 +1759,16 @@ mod tests {
 
         fn size(&self) -> Arc<Mutex<(usize, usize)>> {
             self.size.clone()
+        }
+
+        /// The pixel size this terminal reports, settable per test.
+        ///
+        /// The geometry a renderer uses is a property of its terminal, so a
+        /// test drives it through the fake terminal instead of a process-wide
+        /// override: nothing another test does can move this renderer's cell
+        /// size between two frames.
+        fn pixels(&self) -> Arc<Mutex<Option<(u16, u16)>>> {
+            self.pixels.clone()
         }
     }
 
@@ -1712,6 +1796,16 @@ mod tests {
         fn enter_raw_mode(&self) {}
         fn exit_raw_mode(&self) {}
         fn refresh_size(&self) {}
+        fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+            let (columns, rows) = *self.size.lock().unwrap();
+            let (width, height) = (*self.pixels.lock().unwrap())?;
+            Some(crossterm::terminal::WindowSize {
+                columns: columns as u16,
+                rows: rows as u16,
+                width,
+                height,
+            })
+        }
         fn start(
             &self,
             _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
@@ -2338,91 +2432,62 @@ mod tests {
     /// The alt-screen path already re-polls right before layout; the main
     /// screen returned to `do_render_main_screen()` first, so a host that
     /// renders without a periodic watchdog would keep the geometry from
-    /// startup. The pixel size is faked through the test override because
-    /// `crossterm::terminal::window_size()` has no injection point; the assert
-    /// is on the capability the renderer itself wrote.
+    /// startup.
+    ///
+    /// The pixel size comes from the fake terminal's own `window_size()`, so
+    /// this test shares no mutable state with the rest of the binary: nothing
+    /// it does can move another renderer's geometry, and nothing another test
+    /// does can move this one's. The assertions read the renderer's polled
+    /// geometry rather than the process-wide cache for the same reason.
     #[test]
     fn the_main_screen_polls_the_cell_geometry_before_laying_out() {
-        let _g = crate::terminal_image::capability_test_lock();
-        let saved = crate::terminal_image::get_capabilities();
-        struct Restore(crate::terminal_image::TerminalCapabilities);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::terminal_image::set_capabilities(self.0.clone());
-                crate::terminal_image::set_window_size_override(None);
-            }
-        }
-        let _restore = Restore(saved);
-
-        // The grid the fake terminal reports is 40x8; the window is 400x160
-        // pixels, so one cell is 10x20.
-        crate::terminal_image::set_window_size_override(Some(
-            crate::terminal_image::WindowSizeOverride::Reported {
-                columns: 40,
-                rows: 8,
-                width: 400,
-                height: 160,
-            },
-        ));
-        crate::terminal_image::set_cell_dimensions(8, 16);
-
-        let output = Arc::new(Mutex::new(String::new()));
-        let tui = TuiAltScreen::new(
-            Box::new(RecordingTerminal {
-                output: output.clone(),
-            }),
-            true,
-            None,
-        );
+        // The grid is 40x8; 400x160 pixels means one cell is 10x20.
+        let terminal = ResizableTerminal::new(40, 8);
+        let pixels = terminal.pixels();
+        *pixels.lock().unwrap() = Some((400, 160));
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
         tui.set_main_screen_mode(true);
         tui.set_layout_root(Some(Arc::new(Text::new("main screen frame", 0, 0))));
         tui.start_readerless();
+        output.lock().unwrap().clear();
 
         // `start_readerless` paints the first frame; the renderer must have
         // polled the pixel size instead of trusting the 8x16 default.
         assert_eq!(
-            crate::terminal_image::get_cell_dimensions(),
-            crate::terminal_image::CellDimensions {
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
                 width: 10,
                 height: 20
-            },
+            }),
             "the main-screen renderer must poll the cell geometry before layout"
         );
 
         // A later font zoom (new pixel size, same grid) must be picked up by a
         // plain render too, without waiting for `ensure_size`.
-        crate::terminal_image::set_window_size_override(Some(
-            crate::terminal_image::WindowSizeOverride::Reported {
-                columns: 40,
-                rows: 8,
-                width: 800,
-                height: 160,
-            },
-        ));
+        *pixels.lock().unwrap() = Some((800, 160));
         tui.do_render(false);
         assert_eq!(
-            crate::terminal_image::get_cell_dimensions(),
-            crate::terminal_image::CellDimensions {
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
                 width: 20,
                 height: 20
-            },
+            }),
             "a direct main-screen render must re-poll the cell geometry"
         );
 
         // The Windows / zero-pixel fallback: a terminal that cannot report a
         // pixel size must leave the last known geometry in place instead of
         // resetting it to the 8x16 default mid-session.
-        crate::terminal_image::set_window_size_override(Some(
-            crate::terminal_image::WindowSizeOverride::Unsupported,
-        ));
+        *pixels.lock().unwrap() = None;
         tui.do_render(false);
         assert_eq!(
-            crate::terminal_image::get_cell_dimensions(),
-            crate::terminal_image::CellDimensions {
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
                 width: 20,
                 height: 20
-            },
-            "an unsupported pixel query must keep the cached geometry"
+            }),
+            "an unsupported pixel query must keep the polled geometry"
         );
     }
 
