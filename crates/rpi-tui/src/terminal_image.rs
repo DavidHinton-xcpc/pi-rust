@@ -49,7 +49,7 @@ pub struct ImageDimensions {
 }
 
 /// Cell dimensions in pixels.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellDimensions {
     pub width: u16,
     pub height: u16,
@@ -124,7 +124,69 @@ pub fn detect_capabilities() -> TerminalCapabilities {
         caps.rows = size.1;
     }
 
+    // Cell size in pixels, when the platform reports it.
+    if let Some(cell) = query_cell_dimensions(
+        crossterm::terminal::window_size().ok(),
+        crossterm::terminal::size().ok(),
+    ) {
+        caps.cell_width = cell.width;
+        caps.cell_height = cell.height;
+    }
+
     caps
+}
+
+/// Default cell size used when the terminal cannot report one.
+///
+/// Matches the historical [`TerminalCapabilities::default`] values so a
+/// terminal that reports nothing keeps rendering exactly as before.
+pub const DEFAULT_CELL_WIDTH: u16 = 8;
+pub const DEFAULT_CELL_HEIGHT: u16 = 16;
+
+/// Derive the cell size in pixels from a window size report.
+///
+/// `crossterm::terminal::window_size` returns the terminal's pixel size on
+/// Unix but is `Unsupported` on Windows, and even on Unix some terminals report
+/// zero pixels. Both cases fall back to [`DEFAULT_CELL_WIDTH`] /
+/// [`DEFAULT_CELL_HEIGHT`] instead of guessing a cell count from nothing.
+/// A reported pixel size that is smaller than the cell grid is treated as
+/// unusable for the same reason: it would imply a sub-pixel cell.
+pub fn query_cell_dimensions(
+    window: Option<crossterm::terminal::WindowSize>,
+    size: Option<(u16, u16)>,
+) -> Option<CellDimensions> {
+    let window = window?;
+    let (columns, rows) = match size {
+        Some((c, r)) if c > 0 && r > 0 => (c, r),
+        _ => (window.columns, window.rows),
+    };
+    if columns == 0 || rows == 0 {
+        return None;
+    }
+    if u32::from(window.width) < u32::from(columns) || u32::from(window.height) < u32::from(rows) {
+        return None;
+    }
+    let width = window.width / columns;
+    let height = window.height / rows;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(CellDimensions { width, height })
+}
+
+/// Refresh the cached cell size after a resize.
+///
+/// Callers that learn about a resize (`Event::Resize`, or the renderer's own
+/// size check) call this so image sizing follows the new cell geometry. It is a
+/// no-op on terminals that do not report pixel sizes, leaving the previously
+/// cached (or default) values in place.
+pub fn refresh_cell_dimensions() {
+    if let Some(cell) = query_cell_dimensions(
+        crossterm::terminal::window_size().ok(),
+        crossterm::terminal::size().ok(),
+    ) {
+        set_cell_dimensions(cell.width, cell.height);
+    }
 }
 
 fn detect_image_protocol(env: impl Fn(&str) -> Option<String>) -> ImageProtocol {
@@ -836,6 +898,80 @@ mod tests {
     fn test_capabilities_default() {
         let caps = TerminalCapabilities::default();
         assert_eq!(caps.protocol, ImageProtocol::None);
+    }
+
+    #[test]
+    fn cell_dimensions_come_from_the_reported_pixel_size_or_stay_default() {
+        use crossterm::terminal::WindowSize;
+
+        let window = |columns, rows, width, height| WindowSize {
+            rows,
+            columns,
+            width,
+            height,
+        };
+
+        // The normal case: a 120x30 grid in a 1200x600 window is 10x20 per cell.
+        assert_eq!(
+            query_cell_dimensions(Some(window(120, 30, 1200, 600)), Some((120, 30))),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            })
+        );
+
+        // Integer division truncates rather than rounding up, so a cell can
+        // never be reported larger than the terminal actually has.
+        assert_eq!(
+            query_cell_dimensions(Some(window(120, 30, 1205, 605)), Some((120, 30))),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            })
+        );
+
+        // Windows: `window_size()` is `Unsupported`, so no pixel size exists and
+        // the historical default has to survive untouched. This is the case the
+        // probe exists for — the previous code never left 8x16 anywhere.
+        assert_eq!(query_cell_dimensions(None, Some((120, 30))), None);
+
+        // A terminal that answers the query with zero pixels (common on Unix per
+        // the ioctl docs) is not a usable measurement either.
+        assert_eq!(
+            query_cell_dimensions(Some(window(120, 30, 0, 0)), Some((120, 30))),
+            None
+        );
+
+        // Fewer pixels than cells would imply a sub-pixel cell: reject it
+        // instead of dividing down to a 0-width cell.
+        assert_eq!(
+            query_cell_dimensions(Some(window(120, 30, 100, 20)), Some((120, 30))),
+            None
+        );
+
+        // A zero column count cannot be divided by; fall back to the window's
+        // own grid, and reject when that is zero too.
+        assert_eq!(
+            query_cell_dimensions(Some(window(0, 0, 1200, 600)), Some((120, 30))),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            })
+        );
+        assert_eq!(
+            query_cell_dimensions(Some(window(0, 0, 1200, 600)), None),
+            None
+        );
+
+        // The default itself is unchanged, so terminals without a pixel size
+        // render exactly as they did before this change.
+        assert_eq!(
+            (
+                TerminalCapabilities::default().cell_width,
+                TerminalCapabilities::default().cell_height
+            ),
+            (DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT)
+        );
     }
 
     #[test]

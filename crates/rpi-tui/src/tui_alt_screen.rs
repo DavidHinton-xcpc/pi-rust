@@ -612,6 +612,11 @@ impl TuiAltScreen {
     /// The repaint is forced even when the window ends up at the size it already
     /// had, because every intermediate resize reflowed the terminal's rows.
     pub fn note_resize(&self) {
+        // A resize can change the cell size in pixels (font zoom, moving to a
+        // monitor with a different DPI). Image sizing divides the source image
+        // by the cell size, so a stale cache would keep the old geometry. This
+        // is a no-op on terminals that do not report pixel sizes.
+        crate::terminal_image::refresh_cell_dimensions();
         self.resize_dirty.store(true, Ordering::Release);
         self.request_render(false);
     }
