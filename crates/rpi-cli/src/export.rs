@@ -480,6 +480,8 @@ mod tests {
             message,
             what: "a message you sent".to_string(),
             at: 0,
+            session_id: "sess".to_string(),
+            lane: "main".to_string(),
         }];
 
         let md_path = dir.path().join("out.md");
@@ -516,5 +518,34 @@ mod tests {
         let out = dir.path().join("out.md");
         let err = export_file(&bogus, &out).unwrap_err();
         assert!(err.contains("not a JSONL v4 session file"), "{err}");
+    }
+
+    /// The maintainer's isolation probe, verbatim in shape: preload a recovery
+    /// copy for session A through the test hook, switch to an empty ephemeral
+    /// session B, export B through the production `export_session` — the file
+    /// must not contain A's refused content. Combined with the harness-side
+    /// `review_session_switch_does_not_expose_previous_session_recovery`, this
+    /// pins both ends of the isolation contract (scoped reader + real switch).
+    #[tokio::test]
+    async fn review_session_switch_does_not_export_previous_session_recovery() {
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        harness.keep_unsaved_message_for_test(
+            "old session message",
+            rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage::new("SESSION_A_SECRET", 1)),
+        );
+        harness
+            .set_session(crate::session::ephemeral_session())
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("session-b.md");
+        export_session(&harness, ExportFormat::Markdown, &output)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(output).unwrap();
+        assert!(
+            !text.contains("SESSION_A_SECRET"),
+            "session B export leaked session A's recovery data: {text}"
+        );
     }
 }
