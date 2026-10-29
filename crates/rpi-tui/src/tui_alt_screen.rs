@@ -20,6 +20,7 @@ use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
+use crate::terminal_image::CellDimensions;
 
 /// Symbol for ViewportTUI capability check.
 pub const VIEWPORT_TUI: &[u8] = b"rpi-tui/viewport";
@@ -139,6 +140,14 @@ pub struct TuiAltScreen {
     /// the terminal reflowed its rows, so the frame cannot be patched cell by
     /// cell and must be repainted whole.
     painted_size: Mutex<(usize, usize)>,
+    /// Cell size in pixels the frame in `previous_screen` was laid out for.
+    ///
+    /// Image placements derive their row count from the cell geometry, so a
+    /// frame built for another geometry cannot be diffed against: the rows that
+    /// look unchanged still hold the previous geometry. Tracked separately from
+    /// `painted_size` because the character grid can stay identical while the
+    /// pixels per cell change (font zoom, another monitor's DPI).
+    painted_cells: Mutex<CellDimensions>,
     /// Set when a resize event reaches the loop. The window can end up at the
     /// size it already had (dragged out and back) while every intermediate
     /// resize reflowed the terminal's rows, so the next frame repaints whole.
@@ -205,6 +214,7 @@ impl TuiAltScreen {
             full_redraw_count: Mutex::new(0),
             previous_screen: Mutex::new(Vec::new()),
             painted_size: Mutex::new((0, 0)),
+            painted_cells: Mutex::new(crate::terminal_image::get_cell_dimensions()),
             resize_dirty: AtomicBool::new(false),
             scroll_top: Mutex::new(0),
             stick_to_bottom: Mutex::new(true),
@@ -629,6 +639,13 @@ impl TuiAltScreen {
     /// so hosts call this from their periodic tick. The render path re-reads the
     /// size on every frame too; this catches a window that changed while no
     /// event reached the loop.
+    ///
+    /// The cell size in pixels is polled here as well, because the character
+    /// grid can stay identical while the cell geometry changes (font zoom, a
+    /// move to a monitor with another DPI) and no resize event is guaranteed to
+    /// arrive for that. A geometry change repaints every row: image placements
+    /// re-derive their row count from the cell size, so a diff against the old
+    /// frame would keep rows at the previous geometry.
     pub fn ensure_size(&self) {
         let Some((columns, rows)) = self.terminal.lock().ok().map(|terminal| {
             terminal.refresh_size();
@@ -636,7 +653,13 @@ impl TuiAltScreen {
         }) else {
             return;
         };
-        if columns == 0 || rows == 0 || *self.painted_size.lock().unwrap() == (columns, rows) {
+        if columns == 0 || rows == 0 {
+            return;
+        }
+        let size_changed = *self.painted_size.lock().unwrap() != (columns, rows);
+        crate::terminal_image::refresh_cell_dimensions();
+        let cells_changed = self.cell_geometry_changed();
+        if !size_changed && !cells_changed {
             return;
         }
         // Alt-screen frames need every row repainted: the terminal reflowed the
@@ -647,7 +670,18 @@ impl TuiAltScreen {
                 prev.clear();
             }
         }
+        self.resize_dirty.store(true, Ordering::Release);
         self.request_render(false);
+    }
+
+    /// Whether the cached cell geometry differs from the frame on screen.
+    ///
+    /// Compared against `painted_cells` (what the last frame was laid out for),
+    /// not against the previous poll: a geometry change that arrived while a
+    /// repaint was parked must still be picked up by the next tick.
+    fn cell_geometry_changed(&self) -> bool {
+        let current = crate::terminal_image::get_cell_dimensions();
+        *self.painted_cells.lock().unwrap() != current
     }
 
     fn enter_alt_screen(&self) {
@@ -778,6 +812,8 @@ impl TuiAltScreen {
         // The previous frame's geometry, recorded by whichever renderer ran
         // last. A mismatch means the terminal reflowed its rows.
         let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
+        let cells = crate::terminal_image::get_cell_dimensions();
+        let previous_cells = *self.painted_cells.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
         terminal.write(&crate::terminal_image::removed_kitty_placements(
             &previous, &lines,
@@ -804,6 +840,7 @@ impl TuiAltScreen {
         // remain incremental.
         if (previous_width != 0 && previous_width != width)
             || (previous_height != 0 && previous_height != height)
+            || previous_cells != cells
             || changed_in_scrollback
         {
             terminal.write("\x1b[?2026h");
@@ -984,6 +1021,7 @@ impl TuiAltScreen {
         if let Ok(mut painted) = self.painted_size.lock() {
             *painted = (width, height);
         }
+        *self.painted_cells.lock().unwrap() = cells;
     }
 
     /// Perform a differential render with constrained layout.
@@ -1016,6 +1054,14 @@ impl TuiAltScreen {
         } else {
             return;
         };
+
+        // Re-poll the cell geometry before laying the frame out, for the same
+        // reason as the character size above: an image's row count is derived
+        // from it, so a frame laid out for a stale cell size is wrong even when
+        // the columns did not move. Doing it here (not only in `ensure_size`)
+        // covers a host that renders without a periodic tick.
+        crate::terminal_image::refresh_cell_dimensions();
+        let cells = crate::terminal_image::get_cell_dimensions();
 
         // Get layout root or use container
         let root = self.get_layout_root();
@@ -1073,7 +1119,13 @@ impl TuiAltScreen {
         // cell-by-cell: the skipped "unchanged" rows would keep the terminal's
         // reflowed leftovers (short borders, duplicated spinner rows). Repaint
         // every row when it moved.
-        let full_redraw = previous.is_empty() || painted != (width, height) || resize_dirty;
+        //
+        // The cell size counts as geometry too: an image's row count is derived
+        // from it, so a frame laid out for another cell size holds placements of
+        // the wrong height even though every column count matches.
+        let cells_changed = *self.painted_cells.lock().unwrap() != cells;
+        let full_redraw =
+            previous.is_empty() || painted != (width, height) || resize_dirty || cells_changed;
 
         // Build output buffer
         let mut buffer = String::new();
@@ -1178,6 +1230,7 @@ impl TuiAltScreen {
         if let Ok(mut painted) = self.painted_size.lock() {
             *painted = (width, height);
         }
+        *self.painted_cells.lock().unwrap() = cells;
     }
 
     fn paint_overlays(&self, lines: &mut [String], width: usize, height: usize) {
@@ -1885,6 +1938,51 @@ mod tests {
             assert!(!tui.flush_pending_render());
             assert!(output.lock().unwrap().is_empty());
         }
+    }
+
+    /// The character grid can stay identical while the cell geometry changes
+    /// (font zoom, a window moved to a monitor with another DPI). No resize event
+    /// has to arrive for that, so the watchdog is the only place that can notice
+    /// it — and a diff against the previous frame would keep the old image rows.
+    ///
+    /// The previous frame's geometry is faked through `painted_cells` instead of
+    /// mutating the process-wide capability cache, which other tests running in
+    /// parallel would observe.
+    #[test]
+    fn the_size_watchdog_repaints_when_only_the_cell_geometry_changed() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // The frame on screen was laid out for a cell size the terminal no
+        // longer reports, with the columns and rows unchanged.
+        let painted = *tui.painted_cells.lock().unwrap();
+        *tui.painted_cells.lock().unwrap() = CellDimensions {
+            width: painted.width.saturating_add(1).max(1),
+            height: painted.height.saturating_add(1).max(1),
+        };
+        let redraws = tui.full_redraws();
+        tui.ensure_size();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("[2J"),
+            "a cell geometry change must repaint every row, got: {frame:?}"
+        );
+        assert_eq!(tui.full_redraws(), redraws + 1);
+        assert_eq!(*tui.painted_cells.lock().unwrap(), painted);
+
+        // A tick that re-reads the same geometry stays free.
+        output.lock().unwrap().clear();
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "an unchanged cell geometry must not repaint, got: {:?}",
+            output.lock().unwrap()
+        );
     }
 
     #[test]

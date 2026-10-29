@@ -60,6 +60,22 @@ impl Default for ImageOptions {
     }
 }
 
+/// The cell geometry a cached render was computed for.
+///
+/// `Image::render_image` divides the source image's pixel size by the cell size
+/// to decide how many rows the placement occupies, so a cached string is only
+/// valid for the geometry it was built with. Keying the cache on width alone
+/// kept a stale geometry after the terminal's cell size changed (font zoom, a
+/// move to a monitor with another DPI) and made old images disagree with new
+/// ones in the same frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderKey {
+    width: usize,
+    cell_width: u16,
+    cell_height: u16,
+    protocol: ImageProtocol,
+}
+
 /// Image component.
 pub struct Image {
     data: Mutex<Option<Vec<u8>>>,
@@ -67,7 +83,7 @@ pub struct Image {
     options: ImageOptions,
     theme: ImageTheme,
     image_id: Mutex<Option<u32>>,
-    cached_render: Mutex<Option<(usize, String)>>,
+    cached_render: Mutex<Option<(RenderKey, String)>>,
     inline_visible: Mutex<bool>,
 }
 
@@ -179,11 +195,21 @@ impl Image {
             return crate::utils::truncate_to_width("[Image]", width, "");
         }
         let caps = get_capabilities();
+        let cell_dims = CellDimensions {
+            width: caps.cell_width,
+            height: caps.cell_height,
+        };
+        let key = RenderKey {
+            width,
+            cell_width: cell_dims.width,
+            cell_height: cell_dims.height,
+            protocol: caps.protocol,
+        };
 
-        // Check if we have cached render
+        // Check if we have cached render for this width *and* this geometry.
         if let Ok(cached) = self.cached_render.lock() {
-            if let Some((cached_width, rendered)) = cached.as_ref() {
-                if *cached_width == width {
+            if let Some((cached_key, rendered)) = cached.as_ref() {
+                if *cached_key == key {
                     return rendered.clone();
                 }
             }
@@ -193,7 +219,6 @@ impl Image {
         let dimensions = self.get_dimensions();
         let (img_width, img_height) = if let Some((w, h)) = dimensions {
             // Calculate cell dimensions
-            let cell_dims = super::terminal_image::get_cell_dimensions();
             let cell_width = self
                 .options
                 .width
@@ -289,9 +314,9 @@ impl Image {
             self.render_placeholder(img_width as usize, img_height as usize, width)
         };
 
-        // Cache the result
+        // Cache the result against the geometry it was computed for.
         if let Ok(mut cached) = self.cached_render.lock() {
-            *cached = Some((width, result.clone()));
+            *cached = Some((key, result.clone()));
         }
 
         result

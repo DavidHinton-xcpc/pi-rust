@@ -176,10 +176,15 @@ pub fn query_cell_dimensions(
 
 /// Refresh the cached cell size after a resize.
 ///
-/// Callers that learn about a resize (`Event::Resize`, or the renderer's own
-/// size check) call this so image sizing follows the new cell geometry. It is a
-/// no-op on terminals that do not report pixel sizes, leaving the previously
-/// cached (or default) values in place.
+/// Callers that learn about a resize (`Event::Resize`, the renderer's own size
+/// check, or the size watchdog) call this so image sizing follows the new cell
+/// geometry. It is a no-op on terminals that do not report pixel sizes, leaving
+/// the previously cached (or default) values in place.
+///
+/// A character grid can stay the same while the pixel size of a cell changes
+/// (font zoom, moving the window to a monitor with another DPI), so callers
+/// cannot infer a geometry change from columns and rows: they compare
+/// [`get_cell_dimensions`] against what they last painted.
 pub fn refresh_cell_dimensions() {
     if let Some(cell) = query_cell_dimensions(
         crossterm::terminal::window_size().ok(),
