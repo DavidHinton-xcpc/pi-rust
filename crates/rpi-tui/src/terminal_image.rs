@@ -255,6 +255,42 @@ pub fn get_cell_dimensions() -> CellDimensions {
     }
 }
 
+thread_local! {
+    /// The cell geometry the renderer that is painting the current frame polled
+    /// from its own terminal.
+    ///
+    /// A renderer polls the pixel size per frame and lays the frame out for it;
+    /// components inside the frame (`Image`, `ScrollView`'s cached documents)
+    /// derive image rows from the same geometry, so they must read the renderer's
+    /// polled value rather than a process-wide cache another terminal or test can
+    /// move mid-frame. The renderer sets this for the duration of a layout pass;
+    /// outside one, the process-wide cache (last refreshed by
+    /// [`refresh_cell_dimensions`]) still answers.
+    static FRAME_CELL_GEOMETRY: std::cell::Cell<Option<CellDimensions>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with components reading `geometry` for their cell size.
+///
+/// The renderer wraps its layout pass in this so image sizing follows the
+/// geometry the renderer itself polled, on the thread doing the layout.
+pub(crate) fn with_frame_cell_geometry<T>(geometry: CellDimensions, f: impl FnOnce() -> T) -> T {
+    let previous = FRAME_CELL_GEOMETRY.with(|slot| slot.replace(Some(geometry)));
+    let result = f();
+    FRAME_CELL_GEOMETRY.with(|slot| slot.set(previous));
+    result
+}
+
+/// The cell size components should size images with right now.
+///
+/// The frame-scoped geometry wins because it is what the frame being painted
+/// was polled for; the process-wide cache is the fallback outside a frame.
+pub(crate) fn effective_cell_dimensions() -> CellDimensions {
+    FRAME_CELL_GEOMETRY
+        .with(|slot| slot.get())
+        .unwrap_or_else(get_cell_dimensions)
+}
+
 /// Allocate a unique image ID.
 pub fn allocate_image_id() -> u32 {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);

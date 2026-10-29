@@ -217,10 +217,9 @@ impl Image {
             return crate::utils::truncate_to_width("[Image]", width, "");
         }
         let caps = get_capabilities();
-        let cell_dims = CellDimensions {
-            width: caps.cell_width,
-            height: caps.cell_height,
-        };
+        // The frame being painted was laid out for the geometry its renderer
+        // polled; the process-wide cache is only the fallback outside a frame.
+        let cell_dims = crate::terminal_image::effective_cell_dimensions();
         let key = RenderKey {
             width,
             cell_width: cell_dims.width,

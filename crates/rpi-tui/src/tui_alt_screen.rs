@@ -870,7 +870,10 @@ impl TuiAltScreen {
         let root: Arc<dyn Component> = self
             .get_layout_root()
             .unwrap_or_else(|| Arc::new(self.container.clone()));
-        let raw_lines = root.render(width);
+        // Components inside the frame read the geometry this renderer polled
+        // (frame-scoped), not the process-wide cache.
+        let raw_lines =
+            crate::terminal_image::with_frame_cell_geometry(cells, || root.render(width));
         let cursor = raw_lines.iter().enumerate().rev().find_map(|(row, line)| {
             line.find(CURSOR_MARKER)
                 .map(|idx| (row, visible_width(&line[..idx])))
@@ -1152,11 +1155,16 @@ impl TuiAltScreen {
             self.selection.clear();
         }
 
-        // Render layout frame
+        // Render layout frame. Components inside the frame read the geometry
+        // this renderer polled (frame-scoped), not the process-wide cache.
         let frame = if reuse_scroll_content {
-            render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
+            crate::terminal_image::with_frame_cell_geometry(cells, || {
+                render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
+            })
         } else {
-            render_layout_frame(root_component.clone(), width, height)
+            crate::terminal_image::with_frame_cell_geometry(cells, || {
+                render_layout_frame(root_component.clone(), width, height)
+            })
         };
 
         // Get screen lines and composite modal overlays above the layout.
