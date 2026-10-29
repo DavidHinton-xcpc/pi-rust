@@ -601,13 +601,20 @@ fn paint_scrolled_placement(lbox: &LayoutBox, screen: &mut [String], total_width
         return;
     }
     // An ancestor clip may hide the first rows of the viewport; the placement
-    // has to skip those as well.
+    // has to skip those as well. `paint_box` starts at `clip_offset` rows into
+    // the viewport slice, so the first *visible* document row is
+    // `scroll_top + line_offset + clip_offset` — a placement anchored between
+    // `scroll_top` and that boundary still has rows on screen even though the
+    // paint loop never saw its escape.
     let clip_offset = top.saturating_sub(lbox.rect.y);
+    let visible_source_top = scroll_top
+        .saturating_add(lbox.line_offset)
+        .saturating_add(clip_offset);
     // Rows above the viewport can only reach into it if they belong to a
     // placement no taller than the tallest one registered, so the search is
     // bounded instead of scanning the whole history.
-    let min_row = scroll_top.saturating_sub(max_kitty_image_rows());
-    for image_row in (min_row..scroll_top).rev() {
+    let min_row = visible_source_top.saturating_sub(max_kitty_image_rows());
+    for image_row in (min_row..visible_source_top).rev() {
         let Some(line) = document.line(image_row) else {
             continue;
         };
@@ -617,7 +624,7 @@ fn paint_scrolled_placement(lbox: &LayoutBox, screen: &mut [String], total_width
         let Some(metadata) = kitty_image_metadata(line) else {
             continue;
         };
-        let hidden = (scroll_top - image_row + clip_offset).min(usize::from(u16::MAX)) as u16;
+        let hidden = (visible_source_top - image_row).min(usize::from(u16::MAX)) as u16;
         if hidden >= metadata.rows {
             continue;
         }
@@ -1066,6 +1073,78 @@ mod scroll_layout_tests {
             renders.load(Ordering::SeqCst),
             3,
             "a width change must invalidate wrapped transcript lines",
+        );
+    }
+
+    /// A ScrollView can sit inside a box whose clip starts below its top edge.
+    /// The paint loop then skips the rows above the clip — including the row
+    /// that carries a placement's escape — so the placement has to be
+    /// re-anchored from the first *visible* source row, not from `scroll_top`.
+    #[test]
+    fn a_placement_above_an_ancestor_clip_is_reanchored_to_the_first_visible_row() {
+        const ID: u32 = 9_903;
+        crate::terminal_image::register_kitty_image(crate::terminal_image::KittyImageMetadata {
+            id: ID,
+            columns: 20,
+            rows: 8,
+            width_px: 400,
+            height_px: 800,
+        });
+
+        // The image is anchored on document row 5 and covers rows 5..13.
+        let mut rows: Vec<String> = (0..30).map(|row| format!("row {row}")).collect();
+        rows[5] = format!("\x1b_Ga=T,f=100,C=1,q=2,i={ID},p=1,c=20,r=8,m=0;AAAA\x1b\\");
+        for row in &mut rows[6..13] {
+            row.clear();
+        }
+
+        struct FixedRows(Vec<String>);
+        impl Component for FixedRows {
+            fn render(&self, _width: usize) -> Vec<String> {
+                self.0.clone()
+            }
+            fn invalidate(&self) {}
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let scroll = Arc::new(ScrollView::new(
+            Arc::new(FixedRows(rows)),
+            ScrollViewOptions {
+                follow: crate::FollowMode::None,
+                ..Default::default()
+            },
+        ));
+        // Two passes: the first sizes the document, the second renders the
+        // viewport at the scroll position the test wants.
+        let _ = scroll.render_with_viewport(40, 10);
+        scroll.scroll_to(5);
+        let viewport = scroll.render_with_viewport(40, 10);
+
+        // The box starts at row 0 but an ancestor clips it to rows 3..10, so
+        // rows 0..3 of the viewport (document rows 5..8) are never painted.
+        let mut lbox = LayoutBox::new(
+            Arc::new(Text::new("", 0, 0)),
+            LayoutRect::new(0, 0, 40, 10),
+            LayoutRect::new(0, 3, 40, 7),
+        );
+        lbox.lines = Some(viewport);
+        lbox.scroll_view = Some(scroll.clone());
+        lbox.scroll_document = scroll.rendered_document();
+
+        let mut screen = vec![String::new(); 10];
+        paint_box(&lbox, &mut screen, 40);
+
+        assert!(
+            screen[3].contains(",y=300,h=500,r=5;"),
+            "the placement must resume at the first visible row with the rows \
+             hidden by the ancestor clip cropped away, got {:?}",
+            screen[3]
+        );
+        assert!(
+            screen[4..].iter().all(|row| !row.contains("\x1b_G")),
+            "the placement must be emitted once, on the row it is anchored to"
         );
     }
 }

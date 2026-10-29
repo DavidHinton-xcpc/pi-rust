@@ -2,6 +2,7 @@
 //!
 //! Provides support for displaying images in terminals using Kitty and iTerm2 protocols.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Image protocol type.
@@ -175,6 +176,14 @@ pub fn allocate_image_id() -> u32 {
     COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Placement id used for every image this client displays.
+///
+/// A placement is identified by the `(i=, p=)` pair, so one constant id is
+/// enough: re-placing the same image at a new cell replaces its placement,
+/// which the protocol defines as the way to move an image "without flicker".
+/// Without a placement id every `a=p` would create an additional placement.
+const KITTY_PLACEMENT_ID: u32 = 1;
+
 /// Encode image data for Kitty protocol.
 pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -186,7 +195,7 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
     control.push_str("a=T,f=100,C=1,q=2"); // PNG; keep cursor fixed, suppress responses
 
     if let Some(id) = options.id {
-        control.push_str(&format!(",i={}", id));
+        control.push_str(&format!(",i={id},p={KITTY_PLACEMENT_ID}"));
     }
 
     if let Some(z) = options.z_index {
@@ -261,9 +270,27 @@ pub fn delete_all_kitty_images() -> String {
     "\x1b_Ga=d,d=A\x1b\\".to_string()
 }
 
-/// Delete placements whose retained line changed or disappeared. Other images
-/// remain in place, so ordinary streaming text does not retransmit them.
+/// Delete this client's placement of a Kitty image, keeping its pixel data.
+///
+/// Lowercase `d=i` only drops the placement, and the `p=` key scopes it to the
+/// `(image id, placement id)` pair this client creates. The stored data stays
+/// available, so the same id can be placed again without re-transmitting it.
+pub fn delete_kitty_placement(id: u32) -> String {
+    format!("\x1b_Ga=d,d=i,i={id},p={KITTY_PLACEMENT_ID}\x1b\\")
+}
+
+/// Delete the placements whose retained line changed or disappeared.
+///
+/// Only the placement is deleted, never the image data: a row that is rewritten
+/// to a placement-only `a=p` needs the payload to still be in the terminal.
+/// An image that is still on screen in the new frame is not deleted at all —
+/// re-placing it with the same `(i=, p=)` pair moves its placement, and the
+/// terminal replaces the old one instead of leaving a stale copy behind.
 pub(crate) fn removed_kitty_placements(previous: &[String], current: &[String]) -> String {
+    let live: Vec<u32> = current
+        .iter()
+        .filter_map(|line| kitty_transmission_id(line))
+        .collect();
     let mut output = String::new();
     for (row, line) in previous.iter().enumerate() {
         if current.get(row) == Some(line) {
@@ -278,7 +305,10 @@ pub(crate) fn removed_kitty_placements(previous: &[String], current: &[String]) 
                 .split(',')
                 .find_map(|field| field.strip_prefix("i=")?.parse::<u32>().ok())
             {
-                output.push_str(&delete_kitty_image(id));
+                if live.contains(&id) {
+                    continue;
+                }
+                output.push_str(&delete_kitty_placement(id));
             }
         }
     }
@@ -309,13 +339,21 @@ pub struct KittyImageMetadata {
     pub height_px: u32,
 }
 
-/// Upper bound on tracked placements: transcripts can hold many screenshots,
-/// and only the ones near the viewport are ever looked up.
-const MAX_TRACKED_KITTY_IMAGES: usize = 512;
+/// Registered placements, keyed by image id.
+///
+/// Image ids are unique for the whole process (`allocate_image_id`) and a
+/// placement's geometry never changes once rendered, so an entry stays valid
+/// for as long as any rendered document can retain its row. The map is
+/// deliberately not evicted: dropping an entry would silently disable both the
+/// bottom crop and the top re-anchor for an image the user scrolls back to,
+/// and an entry is a handful of words. A long session that shows thousands of
+/// images pays a few hundred kilobytes, not the correctness of its transcript.
+static KITTY_IMAGES: std::sync::OnceLock<Mutex<HashMap<u32, KittyImageMetadata>>> =
+    std::sync::OnceLock::new();
 
-/// Registered placements, oldest first. Small enough for a linear scan: a frame
-/// looks up at most a handful of image lines.
-static KITTY_IMAGES: Mutex<Vec<KittyImageMetadata>> = Mutex::new(Vec::new());
+fn kitty_images() -> &'static Mutex<HashMap<u32, KittyImageMetadata>> {
+    KITTY_IMAGES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Tallest registered placement, used to bound the backwards search for an
 /// image row above the viewport.
@@ -330,14 +368,10 @@ pub fn register_kitty_image(metadata: KittyImageMetadata) {
         return;
     }
     MAX_KITTY_IMAGE_ROWS.fetch_max(metadata.rows, std::sync::atomic::Ordering::Relaxed);
-    let Ok(mut images) = KITTY_IMAGES.lock() else {
+    let Ok(mut images) = kitty_images().lock() else {
         return;
     };
-    images.retain(|known| known.id != metadata.id);
-    images.push(metadata);
-    if images.len() > MAX_TRACKED_KITTY_IMAGES {
-        images.remove(0);
-    }
+    images.insert(metadata.id, metadata);
 }
 
 /// Tallest placement registered so far, in cells.
@@ -363,13 +397,7 @@ pub fn kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
     let id = control
         .split(',')
         .find_map(|field| field.strip_prefix("i=")?.parse::<u32>().ok())?;
-    KITTY_IMAGES
-        .lock()
-        .ok()?
-        .iter()
-        .rev()
-        .find(|known| known.id == id)
-        .copied()
+    kitty_images().lock().ok()?.get(&id).copied()
 }
 
 /// Source rectangle (in pixels) covering `visible` of a placement's `rows`,
@@ -431,45 +459,60 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: u16, visible_rows: u16) ->
     )
 }
 
-/// Images whose pixel data is already in the terminal, most recent last.
+/// Per-terminal record of the image payloads the terminal is known to hold.
 ///
-/// A placement cannot be moved, so every frame that repaints an image row has
-/// to re-emit the placement. Re-sending the payload (hundreds of kilobytes for
-/// a screenshot) on every scroll step is what makes scrolling crawl, so the
-/// row is rewritten to a placement-only `a=p` command once the data is in the
-/// terminal. The data survives `a=d,d=i` (lowercase keeps it for re-display)
-/// but not a screen clear, which is why the alt screen drops this set whenever
-/// it emits `\x1b[2J`.
-static UPLOADED_KITTY_IMAGES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-/// Upper bound on remembered uploads; the terminal evicts image data under its
-/// own quota, and a re-upload is always correct, so the set is only a hint.
-const MAX_UPLOADED_KITTY_IMAGES: usize = 64;
-
-/// Whether this process already transmitted the image's pixel data.
-pub fn kitty_image_uploaded(id: u32) -> bool {
-    UPLOADED_KITTY_IMAGES
-        .lock()
-        .map(|images| images.contains(&id))
-        .unwrap_or(false)
+/// A placement cannot be moved without re-emitting it, so every frame that
+/// repaints an image row has to re-emit the placement. Re-sending the payload
+/// (hundreds of kilobytes for a screenshot) on every scroll step is what makes
+/// scrolling crawl, so a row whose data is already in the terminal is rewritten
+/// to a placement-only `a=p` command.
+///
+/// The terminal's image store belongs to one terminal connection, so this state
+/// lives on the screen that owns that terminal, never in a process global. It
+/// is a hint that may only ever err towards re-sending:
+///
+/// * an id is trusted only while the image was on screen in the *previous*
+///   frame — an image that scrolled away is uploaded again when it comes back,
+///   so a terminal that dropped the data meanwhile cannot show a blank;
+/// * every event that can drop the store (`\x1b[2J`, a resize, entering the
+///   alternate screen) calls [`KittyUploads::invalidate`];
+/// * forgetting an id costs one payload, claiming one the terminal no longer
+///   has would cost the image.
+#[derive(Debug, Default)]
+pub struct KittyUploads {
+    /// Ids painted in the previous frame.
+    painted: Vec<u32>,
+    /// Ids painted in the frame being built.
+    next: Vec<u32>,
 }
 
-/// Record that the image's pixel data is in the terminal.
-pub fn mark_kitty_image_uploaded(id: u32) {
-    let Ok(mut images) = UPLOADED_KITTY_IMAGES.lock() else {
-        return;
-    };
-    images.retain(|known| *known != id);
-    images.push(id);
-    if images.len() > MAX_UPLOADED_KITTY_IMAGES {
-        images.remove(0);
+impl KittyUploads {
+    pub fn new() -> Self {
+        Self::default()
     }
-}
 
-/// Forget every upload, e.g. after `\x1b[2J` cleared the screen's images.
-pub fn clear_uploaded_kitty_images() {
-    if let Ok(mut images) = UPLOADED_KITTY_IMAGES.lock() {
-        images.clear();
+    /// Whether the terminal is known to hold this image's pixel data.
+    pub fn is_uploaded(&self, id: u32) -> bool {
+        self.painted.contains(&id)
+    }
+
+    /// Record that the image is on screen in the frame being built.
+    pub fn note_painted(&mut self, id: u32) {
+        if !self.next.contains(&id) {
+            self.next.push(id);
+        }
+    }
+
+    /// Close the frame: what was painted becomes what is trusted next time.
+    pub fn end_frame(&mut self) {
+        std::mem::swap(&mut self.painted, &mut self.next);
+        self.next.clear();
+    }
+
+    /// Forget every upload, e.g. after `\x1b[2J` cleared the screen's images.
+    pub fn invalidate(&mut self) {
+        self.painted.clear();
+        self.next.clear();
     }
 }
 
@@ -491,9 +534,9 @@ const KITTY_PLACEMENT_KEYS: [&str; 16] = [
 
 /// Rewrite a transmitted image row into a placement-only command.
 ///
-/// Returns `None` when the row carries no Kitty transmission or its data has
-/// not been sent yet, in which case the row has to be written as is.
-pub fn kitty_placement_line(line: &str) -> Option<String> {
+/// Returns `None` when the row carries no Kitty transmission or the terminal is
+/// not known to hold its data, in which case the row has to be written as is.
+pub fn kitty_placement_line(line: &str, uploads: &KittyUploads) -> Option<String> {
     let escape = line.find("\x1b_G")?;
     let control_start = escape + 3;
     let control_end = control_start + line[control_start..].find(';')?;
@@ -505,7 +548,7 @@ pub fn kitty_placement_line(line: &str) -> Option<String> {
     let id = fields
         .iter()
         .find_map(|field| field.strip_prefix("i=")?.parse::<u32>().ok())?;
-    if !kitty_image_uploaded(id) {
+    if !uploads.is_uploaded(id) {
         return None;
     }
 
@@ -785,7 +828,7 @@ mod tests {
         assert!(removed_kitty_placements(&[sequence.clone()], &[sequence.clone()]).is_empty());
         assert_eq!(
             removed_kitty_placements(&[sequence], &["[Image]".into()]),
-            delete_kitty_image(42)
+            delete_kitty_placement(42)
         );
     }
 
@@ -993,20 +1036,24 @@ mod tests {
                 },
             )
         );
+        let mut uploads = KittyUploads::new();
 
         // Nothing sent yet: the row has to carry its payload.
-        assert_eq!(kitty_placement_line(&transmitted), None);
+        assert_eq!(kitty_placement_line(&transmitted, &uploads), None);
         assert_eq!(kitty_transmission_id(&transmitted), Some(9_002));
 
-        mark_kitty_image_uploaded(9_002);
-        let placed = kitty_placement_line(&transmitted).expect("placement-only row");
+        // The frame that transmits the payload is the frame that paints it; the
+        // next frame may move the placement by id alone.
+        uploads.note_painted(9_002);
+        uploads.end_frame();
+        let placed = kitty_placement_line(&transmitted, &uploads).expect("placement-only row");
         assert!(
             placed.starts_with("  \x1b_Ga=p,q=2,"),
             "the row must be rewritten in place, got {:?}",
             &placed[..placed.len().min(80)]
         );
         assert!(
-            placed.contains(",i=9002,c=40,r=8"),
+            placed.contains(",i=9002,p=1,c=40,r=8"),
             "the placement keeps the image geometry, got {placed:?}"
         );
         assert!(
@@ -1022,15 +1069,161 @@ mod tests {
 
         // A cropped row keeps its source rectangle.
         let cropped = crop_kitty_image_line(&transmitted, 2, 4);
-        let placed = kitty_placement_line(&cropped).expect("placement-only crop");
+        let placed = kitty_placement_line(&cropped, &uploads).expect("placement-only crop");
         assert!(
             placed.contains(",y=40,h=80,r=4"),
             "the crop must survive the rewrite, got {placed:?}"
         );
 
         // After a screen clear the payload has to be sent again.
-        clear_uploaded_kitty_images();
-        assert_eq!(kitty_placement_line(&transmitted), None);
+        uploads.invalidate();
+        assert_eq!(kitty_placement_line(&transmitted, &uploads), None);
+    }
+
+    /// The sequence a scroll step produces: the old row is repainted, the new
+    /// row carries the same image. Deleting the placement here would also drop
+    /// the payload the placement-only rewrite depends on, so the move must not
+    /// delete anything — the `(i=, p=)` pair replaces the placement in place.
+    #[test]
+    fn moving_an_image_does_not_delete_the_payload_it_re_places() {
+        register_kitty_image(KittyImageMetadata {
+            id: 9_003,
+            columns: 40,
+            rows: 8,
+            width_px: 400,
+            height_px: 800,
+        });
+        let mut payload = vec![0x89, b'P', b'N', b'G'];
+        payload.resize(44_181, 0);
+        let transmitted = format!(
+            "  {}",
+            encode_kitty(
+                &payload,
+                &ImageRenderOptions {
+                    id: Some(9_003),
+                    width: Some(40),
+                    height: Some(8),
+                    ..Default::default()
+                },
+            )
+        );
+        let mut uploads = KittyUploads::new();
+        uploads.note_painted(9_003);
+        uploads.end_frame();
+
+        // Frame N: the image is anchored on row 4 of the viewport.
+        let mut previous: Vec<String> = (0..6).map(|row| format!("row {row}")).collect();
+        previous[4] = transmitted.clone();
+        // Frame N+1: it scrolled up one row.
+        let mut current: Vec<String> = (0..6).map(|row| format!("row {row}")).collect();
+        current[3] = transmitted.clone();
+
+        let deletes = removed_kitty_placements(&previous, &current);
+        assert!(
+            deletes.is_empty(),
+            "an image that is still on screen is moved, not deleted: {deletes:?}"
+        );
+
+        let moved = kitty_placement_line(&current[3], &uploads).expect("placement-only move");
+        assert!(moved.contains("\x1b_Ga=p,"), "got {moved:?}");
+        assert!(
+            moved.contains("i=9003,p=1"),
+            "the move must reuse the placement id, got {moved:?}"
+        );
+        assert!(
+            !moved.contains("iVBOR"),
+            "the move must not re-send the payload, got {} bytes",
+            moved.len()
+        );
+    }
+
+    /// An image that leaves the screen is deleted by placement only: the stored
+    /// data has to survive for a later re-place of the same id.
+    #[test]
+    fn a_placement_that_leaves_the_screen_is_deleted_without_freeing_its_data() {
+        let transmitted = encode_kitty(
+            b"png",
+            &ImageRenderOptions {
+                id: Some(9_004),
+                width: Some(20),
+                height: Some(4),
+                ..Default::default()
+            },
+        );
+        let previous = vec!["row 0".to_string(), transmitted, "row 2".to_string()];
+        let current = vec![
+            "row 0".to_string(),
+            "row 1".to_string(),
+            "row 2".to_string(),
+        ];
+
+        let deletes = removed_kitty_placements(&previous, &current);
+        assert_eq!(deletes, delete_kitty_placement(9_004));
+        assert!(
+            !deletes.contains("d=I"),
+            "the uppercase form frees the data and would blank a later re-place: {deletes:?}"
+        );
+        assert!(
+            deletes.contains("i=9004,p=1"),
+            "only this client's placement may be deleted: {deletes:?}"
+        );
+    }
+
+    #[test]
+    fn upload_state_follows_the_frame_and_the_terminal() {
+        let mut uploads = KittyUploads::new();
+        assert!(!uploads.is_uploaded(7));
+        uploads.note_painted(7);
+        assert!(
+            !uploads.is_uploaded(7),
+            "the frame that transmits the payload must still write it"
+        );
+        uploads.end_frame();
+        assert!(uploads.is_uploaded(7));
+
+        // A frame that does not paint the image forgets it: when it comes back
+        // the payload is re-sent instead of trusting a store nobody watched.
+        uploads.end_frame();
+        assert!(!uploads.is_uploaded(7));
+        uploads.note_painted(7);
+        uploads.end_frame();
+        assert!(uploads.is_uploaded(7));
+
+        uploads.invalidate();
+        assert!(!uploads.is_uploaded(7), "a screen clear drops every image");
+    }
+
+    /// Placement geometry must stay resolvable for as long as a document can
+    /// retain the row: scrolling back to an old image has to keep its crop.
+    #[test]
+    fn placement_metadata_outlives_a_long_transcript() {
+        for id in 20_000..20_600 {
+            register_kitty_image(KittyImageMetadata {
+                id,
+                columns: 10,
+                rows: 8,
+                width_px: 100,
+                height_px: 80,
+            });
+        }
+        let line = encode_kitty(
+            b"png",
+            &ImageRenderOptions {
+                id: Some(20_000),
+                width: Some(10),
+                height: Some(8),
+                ..Default::default()
+            },
+        );
+        assert!(
+            kitty_image_metadata(&line).is_some(),
+            "the oldest placement must stay resolvable"
+        );
+        let cropped = crop_kitty_image_line(&line, 2, 4);
+        assert!(
+            cropped.contains(",y=20,h=40,r=4;"),
+            "expected the crop of the oldest image, got {cropped:?}"
+        );
     }
 
     #[test]
