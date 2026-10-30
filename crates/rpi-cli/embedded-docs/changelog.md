@@ -11,6 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (RPC wire format):** `--mode rpc` now defaults to `compact-deltas`. Text, thinking, and tool-call delta updates omit the cumulative `message` and `assistantMessageEvent.partial` snapshots while retaining nested delta fields and the top-level `eventType`, `contentIndex`, and `delta` mirrors. `ready.semantics.messageUpdates` identifies the selected mode; a missing field means legacy `snapshot`. Upgrade remote clients and protocol adapters before deploying the new host. `--rpc-message-updates=snapshot` is an explicit, temporary migration fallback, not the long-term default. Structural events, authoritative final messages, settlement and canonical branch-query contracts, plugin serialization, and `--mode json` are unchanged. This is not a fully snapshot-free or lossless replay protocol. ([#171](https://github.com/bigfish1913/pi-rust/issues/171))
+
+### Fixed
+
+- Remote TUI streaming now accumulates indexed compact text, thinking, and tool-argument updates and reconciles structural/final snapshots without appending deltas twice; older snapshot senders remain supported. Compact tool deltas include the provider's currently known `id`/`toolName` so identity discovered after start is not lost.
+- OpenAI Responses function-call deltas include any initial raw argument prefix exactly once on their first delta, matching the existing custom-tool behavior. This provider correctness fix applies to all event consumers; final message and snapshot contents are unchanged.
+- OpenAI Completions and Responses flush batched text/thinking before crossing channel/structural boundaries, preventing a snapshot from exposing content whose later compact delta would append it again. Real-provider offline SSE regressions compare both wire modes at every UI update.
+
 ## [0.14.0](https://github.com/bigfish1913/pi-rust/compare/v0.13.0...v0.14.0) - 2026-10-30
 
 ### Added

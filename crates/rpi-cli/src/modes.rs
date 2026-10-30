@@ -312,6 +312,7 @@ pub async fn rpc(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    message_updates: crate::args::RpcMessageUpdates,
 ) -> i32 {
     rpc_with_io(
         harness,
@@ -319,6 +320,7 @@ pub async fn rpc(
         model_catalog,
         ui_dialog,
         oauth_snapshot,
+        message_updates,
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -331,6 +333,7 @@ async fn rpc_with_io<R, W>(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    message_updates: crate::args::RpcMessageUpdates,
     input: R,
     output: W,
 ) -> i32
@@ -342,7 +345,7 @@ where
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // One blocking writer owns stdout. Producers only enqueue bounded messages,
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
-    let (stdout, writer_task, writer_failed) = start_rpc_writer(output);
+    let (stdout, writer_task, writer_failed) = start_rpc_writer(output, message_updates);
     let pump_stop = tokio_util::sync::CancellationToken::new();
 
     // Publish generic commit metadata after successful Session appends. The
@@ -461,7 +464,7 @@ where
     use tokio::io::AsyncBufReadExt;
 
     let mut lines = input.lines();
-    write_line(&stdout, &rpc_protocol::ready()).await;
+    write_line(&stdout, &rpc_protocol::ready(message_updates)).await;
 
     loop {
         let incoming = tokio::select! {
@@ -2326,6 +2329,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone(),
             )
@@ -2560,6 +2564,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone(),
             )
@@ -2612,6 +2617,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 Some(Arc::new(registry.snapshot())),
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone()
             )
@@ -2772,6 +2778,7 @@ mod tests {
                 vec![],
                 ui,
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input),
                 captured,
             )
@@ -2887,6 +2894,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(input.as_bytes()),
             output.clone(),
         )
@@ -2916,6 +2924,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&input[..]),
             output.clone(),
         )
@@ -2946,6 +2955,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&b"{\"type\":\"compact\",\"id\":1}\n"[..]),
             output.clone(),
         )
@@ -2985,6 +2995,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&b""[..]),
             output.clone(),
         )
@@ -2997,6 +3008,215 @@ mod tests {
             "ready plus every queued event must be flushed"
         );
         assert_eq!(messages.last().unwrap()["type"], "agent_end");
+    }
+
+    fn assert_rpc_update_mode(
+        messages: &[serde_json::Value],
+        mode: crate::args::RpcMessageUpdates,
+    ) {
+        let updates: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m["eventType"].as_str(),
+                    Some("text_delta" | "thinking_delta" | "toolcall_delta")
+                )
+            })
+            .collect();
+        assert!(
+            !updates.is_empty(),
+            "expected streaming deltas: {messages:?}"
+        );
+        for update in updates {
+            let snapshot = mode == crate::args::RpcMessageUpdates::Snapshot;
+            assert_eq!(update.get("message").is_some(), snapshot, "{update}");
+            assert_eq!(
+                update["assistantMessageEvent"].get("partial").is_some(),
+                snapshot,
+                "{update}"
+            );
+            assert_eq!(update["eventType"], update["assistantMessageEvent"]["type"]);
+            assert_eq!(
+                update["contentIndex"],
+                update["assistantMessageEvent"]["contentIndex"]
+            );
+            assert_eq!(update["delta"], update["assistantMessageEvent"]["delta"]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_selected_updates_survive_prompt_eof_and_stop() {
+        use tokio::io::AsyncWriteExt;
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            for stop in [false, true] {
+                let (harness, _) =
+                    rpc_test_harness("one two three four five six seven eight", 100.0).await;
+                let (emitter, events) = rpi_agent::events::BroadcastEmitter::new(256);
+                harness
+                    .set_agent_emitter(Some(Arc::new(emitter)))
+                    .await
+                    .unwrap();
+                let (mut client, input) = tokio::io::duplex(4096);
+                let output = RpcOutput::default();
+                let captured = output.clone();
+                let task = tokio::spawn(async move {
+                    rpc_with_io(
+                        &harness,
+                        Some(events),
+                        vec![],
+                        rpi_extensions::UiDialogMailbox::new(),
+                        None,
+                        mode,
+                        tokio::io::BufReader::new(input),
+                        captured,
+                    )
+                    .await
+                });
+                let ready = output.wait_for(|m| m["type"] == "ready").await;
+                assert_eq!(ready["semantics"]["messageUpdates"], mode.as_str());
+                client
+                    .write_all(b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n")
+                    .await
+                    .unwrap();
+                if stop {
+                    output.wait_for(|m| m["eventType"] == "text_delta").await;
+                    client
+                        .write_all(b"{\"type\":\"stop\",\"id\":2}\n")
+                        .await
+                        .unwrap();
+                } else {
+                    client.shutdown().await.unwrap();
+                }
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                let messages = output.messages();
+                assert_rpc_update_mode(&messages, mode);
+                assert!(messages.iter().any(|m| m["type"] == "message_end"));
+                assert!(messages.iter().any(|m| m["type"] == "agent_end"));
+                assert!(messages.iter().any(|m| m["type"] == "agent_settled"));
+                if !stop {
+                    assert!(messages
+                        .iter()
+                        .any(|m| m["type"] == "agent_settled" && m["outcome"] == "completed"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_normal_and_explicit_drain_use_the_same_immutable_writer_mode() {
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            let output = RpcOutput::default();
+            let (writer, task, _) = start_rpc_writer(output.clone(), mode);
+            let cloned_writer = writer.clone();
+            let mut message = rpi_ai::AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "m", 42);
+            message.content = vec![rpi_ai::Content::text("snapshot")];
+            let message = Arc::new(message);
+            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+            for kind in 0..3 {
+                let assistant_message_event = match kind {
+                    0 => rpi_ai::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "text".into(),
+                        partial: message.clone(),
+                    },
+                    1 => rpi_ai::AssistantMessageEvent::ThinkingDelta {
+                        content_index: 1,
+                        delta: "thought".into(),
+                        partial: message.clone(),
+                    },
+                    _ => rpi_ai::AssistantMessageEvent::ToolCallDelta {
+                        content_index: 2,
+                        delta: "{}".into(),
+                        partial: message.clone(),
+                    },
+                };
+                let event = AgentEvent::MessageUpdate {
+                    message: message.clone(),
+                    assistant_message_event,
+                };
+                write_agent_event(&writer, &event).await;
+                tx.send(event).unwrap();
+            }
+            drain_rpc_events(&cloned_writer, &mut rx).await;
+            drop(cloned_writer);
+            drop(writer);
+            task.await.unwrap().unwrap();
+            let messages = output.messages();
+            assert_eq!(messages.len(), 6);
+            assert_eq!(messages[..3], messages[3..]);
+            assert_rpc_update_mode(&messages, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_queued_deltas_are_flushed_on_eof_and_stop_in_selected_mode() {
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            for input in ["", "{\"type\":\"stop\",\"id\":1}\n"] {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let (tx, rx) = tokio::sync::broadcast::channel(256);
+                let mut message =
+                    rpi_ai::AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "m", 42);
+                message.content = vec![rpi_ai::Content::text("snapshot")];
+                let message = Arc::new(message);
+                for _ in 0..100 {
+                    tx.send(AgentEvent::MessageUpdate {
+                        message: message.clone(),
+                        assistant_message_event: rpi_ai::AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: "x".into(),
+                            partial: message.clone(),
+                        },
+                    })
+                    .unwrap();
+                }
+                tx.send(AgentEvent::AgentEnd { messages: vec![] }).unwrap();
+                let output = RpcOutput::default();
+                assert_eq!(
+                    rpc_with_io(
+                        &harness,
+                        Some(rx),
+                        vec![],
+                        rpi_extensions::UiDialogMailbox::new(),
+                        None,
+                        mode,
+                        tokio::io::BufReader::new(input.as_bytes()),
+                        output.clone()
+                    )
+                    .await,
+                    0
+                );
+                let messages = output.messages();
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|m| m["eventType"] == "text_delta")
+                        .count(),
+                    100
+                );
+                assert_eq!(
+                    messages.iter().find(|m| m["type"] == "ready").unwrap()["semantics"]
+                        ["messageUpdates"],
+                    mode.as_str()
+                );
+                assert_rpc_update_mode(&messages, mode);
+                assert!(messages.iter().any(|m| m["type"] == "agent_end"));
+            }
+        }
     }
 
     struct BackpressuredOutput {
@@ -3032,11 +3252,14 @@ mod tests {
         let _release = ReleaseOnDrop(release.clone());
         let entered = Arc::new(AtomicBool::new(false));
         let output = RpcOutput::default();
-        let (writer, task, _) = start_rpc_writer(BackpressuredOutput {
-            entered: entered.clone(),
-            release: release.clone(),
-            output: output.clone(),
-        });
+        let (writer, task, _) = start_rpc_writer(
+            BackpressuredOutput {
+                entered: entered.clone(),
+                release: release.clone(),
+                output: output.clone(),
+            },
+            crate::args::RpcMessageUpdates::default(),
+        );
         write_line(&writer, &serde_json::json!({"id": 0})).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !entered.load(Ordering::SeqCst) {
@@ -3094,6 +3317,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(
                 &b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n"[..],
             ),
@@ -3159,6 +3383,7 @@ mod tests {
                 vec![],
                 ui.clone(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input),
                 BrokenOutput,
             ),
