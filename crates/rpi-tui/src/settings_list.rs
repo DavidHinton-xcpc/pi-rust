@@ -427,11 +427,10 @@ impl SettingsList {
 
         let main_line = if is_selected {
             format!(
-                "{}{} {} {}",
+                "{}{} {}",
                 (self.theme.selected_prefix)(prefix),
                 (self.theme.key)(&key_display),
-                (self.theme.selected)(&value_display),
-                ""
+                (self.theme.selected)(&value_display)
             )
         } else {
             format!(
