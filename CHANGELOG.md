@@ -11,6 +11,53 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/bigfish1913/pi-rust/compare/v0.14.0...v0.15.0) - 2026-10-30
+
+### Added
+
+- *(extensions)* carry recorded tool results through plugin streams
+- *(ai)* add a recorded field to tool calls and stream frames
+- *(extensions)* advertise recorded tool calls in provider requests
+
+### Fixed
+
+- *(cli)* render each autocomplete row as exactly one screen line
+- *(cli)* compare the expiry too before writing a refresh back
+- *(prompt)* align tool snippets and guidelines with Pi
+- *(rpc)* [**breaking**] default to compact message deltas with migrated consumers
+- *(cli)* drop a refresh result when login or logout changed the credential
+- *(cli)* renew OAuth logins per provider, not under one global lock
+- *(runtime)* refresh stored OAuth logins before provider requests
+- *(agent)* never execute recorded tool calls
+- *(plugin-sdk)* refuse recorded calls on hosts that cannot honor them
+- *(extensions)* keep plugin call ids out of the fail-closed error text
+- *(extensions)* keep a streamed recording through the final message
+- *(tui)* drop the selected row's trailing space
+- *(tui)* size the settings label column to its labels
+- *(tui)* render overlays inside the frame's cell geometry scope
+- *(tui)* scope image geometry to the frame's polled cells
+- *(tui)* give each renderer its own polled cell geometry
+- *(tui)* poll cell geometry on the main screen and harden the probes
+- *(tui)* key image caches on cell geometry, not just width
+- *(tui)* size inline images from the terminal's real cell size
+
+### Other
+
+- *(extensions)* define recordedToolCalls as the highest decoded version
+- *(extensions)* document the recorded capability and the final out check
+- Merge branch 'main' into upstream/recorded-tool-calls
+- Merge branch 'main' into upstream/oauth-auto-refresh
+- Merge branch 'main' into fix/autocomplete-panel-flicker
+- Merge branch 'main' into upstream/oauth-auto-refresh
+- *(ai)* cover unversioned OpenAI proxy prefixes
+- *(ai)* frames written before the recorded field reduce to an ordinary call
+- *(agent)* a recorded call never reaches after_tool_call
+- *(agent)* an explicit retry of a recorded call runs once
+- *(extensions)* collapse two nested if-lets in the recorded-call tests
+- add the #183 review's provider-to-agent and JSONL recovery checks
+- *(extensions)* a toolcall_end without a recording stays an ordinary call
+- *(tui)* probe renderer-local cell geometry isolation
+
 ### Changed
 
 - **Breaking (RPC wire format):** `--mode rpc` now defaults to `compact-deltas`. Text, thinking, and tool-call delta updates omit the cumulative `message` and `assistantMessageEvent.partial` snapshots while retaining nested delta fields and the top-level `eventType`, `contentIndex`, and `delta` mirrors. `ready.semantics.messageUpdates` identifies the selected mode; a missing field means legacy `snapshot`. Upgrade remote clients and protocol adapters before deploying the new host. `--rpc-message-updates=snapshot` is an explicit, temporary migration fallback, not the long-term default. Structural events, authoritative final messages, settlement and canonical branch-query contracts, plugin serialization, and `--mode json` are unchanged. This is not a fully snapshot-free or lossless replay protocol. ([#171](https://github.com/bigfish1913/pi-rust/issues/171))
