@@ -47,7 +47,6 @@ use rpi_harness::agent_harness::{
     AgentHarness, HarnessRunOutcome, NavigationOutcome, SendMessageResult, WeakAgentHarness,
 };
 use rpi_harness::session::session::Session;
-use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
 use rpi_harness::types::SendMessageOptions;
 use tokio::runtime::Handle;
 
@@ -489,25 +488,20 @@ impl RuntimeActionHost for HarnessActionHost {
 
     async fn get_session_branch(
         &self,
-        _args: serde_json::Value,
+        args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let entries = self
-            .harness()?
-            .find_entries_on_branch(
-                &EntryQuery {
-                    order: Some(EntryOrder::OldestFirst),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let request = crate::modes::branch_entry_query(&args)?;
+        let entries = crate::modes::find_branch_entries(&self.harness()?, &request).await?;
         let entries = entries
             .iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("serialize session branch: {e}"))?;
-        Ok(serde_json::json!({"entries": entries}))
+        Ok(serde_json::json!({
+            "entries": entries,
+            "count": entries.len(),
+            "filtered": true,
+        }))
     }
 
     async fn set_session_name(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -660,6 +654,7 @@ impl RuntimeActionHost for HarnessActionHost {
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let new_session: Session = open_session_by_id_in_dir(&id, &cwd_str, &self.session_dir)
             .await
+            .map(|restored| restored.session)
             .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();
         crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;

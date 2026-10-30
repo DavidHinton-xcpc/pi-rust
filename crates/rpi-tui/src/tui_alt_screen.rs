@@ -173,6 +173,11 @@ pub struct TuiAltScreen {
     scheduler_thread: Mutex<Option<JoinHandle<()>>>,
     /// Fullscreen text selection (anchor/focus in content coordinates).
     selection: crate::selection::SelectionState,
+    /// Image payloads this screen's terminal is known to hold. Terminal state,
+    /// so it belongs to the screen that owns the terminal — never a process
+    /// global, which a second screen, a reconnect, or a terminal restart would
+    /// silently invalidate.
+    kitty_uploads: Mutex<crate::terminal_image::KittyUploads>,
 }
 
 impl TuiAltScreen {
@@ -216,6 +221,7 @@ impl TuiAltScreen {
             scheduler_started: AtomicBool::new(false),
             scheduler_thread: Mutex::new(None),
             selection: crate::selection::SelectionState::new(),
+            kitty_uploads: Mutex::new(crate::terminal_image::KittyUploads::new()),
         }
     }
 
@@ -645,6 +651,9 @@ impl TuiAltScreen {
             terminal.write("\x1b[?1049h\x1b[?7l");
             // Clear screen and hide cursor
             terminal.write("\x1b[2J\x1b[H\x1b[?25l");
+            // A fresh alternate buffer holds no images: the next frame has to
+            // carry each payload again instead of placing it by id.
+            self.invalidate_kitty_uploads();
             terminal.flush();
         }
     }
@@ -665,8 +674,22 @@ impl TuiAltScreen {
                 // farewell after this.
                 terminal.write("\x1b[?1049l\x1b[2J\x1b[H\x1b[?25h");
             }
+            // Whatever the terminal kept for the alternate buffer is gone with
+            // it; the next frame has to carry the payloads again.
+            self.invalidate_kitty_uploads();
             terminal.flush();
         }
+    }
+
+    /// Forget the image payloads this screen believes its terminal holds.
+    ///
+    /// Called for every event that can drop the terminal's image store: a
+    /// screen clear, a resize, and entering or leaving the alternate screen.
+    fn invalidate_kitty_uploads(&self) {
+        self.kitty_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate();
     }
 
     /// Hand the terminal back to the shell so the process can be stopped
@@ -780,6 +803,7 @@ impl TuiAltScreen {
         {
             terminal.write("\x1b[?2026h");
             terminal.write("\x1b[2J\x1b[H\x1b[3J");
+            self.invalidate_kitty_uploads();
             terminal.write(&lines.join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
@@ -993,17 +1017,23 @@ impl TuiAltScreen {
         let root_component: Arc<dyn Component> =
             root.unwrap_or_else(|| Arc::new(self.container.clone()));
 
+        // Reflow changes document row/column identities. Never reinterpret an
+        // old selection against rows wrapped for a different terminal width.
+        // Cancel before rendering so a non-dragged click can restore follow.
+        if self.current_frame.lock().ok().is_some_and(|current| {
+            current
+                .as_ref()
+                .is_some_and(|previous| previous.width != width)
+        }) {
+            self.selection.clear();
+        }
+
         // Render layout frame
         let frame = if reuse_scroll_content {
             render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
         } else {
             render_layout_frame(root_component.clone(), width, height)
         };
-
-        // Store the frame for input handling
-        if let Ok(mut current) = self.current_frame.lock() {
-            *current = Some(frame.clone());
-        }
 
         // Get screen lines and composite modal overlays above the layout.
         let mut visible = frame.lines.clone();
@@ -1047,6 +1077,10 @@ impl TuiAltScreen {
         ));
 
         if let Ok(terminal) = self.terminal.lock() {
+            let mut uploads = self
+                .kitty_uploads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if full_redraw {
                 if let Ok(mut count) = self.full_redraw_count.lock() {
                     *count += 1;
@@ -1055,6 +1089,9 @@ impl TuiAltScreen {
                 // whole width, and a terminal that reset the mode on resize
                 // would wrap the last cell and shift every following row.
                 buffer.push_str("\x1b[2J");
+                // A clear drops every image the terminal holds, so the next
+                // image row has to carry its payload again.
+                uploads.invalidate();
                 buffer.push_str("\x1b[?7l");
             }
 
@@ -1066,21 +1103,43 @@ impl TuiAltScreen {
                 if !full_redraw && row < previous.len() && &previous[row] == line {
                     continue; // Skip unchanged lines
                 }
-                // Overwrite before clearing any leftover tail. Clearing the
-                // whole row first blanks stationary sidebars during scroll on
-                // terminals that do not implement synchronized output.
-                if let Some((column, text)) = (!full_redraw)
-                    .then(|| crate::line_diff::patch(&previous[row], line))
-                    .flatten()
-                {
-                    buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
-                } else {
-                    buffer.push_str(&format!("\x1b[{};1H{}", row + 1, line));
-                    if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
-                        buffer.push_str("\x1b[K");
+                // A repainted image row carries the whole PNG payload. Once the
+                // data is in the terminal, the placement alone is enough, which
+                // keeps scrolling a transcript full of screenshots cheap.
+                let is_image = crate::terminal_image::is_image_line(line);
+                let placement = crate::terminal_image::kitty_placement_line(line, &uploads);
+                let rendered = placement.as_deref().unwrap_or(line.as_str());
+                // Image rows are never patched: their prefix is the escape that
+                // changes, so a partial write buys nothing and a full row keeps
+                // the placement anchored at column 1.
+                if !is_image {
+                    // Overwrite before clearing any leftover tail. Clearing the
+                    // whole row first blanks stationary sidebars during scroll on
+                    // terminals that do not implement synchronized output.
+                    if let Some((column, text)) = (!full_redraw)
+                        .then(|| crate::line_diff::patch(&previous[row], line))
+                        .flatten()
+                    {
+                        buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
+                        continue;
                     }
                 }
+                buffer.push_str(&format!("\x1b[{};1H{}", row + 1, rendered));
+                if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
+                    buffer.push_str("\x1b[K");
+                }
             }
+
+            // Every image on screen this frame is in the terminal: keep it
+            // trusted for the next frame. An image that scrolled away is
+            // forgotten, so its payload is re-sent when it comes back instead
+            // of placing an id the terminal may no longer hold.
+            for line in &visible {
+                if let Some(id) = crate::terminal_image::kitty_transmission_id(line) {
+                    uploads.note_painted(id);
+                }
+            }
+            uploads.end_frame();
 
             // Position the hardware cursor using the marker location captured
             // before internal markers were stripped from `visible`.
@@ -1101,6 +1160,12 @@ impl TuiAltScreen {
             terminal.flush();
         }
 
+        // Publish input geometry only after the synchronized frame is written.
+        // Its scroll snapshots must describe the screen the user actually saw,
+        // not a frame still being assembled or an already-mutated live cache.
+        if let Ok(mut current) = self.current_frame.lock() {
+            *current = Some(frame);
+        }
         // Store current screen
         if let Ok(mut prev) = self.previous_screen.lock() {
             *prev = visible;
@@ -1530,7 +1595,8 @@ impl Terminal for TerminalProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Editor, Focusable, Text};
+    use crate::vstack::StackEntryOptions;
+    use crate::{Editor, Focusable, ScrollViewOptions, Text, VStack};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// A terminal whose size the test controls, so a resize can be replayed
@@ -1659,6 +1725,75 @@ mod tests {
         let frame = output.lock().unwrap().clone();
         assert!(frame.contains("\x1b[12;1H"), "got: {frame:?}");
         assert_eq!(*tui.painted_size.lock().unwrap(), (60, 12));
+    }
+
+    #[test]
+    fn reflow_clears_old_selection_instead_of_reusing_stale_columns() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let scroll = Arc::new(ScrollView::simple(Arc::new(Text::new(
+            "prefix TARGET suffix",
+            0,
+            0,
+        ))));
+        tui.set_layout_root(Some(scroll));
+        tui.start_readerless();
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 12),
+            (MouseEventKind::Up(MouseButton::Left), 12),
+        ] {
+            tui.handle_selection_mouse_event(&MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(tui.selection_text().as_deref(), Some("TARGET"));
+        *size.lock().unwrap() = (30, 8);
+        tui.request_render(false);
+        assert!(tui.selection_text().is_none());
+        assert!(!tui.selection_dragged());
+    }
+
+    #[test]
+    fn reflow_cancels_a_plain_press_without_leaving_follow_paused() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let text = Arc::new(Text::new(
+            (0..30)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        let scroll = Arc::new(ScrollView::primary(text));
+        tui.set_layout_root(Some(scroll.clone()));
+        tui.start_readerless();
+        tui.handle_selection_mouse_event(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!scroll.is_following_end());
+        *size.lock().unwrap() = (30, 12);
+        tui.request_render(false);
+        assert!(scroll.is_following_end());
+        assert_eq!(scroll.scroll_top(), 18);
+        assert!(tui.selection_text().is_none());
+        assert!(!tui.handle_selection_mouse_event(&MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE
+        }));
     }
 
     #[test]
@@ -2185,5 +2320,130 @@ mod tests {
             "200 requests in ~250 ms must coalesce into ~16 ms frames, painted {frames}"
         );
         tui.stop(TuiStopOptions::default());
+    }
+
+    /// A transcript row that holds a Kitty placement, plus enough rows around
+    /// it to scroll it in and out of the viewport.
+    struct ImageTranscript {
+        lines: Vec<String>,
+    }
+
+    impl Component for ImageTranscript {
+        fn render(&self, _width: usize) -> Vec<String> {
+            self.lines.clone()
+        }
+        fn invalidate(&self) {}
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    const IMAGE_ID: u32 = 9_902;
+
+    /// A transcript whose row 2 carries a 4-row Kitty placement with a payload
+    /// large enough that re-sending it would be obvious in the frame bytes.
+    fn image_screen() -> (TuiAltScreen, Arc<Mutex<String>>, Arc<ScrollView>) {
+        let mut payload = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        payload.resize(44_181, 0);
+        let placement = crate::terminal_image::encode_kitty(
+            &payload,
+            &crate::terminal_image::ImageRenderOptions {
+                id: Some(IMAGE_ID),
+                width: Some(20),
+                height: Some(4),
+                ..Default::default()
+            },
+        );
+        crate::terminal_image::register_kitty_image(crate::terminal_image::KittyImageMetadata {
+            id: IMAGE_ID,
+            columns: 20,
+            rows: 4,
+            width_px: 400,
+            height_px: 320,
+        });
+
+        let mut lines: Vec<String> = (0..40).map(|row| format!("row {row}")).collect();
+        lines[2] = placement;
+        for row in &mut lines[3..6] {
+            row.clear();
+        }
+
+        let scroll = Arc::new(ScrollView::new(
+            Arc::new(ImageTranscript { lines }),
+            ScrollViewOptions {
+                follow: crate::FollowMode::None,
+                ..Default::default()
+            },
+        ));
+        let stack = VStack::new();
+        stack.add_child_with_options(scroll.clone(), StackEntryOptions::with_basis(8));
+
+        let output = Arc::new(Mutex::new(String::new()));
+        let tui = TuiAltScreen::new(
+            Box::new(RecordingTerminal {
+                output: output.clone(),
+            }),
+            false,
+            None,
+        );
+        tui.set_layout_root(Some(Arc::new(stack)));
+        tui.start_readerless();
+        (tui, output, scroll)
+    }
+
+    /// Scrolling an image repaints its row. The row must move the placement by
+    /// id instead of re-sending the payload, and it must not delete the image
+    /// data the placement-only rewrite depends on.
+    #[test]
+    fn scrolling_an_image_moves_its_placement_without_resending_the_payload() {
+        let (tui, output, scroll) = image_screen();
+        let first = output.lock().unwrap().clone();
+        assert!(
+            first.contains("\x1b_Ga=T,") && first.contains("i=9902,p=1"),
+            "the first frame must transmit the payload, got {} bytes",
+            first.len()
+        );
+
+        output.lock().unwrap().clear();
+        scroll.scroll_to(1);
+        tui.do_render(false);
+        let frame = output.lock().unwrap().clone();
+
+        assert!(
+            frame.contains("\x1b_Ga=p,") && frame.contains("i=9902,p=1"),
+            "the moved image must be placed by id, got {frame:?}"
+        );
+        assert!(
+            !frame.contains("iVBORw0KGgo"),
+            "the payload must not be re-sent, got {} bytes",
+            frame.len()
+        );
+        assert!(
+            !frame.contains("\x1b_Ga=d,"),
+            "an image that is still on screen must be moved, not deleted: {frame:?}"
+        );
+    }
+
+    /// An image that scrolls out of the viewport is deleted by placement only:
+    /// the stored data has to survive for a later re-place of the same id.
+    #[test]
+    fn an_image_that_scrolls_off_screen_is_deleted_by_placement_only() {
+        let (tui, output, scroll) = image_screen();
+        output.lock().unwrap().clear();
+
+        // The placement covers rows 2..6; a viewport starting at row 8 no
+        // longer contains it.
+        scroll.scroll_to(8);
+        tui.do_render(false);
+        let frame = output.lock().unwrap().clone();
+
+        assert!(
+            frame.contains("\x1b_Ga=d,d=i,i=9902,p=1"),
+            "the off-screen placement must be deleted, got {frame:?}"
+        );
+        assert!(
+            !frame.contains("d=I"),
+            "deleting the image data would blank a later re-place: {frame:?}"
+        );
     }
 }

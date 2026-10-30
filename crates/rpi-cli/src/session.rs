@@ -229,7 +229,7 @@ pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
     }
 }
 
-fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
+pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
@@ -477,6 +477,11 @@ pub async fn build_prepared(
     let active = filter_active_tool_names(active_tool_names(&tools, args), args);
 
     // ---- Session storage ----
+    // The root is the one `prepare_extensions` froze at startup, never a fresh
+    // `configured_session_dir(args, cwd)`: settings and `RPI_CODING_AGENT_SESSION_DIR`
+    // can change while extensions load, and an adopted session cwd would point
+    // at another project's tree. Both the cwd peek and this build must read the
+    // same root, so the caller pins it into `args` before either runs.
     let selection = select_session_in_dir(args, session_dir.clone());
     let session = build_session(&selection, &cwd_str).await?;
     // Plugin tools now know which session they serve: `todo` and friends key
@@ -863,6 +868,7 @@ pub async fn build_prepared(
                     .stream_idle_timeout
                     .map(std::time::Duration::from_secs)
             }),
+            thinking_budgets: saved_settings.thinking_budgets,
             ..Default::default()
         },
         // Settings-backed harness options: upstream lets users tune retry,
@@ -987,6 +993,7 @@ pub async fn build_prepared(
         ext_status: ext_status_mailbox,
         editor_text: editor_text_mailbox,
         dev_extension: None,
+        startup_notices: Vec::new(),
     };
 
     Ok((harness, event_rx, reload_context))
@@ -1161,6 +1168,12 @@ pub struct ReloadContext {
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
+    /// One-line notices the host should show at startup (a session directory
+    /// that fell back, an untrusted adopted directory). Filled by the CLI after
+    /// the build and rendered as transcript notes in the TUI; headless modes
+    /// print them to stderr. Kept as data — never `eprintln!`d from here, which
+    /// would corrupt the alternate screen (issue #115).
+    pub startup_notices: Vec<String>,
 }
 
 impl ReloadContext {
@@ -2072,7 +2085,7 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     let default = std::env::var("RPI_BASH_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(120.0);
+        .unwrap_or(rpi_tools::tools::bash::DEFAULT_BASH_TIMEOUT_SECONDS);
     // Saved user defaults, matching how `defaultTools` is read in `build_tools`.
     // `shellCommandPrefix` is prepended to every command (upstream's key for
     // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
@@ -2226,44 +2239,141 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
 /// facade. The restored transcript renders into the TUI at startup and the
 /// harness continues appending to the same file.
 async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
-    // `list_typed` is newest-first; `Latest` takes the head, `ById` matches
-    // the id exactly or by file-name containment (so `--session 01a02…` or a
-    // partial id works, mirroring the TS id/path matching).
+    // `resolve_restore_target` is newest-first; `Latest` takes the head, `ById`
+    // matches the id exactly or by file-name containment (so `--session 01a02…`
+    // or a partial id works, mirroring the TS id/path matching).
+    let Some(meta) = resolve_restore_target(selection, cwd).await? else {
+        return match selection {
+            // Exact id match only (pi `--session-id`): a missing session is
+            // created fresh under the selected dir instead of an error.
+            SessionSelection::ByExactId { id, dir } => {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
+                create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
+                    .await
+                    .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
+            }
+            SessionSelection::Latest { dir } => Err(BuildError::SessionNotFound {
+                requested: "the most recent session".to_string(),
+                dir: dir.display().to_string(),
+            }),
+            SessionSelection::ById { id, dir } => Err(BuildError::SessionNotFound {
+                requested: format!("session {id}"),
+                dir: dir.display().to_string(),
+            }),
+            _ => unreachable!("resolve_restore_target only returns None for restore selections"),
+        };
+    };
+    let sessions_root = selection_dir(selection);
+    open_session(&meta, cwd, &sessions_root)
+        .await
+        .map(|restored| restored.session)
+}
+
+/// The sessions root a selection was resolved against.
+fn selection_dir(selection: &SessionSelection) -> PathBuf {
+    match selection {
+        SessionSelection::Ephemeral => PathBuf::new(),
+        SessionSelection::New { dir, .. }
+        | SessionSelection::Latest { dir }
+        | SessionSelection::ById { dir, .. }
+        | SessionSelection::ByExactId { dir, .. }
+        | SessionSelection::Fork { dir, .. } => dir.clone(),
+    }
+}
+
+/// Resolve the metadata a restore selection names, without opening the file.
+///
+/// Shared by the startup build ([`restore_session`]) and the cwd peek
+/// ([`peek_restored_session_cwd`]) so the two can never disagree about which
+/// session a launch restores. Pure listing + matching: no session lock is
+/// claimed and nothing is created.
+async fn resolve_restore_target(
+    selection: &SessionSelection,
+    cwd: &str,
+) -> Result<Option<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     match selection {
         SessionSelection::Latest { dir } => {
             let metas = list_session_metadata_in_dir(cwd, dir).await?;
-            let Some(meta) = first_resumable_session(&metas) else {
-                return Err(BuildError::SessionNotFound {
-                    requested: "the most recent session".to_string(),
-                    dir: dir.display().to_string(),
-                });
-            };
-            open_session(meta, cwd).await
+            Ok(first_resumable_session(&metas).cloned())
         }
-        SessionSelection::ById { id, dir } => open_session_by_id_in_dir(id, cwd, dir)
-            .await
-            .map_err(|e| match e {
-                OpenError::NotFound { requested } => BuildError::SessionNotFound {
-                    requested,
-                    dir: dir.display().to_string(),
-                },
-                OpenError::Other(msg) => BuildError::SessionOpen(msg),
-            }),
+        SessionSelection::ById { id, dir } => find_session_metadata(id, cwd, dir).await,
         SessionSelection::ByExactId { id, dir } => {
-            // Exact id match only (pi `--session-id`): restore when the
-            // session exists, else create a fresh one under the selected dir.
             let metas = list_session_metadata_in_dir(cwd, dir).await?;
-            if let Some(meta) = metas.iter().find(|m| m.id == *id) {
-                return open_session(meta, cwd).await;
-            }
-            std::fs::create_dir_all(dir)
-                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
-            create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
-                .await
-                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
+            Ok(metas.into_iter().find(|m| m.id == *id))
         }
-        _ => unreachable!("restore_session only called for Latest/ById/ByExactId"),
+        SessionSelection::Fork { .. }
+        | SessionSelection::New { .. }
+        | SessionSelection::Ephemeral => Ok(None),
     }
+}
+
+/// The metadata of the session whose id matches exactly or by file-name
+/// containment (so `--session 01a02…` / a partial id / a full file name all
+/// work), or `None` when nothing matches.
+async fn find_session_metadata(
+    id: &str,
+    cwd: &str,
+    dir: &Path,
+) -> Result<Option<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    let metas = list_session_metadata_in_dir(cwd, dir).await?;
+    Ok(metas
+        .into_iter()
+        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id)))
+}
+
+/// What a launch that would restore a session says about the working directory.
+pub(crate) struct RestoredSessionCwd {
+    /// The id of the session this launch will restore. The host pins it into
+    /// `args` so the later build opens exactly this session — a directory
+    /// listing taken twice can disagree (another `rpi` may write a newer
+    /// session in between), and adopting one session's directory while opening
+    /// another is the very bug this restores.
+    pub id: String,
+    /// The directory recorded in the session header.
+    pub recorded: PathBuf,
+    /// `Some` when the recorded directory still exists and the run adopts it;
+    /// `None` when the caller must fall back to the launch cwd and say so.
+    pub adopted: Option<PathBuf>,
+}
+
+/// The working directory the launch's restored session was created in, resolved
+/// WITHOUT opening, locking, or creating anything.
+///
+/// Read-only by design: this runs before trust resolution and extension
+/// preparation, where a failure must not take the run down — the real open
+/// happens later and surfaces its own errors. Returns `None` when the selection
+/// is not a restore (fresh/ephemeral/fork) or cannot be resolved.
+pub(crate) async fn peek_restored_session_cwd(
+    selection: &SessionSelection,
+    launch_cwd: &Path,
+) -> Option<RestoredSessionCwd> {
+    let cwd_str = launch_cwd.to_string_lossy().into_owned();
+    let meta = resolve_restore_target(selection, &cwd_str).await.ok()??;
+    let recorded = PathBuf::from(&meta.cwd);
+    if recorded.as_os_str().is_empty() {
+        return None;
+    }
+    Some(RestoredSessionCwd {
+        id: meta.id,
+        adopted: crate::session_cwd::resolve_session_cwd(&recorded),
+        recorded,
+    })
+}
+
+/// Pin a peeked restore target into `args` so the later build opens exactly the
+/// session the peek inspected.
+///
+/// `Latest` (`-c`) re-lists the session directory when the build runs, and
+/// another `rpi` may have written a newer session in between. Adopting one
+/// session's working directory while opening a different conversation would put
+/// the tools in a directory that conversation never used — the exact failure
+/// this adoption exists to prevent. Pinning the resolved id turns the second
+/// listing into an exact match instead of a fresh "newest" choice.
+pub(crate) fn pin_restored_selection(args: &mut Args, restored: &RestoredSessionCwd) {
+    args.continue_session = false;
+    args.resume = false;
+    args.session = Some(restored.id.clone());
 }
 
 /// `--fork <path|id>`: open the source session, fork it into a new JSONL
@@ -2664,26 +2774,25 @@ fn first_resumable_session(
 /// TUI `/session` hot-switch calls this with the selector's item value.
 pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenError> {
     let dir = default_session_dir(Path::new(cwd));
-    open_session_by_id_in_dir(id, cwd, &dir).await
+    open_session_by_id_in_dir(id, cwd, &dir)
+        .await
+        .map(|restored| restored.session)
 }
 
 pub(crate) async fn open_session_by_id_in_dir(
     id: &str,
     cwd: &str,
     dir: &Path,
-) -> Result<Session, OpenError> {
-    let metas = list_session_metadata_in_dir(cwd, dir)
+) -> Result<RestoredSession, OpenError> {
+    let meta = find_session_metadata(id, cwd, dir)
         .await
         .map_err(|e| OpenError::Other(e.to_string()))?;
-    let Some(meta) = metas
-        .iter()
-        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id))
-    else {
+    let Some(meta) = meta else {
         return Err(OpenError::NotFound {
             requested: format!("session {id}"),
         });
     };
-    open_session(meta, cwd).await.map_err(|e| {
+    open_session(&meta, cwd, dir).await.map_err(|e| {
         OpenError::Other(match e {
             // `open_session` renders as "Could not open the saved session:
             // <reason>" via `BuildError`. Carry the bare reason so it is not
@@ -2927,17 +3036,37 @@ fn claim_session_lock(session_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A restored session together with the working directory it was created in.
+///
+/// The recorded cwd is data for the host's notices, never a silent adoption:
+/// the launch path adopts the directory in [`app`](crate::app) before any
+/// resource loads (tools, extensions, system prompt, and trust all key off it),
+/// and the `/session` hot-switch does not move the running tools at all. Either
+/// way the user hears about the directory instead of the process quietly
+/// working somewhere unexpected.
+pub(crate) struct RestoredSession {
+    pub session: Session,
+    /// The directory recorded in the session header, when it still exists.
+    /// `None` when the record is empty or the path is gone (or is a file).
+    pub recorded_cwd: Option<PathBuf>,
+}
+
 /// Wrap an opened [`JsonlSessionStorage`] in the `Session` facade (shared by
 /// startup restore + TUI hot-switch).
+///
+/// `sessions_root` is passed in rather than re-derived from `cwd`: after a
+/// restore adopts the session's directory, `default_session_dir(cwd)` would
+/// name the ADOPTED project's tree, which is not where this session was found.
 async fn open_session(
     meta: &rpi_harness::session::jsonl::JsonlSessionMetadata,
     cwd: &str,
-) -> Result<Session, BuildError> {
+    sessions_root: &Path,
+) -> Result<RestoredSession, BuildError> {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
     use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
-    let dir = default_session_dir(Path::new(cwd));
+    let dir = sessions_root;
     let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let fs: Arc<dyn FileSystem> = env.clone();
     let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
@@ -2951,21 +3080,11 @@ async fn open_session(
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
-    // A session records the cwd it was created in. When that directory has
-    // since been removed, continuing silently in it is confusing; warn the
-    // user that we fell back to the process cwd (pi `getMissingSessionCwdIssue`).
-    if let Some(issue) = crate::session_cwd::get_missing_session_cwd_issue(
-        Some(Path::new(&meta.path)),
-        Path::new(&meta.cwd),
-        Path::new(cwd),
-    ) {
-        eprintln!(
-            "warning: {}",
-            crate::session_cwd::format_missing_session_cwd_error(&issue)
-        );
-    }
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
-    Ok(Session::new(storage_arc, None))
+    Ok(RestoredSession {
+        session: Session::new(storage_arc, None),
+        recorded_cwd: crate::session_cwd::resolve_session_cwd(Path::new(&meta.cwd)),
+    })
 }
 
 /// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`
@@ -4323,5 +4442,197 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- restored-session working directory ----
+
+    /// A restore peek must name the directory the session was created in —
+    /// that is the whole point of recording it. Everything downstream (tool
+    /// env, system prompt, context files, extensions) keys off the run's cwd,
+    /// so a peek that falls back to the launch directory would leave the
+    /// resumed agent editing files in whatever directory `rpi` happened to be
+    /// started from.
+    #[tokio::test]
+    async fn a_restored_session_adopts_its_recorded_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project-a");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &project.to_string_lossy(),
+            Some("cwdadopt01".into()),
+        )
+        .await
+        .unwrap();
+
+        let selection = SessionSelection::ById {
+            id: "cwdadopt01".into(),
+            dir: sessions.clone(),
+        };
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("a resumable session with a recorded cwd");
+        assert_eq!(peeked.recorded, project);
+        assert_eq!(peeked.adopted, Some(project));
+    }
+
+    /// A recorded directory that no longer exists must NOT be adopted: the run
+    /// falls back to the launch cwd, and the peek hands back the record so the
+    /// host can say so (instead of the old behaviour of eprintln-ing mid-TUI).
+    #[tokio::test]
+    async fn a_missing_recorded_directory_is_reported_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("project-gone");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &gone.to_string_lossy(),
+            Some("cwdgone001".into()),
+        )
+        .await
+        .unwrap();
+
+        let selection = SessionSelection::ById {
+            id: "cwdgone001".into(),
+            dir: sessions.clone(),
+        };
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("the session itself is resumable");
+        assert_eq!(peeked.recorded, gone);
+        assert_eq!(peeked.adopted, None);
+        let note = crate::session_cwd::missing_session_cwd_note(&peeked.recorded, &launch);
+        assert!(note.contains("no longer exists"), "{note}");
+        assert!(note.contains("launch-dir"), "{note}");
+    }
+
+    /// `open_session` hands back the recorded directory as data (for the
+    /// `/session` hot-switch notes) while still opening the session normally.
+    #[tokio::test]
+    async fn open_session_reports_the_recorded_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project-open");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &project.to_string_lossy(),
+            Some("cwdopen001".into()),
+        )
+        .await
+        .unwrap();
+
+        let restored =
+            open_session_by_id_in_dir("cwdopen001", &launch.to_string_lossy(), &sessions)
+                .await
+                .map_err(|error| error.to_string())
+                .unwrap();
+        assert_eq!(restored.recorded_cwd, Some(project.clone()));
+        assert_eq!(restored.session.storage().metadata().id, "cwdopen001");
+    }
+
+    /// The session the peek inspected must be the session the build opens.
+    ///
+    /// `-c` means "the most recent session", and the build lists the directory
+    /// again. Another `rpi` (or a `/session` new-session) can write a newer one
+    /// between the peek and the build; adopting the peeked session's directory
+    /// while opening the newer conversation would run the tools in a directory
+    /// that conversation never used. Pinning the resolved id makes the second
+    /// listing an exact match instead of a fresh newest-first choice.
+    #[tokio::test]
+    async fn the_peeked_session_is_the_one_the_build_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_project = tmp.path().join("project-first");
+        let second_project = tmp.path().join("project-second");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        for dir in [&first_project, &second_project, &launch, &sessions] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        create_jsonl_session_with_id(
+            &sessions,
+            &first_project.to_string_lossy(),
+            Some("cwdrace001".into()),
+        )
+        .await
+        .unwrap();
+
+        let mut args = Args {
+            continue_session: true,
+            session_dir: Some(sessions.clone()),
+            ..Default::default()
+        };
+        let selection = select_session_in_dir(&args, sessions.clone());
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("a resumable session");
+        assert_eq!(peeked.adopted, Some(first_project.clone()));
+
+        // A newer session appears in another project before the build runs.
+        create_jsonl_session_with_id(
+            &sessions,
+            &second_project.to_string_lossy(),
+            Some("cwdrace002".into()),
+        )
+        .await
+        .unwrap();
+
+        pin_restored_selection(&mut args, &peeked);
+        let pinned = select_session_in_dir(&args, sessions.clone());
+        let reopened = resolve_restore_target(&pinned, &launch.to_string_lossy())
+            .await
+            .unwrap()
+            .expect("the pinned session still exists");
+        assert_eq!(
+            reopened.id, peeked.id,
+            "the build must open the session the peek adopted the directory of"
+        );
+        assert_eq!(reopened.cwd, first_project.to_string_lossy());
+    }
+
+    /// Trust must be resolved against the directory it is asked about. A
+    /// session recorded in another project must not inherit the launch
+    /// directory's decision — that would run an untrusted project's settings,
+    /// skills, and context files with trusted privileges.
+    #[test]
+    fn trust_is_resolved_per_directory() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let untrusted = tmp.path().join("project-untrusted");
+        let launch = tmp.path().join("project-launch");
+        std::fs::create_dir_all(&untrusted).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        crate::config::set_project_trust(&untrusted, Some(false)).unwrap();
+
+        let args = Args::default();
+        assert!(!resolve_project_trust(&args, &untrusted));
+        // A directory with no stored decision loads by default.
+        assert!(resolve_project_trust(&args, &launch));
     }
 }
