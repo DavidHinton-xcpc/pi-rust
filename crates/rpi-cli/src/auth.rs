@@ -257,6 +257,7 @@ fn refresh_stored_oauth(
     if refresh.trim().is_empty() {
         return Err(RefreshError::Invalid);
     }
+    let started_from = (access.clone(), refresh.clone());
     let response = rpi_extensions::request_oauth(
         snapshot,
         provider,
@@ -290,8 +291,24 @@ fn refresh_stored_oauth(
     } else {
         token.refresh
     };
-    config::upsert_oauth_token(provider, token.access.clone(), refresh, token.expires_at)
-        .map_err(|_| RefreshError::Save)?;
+    let committed = config::replace_oauth_token_if_unchanged(
+        provider,
+        (&started_from.0, &started_from.1),
+        token.access.clone(),
+        refresh,
+        token.expires_at,
+    )
+    .map_err(|_| RefreshError::Save)?;
+    if !committed {
+        // Login and logout don't take the renewal lock, so they can land while
+        // the package call runs. Keep what the user did and drop this result.
+        return match config::read_oauth_token(provider).map_err(|_| RefreshError::Read)? {
+            Some(Credential::Oauth {
+                access, expires, ..
+            }) => Ok(RefreshedOAuth { access, expires }),
+            _ => Err(RefreshError::NotStored),
+        };
+    }
     Ok(RefreshedOAuth {
         access: token.access,
         expires: token.expires_at,

@@ -398,6 +398,62 @@ mod package_oauth_refresh {
         assert_eq!(refreshes(), 100);
     }
 
+    /// Runs a login (`replace_login`) or a logout while a refresh of the same
+    /// provider is paused inside the package, then reports whether the user's
+    /// action survived. The worker is always released and joined first.
+    fn auth_change_survives_refresh(replace_login: bool) -> bool {
+        use rpi_runtime::credentials::OAuthRefresher;
+        let _env = TestEnv::new();
+        let _reset = session(true);
+        let refresher = two_oauth_providers();
+        SLOW_ENTERED.store(false, SeqCst);
+        SLOW_RELEASE.store(false, SeqCst);
+        config::upsert_oauth_token("acme", "old-access".into(), "blocked-refresh".into(), 1)
+            .unwrap();
+        let worker = std::thread::spawn(move || refresher.refresh("acme"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !SLOW_ENTERED.load(SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let entered = SLOW_ENTERED.load(SeqCst);
+        if replace_login {
+            config::upsert_oauth_token(
+                "acme",
+                "new-login-access".into(),
+                "new-login-refresh".into(),
+                FRESH_EXPIRY,
+            )
+            .unwrap();
+        } else {
+            assert!(config::delete_credential("acme").unwrap());
+        }
+        SLOW_RELEASE.store(true, SeqCst);
+        let _ = worker.join().unwrap();
+        assert!(entered, "refresh callback did not start");
+        let stored = config::read_oauth_token("acme").unwrap();
+        if replace_login {
+            matches!(stored, Some(config::Credential::Oauth { access, refresh, .. }) if access == "new-login-access" && refresh == "new-login-refresh")
+        } else {
+            stored.is_none()
+        }
+    }
+
+    #[test]
+    fn a_refresh_does_not_restore_a_credential_logged_out_meanwhile() {
+        assert!(
+            auth_change_survives_refresh(false),
+            "refresh silently restored the credential after logout"
+        );
+    }
+
+    #[test]
+    fn a_refresh_does_not_overwrite_a_login_saved_meanwhile() {
+        assert!(
+            auth_change_survives_refresh(true),
+            "refresh overwrote a newer login with the old account's result"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_credential_about_to_expire_is_refreshed_mid_session() {
         let _env = TestEnv::new();

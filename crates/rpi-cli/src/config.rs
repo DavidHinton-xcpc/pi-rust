@@ -269,6 +269,40 @@ pub fn upsert_oauth_token(
     )
 }
 
+/// Replace `provider_id`'s OAuth token only if the stored one still has the
+/// `expected` access and refresh values. Returns `false`, writing nothing, when
+/// a login or logout replaced or removed it meanwhile, so a late refresh result
+/// never undoes that user action.
+pub fn replace_oauth_token_if_unchanged(
+    provider_id: &str,
+    expected: (&str, &str),
+    access: String,
+    refresh: String,
+    expires: i64,
+) -> Result<bool, ConfigError> {
+    let _store_guard = auth_store_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut store = read_auth()?;
+    let unchanged = matches!(
+        store.get(provider_id),
+        Some(Credential::Oauth { access, refresh, .. })
+            if (access.as_str(), refresh.as_str()) == expected
+    );
+    if unchanged {
+        store.insert(
+            provider_id.to_string(),
+            Credential::Oauth {
+                access,
+                refresh,
+                expires,
+            },
+        );
+        write_auth(&store)?;
+    }
+    Ok(unchanged)
+}
+
 /// Read only the OAuth credential for one provider.
 pub fn read_oauth_token(provider_id: &str) -> Result<Option<Credential>, ConfigError> {
     Ok(match read_auth()?.get(provider_id) {
