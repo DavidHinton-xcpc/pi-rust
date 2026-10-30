@@ -979,8 +979,8 @@ mod tests {
             message.error_message = Some(text.to_string());
             message
         };
-        // These mirror the fixed fail-closed texts in rpi-extensions (provider.rs),
-        // which have exact-text tests there.
+        // These mirror the fixed fail-closed texts in rpi-extensions (provider.rs)
+        // and rpi-plugin-sdk (provider.rs), which have exact-text tests there.
         let texts = [
             "a recorded call has no id",
             "two recorded calls share an id",
@@ -992,7 +992,8 @@ mod tests {
         .map(|reason| {
             format!("plugin provider final message drops a recorded tool call: {reason}")
         });
-        for text in &texts {
+        let sdk = "host does not support recorded tool calls".to_string();
+        for text in texts.iter().chain([&sdk]) {
             assert!(!is_retryable_assistant_error(&error(text)), "{text}");
         }
         assert!(is_retryable_assistant_error(&error(
