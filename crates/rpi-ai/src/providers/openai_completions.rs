@@ -923,6 +923,8 @@ impl StreamState {
     }
 
     async fn push_text(&mut self, producer: &mut AssistantMessageEventStreamProducer, delta: &str) {
+        // Flush before even the start snapshot can expose buffered thinking.
+        self.flush_thinking(producer).await;
         let index = match self.text_index {
             Some(index) => index,
             None => {
