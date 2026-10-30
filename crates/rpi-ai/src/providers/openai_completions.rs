@@ -2002,6 +2002,14 @@ mod tests {
             "https://gateway.test/v1/chat/completions"
         );
         assert_eq!(
+            chat_completions_url("https://gateway.test/proxy"),
+            "https://gateway.test/proxy/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.test/proxy/"),
+            "https://gateway.test/proxy/v1/chat/completions"
+        );
+        assert_eq!(
             chat_completions_url("https://ark.cn-beijing.volces.com/api/coding/v3"),
             "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
         );
