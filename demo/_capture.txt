@@ -1,0 +1,185 @@
+<<<SECTION 01-note-before>>>
+   [38;5;81mℹ[0m [38;5;244mModel set to anthropic/claude-sonnet-4-5 — applies to the next message.[0m[0m]8;;
+
+   [38;5;81mℹ[0m [38;5;244mThinking set to high.[0m[0m]8;;
+
+   [38;5;81mℹ[0m [38;5;244mTheme set to dark (saved).[0m[0m]8;;
+
+   [38;5;81mℹ[0m [38;5;244mReloading extensions + resources…[0m[0m]8;;
+
+   [38;5;81mℹ[0m [38;5;244mSwitched to session 2026-10-24-a1f3.[0m[0m]8;;
+
+<<<SECTION 01-note-after>>>
+   [38;5;179mModel set to anthropic/claude-sonnet-4-5 — applies to the next message.[0m[0m]8;;
+
+   [38;5;179mThinking set to high.[0m[0m]8;;
+
+   [38;5;179mTheme set to dark (saved).[0m[0m]8;;
+
+   [38;5;179mReloading extensions + resources…[0m[0m]8;;
+
+   [38;5;179mSwitched to session 2026-10-24-a1f3.[0m[0m]8;;
+
+<<<SECTION 02-help-before>>>
+ [38;5;179m[1m📚 Available Commands[22m[0m[0m]8;;
+
+   /help, /?       [38;5;242m—[0m  [38;5;244mShow this help message[0m[0m]8;;
+   /clear, /new    [38;5;242m—[0m  [38;5;244mClear the conversation[0m[0m]8;;
+   /version, /v    [38;5;242m—[0m  [38;5;244mShow version information[0m[0m]8;;
+   /model, /m      [38;5;242m—[0m  [38;5;244mChoose a model (live switch)[0m[0m]8;;
+   /hotkeys        [38;5;242m—[0m  [38;5;244mShow keyboard shortcuts[0m[0m]8;;
+<<<SECTION 02-help-after>>>
+ [38;5;179m[1mAvailable Commands[22m[0m[0m]8;;
+
+   /help, /?       [38;5;242m—[0m  [38;5;244mShow this help message[0m[0m]8;;
+   /clear, /new    [38;5;242m—[0m  [38;5;244mClear the conversation[0m[0m]8;;
+   /version, /v    [38;5;242m—[0m  [38;5;244mShow version information[0m[0m]8;;
+   /model, /m      [38;5;242m—[0m  [38;5;244mChoose a model (live switch)[0m[0m]8;;
+   /hotkeys        [38;5;242m—[0m  [38;5;244mShow keyboard shortcuts[0m[0m]8;;
+<<<SECTION 02-version-before>>>
+ [38;5;179m[1m📦 Version Information[22m[0m[0m]8;;
+
+   [38;5;244mrpi-cli[0m [39mv0.8.4[0m[0m]8;;
+   [38;5;242mRust implementation of pi coding agent TUI[0m[0m]8;;
+
+<<<SECTION 02-version-after>>>
+ [38;5;179m[1mVersion Information[22m[0m[0m]8;;
+
+   [38;5;244mrpi-cli[0m [39mv0.8.4[0m[0m]8;;
+   [38;5;242mRust implementation of pi coding agent TUI[0m[0m]8;;
+
+<<<SECTION 02-hotkeys-before>>>
+ [38;5;179m[1m⌨️  Keyboard Shortcuts[22m[0m[0m]8;;
+
+   [38;5;108mEnter[0m  [38;5;242m—[0m  [38;5;244mSend message[0m[0m]8;;
+   [38;5;108mShift+Enter[0m  [38;5;242m—[0m  [38;5;244mNew line[0m[0m]8;;
+   [38;5;108mCtrl+T[0m  [38;5;242m—[0m  [38;5;244mShow/hide reasoning blocks[0m[0m]8;;
+
+<<<SECTION 02-hotkeys-after>>>
+ [38;5;179m[1mKeyboard Shortcuts[22m[0m[0m]8;;
+
+   [38;5;108mEnter[0m  [38;5;242m—[0m  [38;5;244mSend message[0m[0m]8;;
+   [38;5;108mShift+Enter[0m  [38;5;242m—[0m  [38;5;244mNew line[0m[0m]8;;
+   [38;5;108mCtrl+T[0m  [38;5;242m—[0m  [38;5;244mShow/hide reasoning blocks[0m[0m]8;;
+
+<<<SECTION 03-skills-before>>>
+ 🧩 Skills available in this session:
+   • rpi-release — 发布 rpi Rust workspace 的版本：release-plz Release PR
+   • pi-rust-pr — pi-rust PR loop: fixes, probes, gates, CI, replies.
+   Invoke with: /skills <name> [instructions]
+
+<<<SECTION 03-skills-after>>>
+ [38;5;179mSkills available in this session:[0m[0m]8;;
+   • rpi-release — 发布 rpi Rust workspace 的版本：release-plz Release PR
+   • pi-rust-pr — pi-rust PR loop: fixes, probes, gates, CI, replies.
+   Invoke with: /skills <name> [instructions]
+
+<<<SECTION 03-context-before>>>
+ 📂 Discovered resources for this session:
+   Context (2):
+     • /e/rpi/AGENTS.md
+     • /e/rpi/.rpi/AGENTS.md
+   Skills (2):
+     • rpi-release — 发布 rpi Rust workspace 的版本
+     • pi-rust-pr — pi-rust PR loop
+   Prompt templates (1):
+     • /review — Review the current diff
+
+<<<SECTION 03-context-after>>>
+ [38;5;179mDiscovered resources for this session:[0m[0m]8;;
+   Context (2):
+     • /e/rpi/AGENTS.md
+     • /e/rpi/.rpi/AGENTS.md
+   Skills (2):
+     • rpi-release — 发布 rpi Rust workspace 的版本
+     • pi-rust-pr — pi-rust PR loop
+   Prompt templates (1):
+     • /review — Review the current diff
+
+<<<SECTION 04-search-before>>>
+[39m🔍 Search: tool[0m                                                           [38;5;242m1/3[0m  
+<<<SECTION 04-search-after>>>
+[39m Search: tool[0m                                                            [38;5;242m1/3[0m  [0m]8;;
+<<<SECTION 05-error-before>>>
+
+ ❌ Error: 429 rate_limit_exceeded — retry after 12s
+<<<SECTION 05-error-aborted>>>
+
+ ❌ Operation aborted: user pressed Esc
+<<<SECTION 05-error-length>>>
+
+ ⚠️ Response was truncated before completion.
+<<<SECTION 05-error-after>>>
+   [38;5;131m✗[0m [38;5;131m429 rate_limit_exceeded — retry after 12s[0m[0m]8;;
+
+   [38;5;131m✗[0m [38;5;131mOperation aborted: user pressed Esc[0m[0m]8;;
+
+   [38;5;131m✗[0m [38;5;131mResponse was truncated before completion.[0m[0m]8;;
+
+<<<SECTION 06-bash-before>>>
+[48;2;40;44;52m                                                                              [0m
+[48;2;40;44;52m  [38;5;107m[1m$ cargo test --workspace --all-features[22m[0m[48;2;40;44;52m                                     [0m
+[48;2;40;44;52m                                                                              [0m
+[48;2;40;44;52m  [38;5;244m   Compiling rpi-cli v0.8.4[0m[48;2;40;44;52m[0m[48;2;40;44;52m]8;;                                                 [0m
+[48;2;40;44;52m  [38;5;108m●[0m[48;2;40;44;52m [38;5;244m0.0s[0m[48;2;40;44;52m                                                                      [0m
+[48;2;40;44;52m                                                                              [0m
+
+ [38;5;244m⏸[0m Esc / Ctrl+C 中止[0m]8;;
+<<<SECTION 06-bash-after>>>
+[48;2;40;44;52m                                                                              [0m
+[48;2;40;44;52m  [38;5;107m[1m$ cargo test --workspace --all-features[22m[0m[48;2;40;44;52m                                     [0m
+[48;2;40;44;52m                                                                              [0m
+[48;2;40;44;52m  [38;5;244m   Compiling rpi-cli v0.8.4[0m[48;2;40;44;52m[0m[48;2;40;44;52m]8;;                                                 [0m
+[48;2;40;44;52m  [38;5;108m●[0m[48;2;40;44;52m [38;5;244m0.0s[0m[48;2;40;44;52m                                                                      [0m
+[48;2;40;44;52m                                                                              [0m
+
+ [38;5;244m↳[0m Esc / Ctrl+C 中止[0m]8;;
+<<<SECTION 07-lockup>>>
+      [38;5;108m██[0m
+      [38;5;108m██[0m
+   [38;5;242m██[0m [38;5;108m██[0m
+   [38;5;242m██[0m [38;5;108m██[0m [38;5;242m██[0m
+   [38;5;242m██[0m [38;5;108m██[0m [38;5;242m██[0m   [38;5;108m[1mrpi[22m[0m [38;5;244m·[0m 🦀
+<<<SECTION 07-lockup-no-crab>>>
+ [38;5;108m[1mrpi[22m[0m[0m]8;;
+<<<SECTION 07-md-tasks>>>
+ 发布前检查：
+
+   [38;5;108m☒[0m 跑完 [48;2;48;52;59m [38;2;138;190;183mcargo test --workspace[0m[48;2;48;52;59m [0m[0m]8;;
+   [38;5;108m☒[0m 更新 [48;2;48;52;59m [38;2;138;190;183mCHANGELOG.md[0m[48;2;48;52;59m [0m[0m]8;;
+   [38;5;108m☐[0m 打 tag [48;2;48;52;59m [38;2;138;190;183mv0.8.5[0m[48;2;48;52;59m [0m[0m]8;;
+   [38;5;108m☐[0m 写 GitHub Release
+
+ 普通无序列表：
+
+   [38;5;108m•[0m first item
+   [38;5;108m•[0m second item
+<<<SECTION 08-fold-before>>>
+   [38;5;179mModel set to anthropic/claude-sonnet-4-5 — applies to the next message.[0m[0m]8;;
+
+   [38;5;179mThinking set to high.[0m[0m]8;;
+
+   [38;5;179mTheme set to dark (saved).[0m[0m]8;;
+
+   [38;5;179mProvider switched to openrouter (model qwen3-coder) — applies to the next m[0m]8;;
+ [38;5;179message. Default saved.[0m[0m]8;;
+
+   [38;5;179mReloading extensions + resources…[0m[0m]8;;
+
+   [38;5;179mSwitched to session 2026-10-24-a1f3.[0m[0m]8;;
+
+   [38;5;179mCopied last reply to the clipboard.[0m[0m]8;;
+
+   [38;5;179mConversation compacted.[0m[0m]8;;
+
+   [38;5;179mModel set to openrouter/qwen3-coder-480b — applies to the next message.[0m[0m]8;;
+
+   [38;5;179mTheme set to light (saved).[0m[0m]8;;
+
+   [38;5;179mThinking set to medium.[0m[0m]8;;
+
+<<<SECTION 08-fold-after>>>
+   [38;5;179mThinking set to medium.[0m[0m]8;;
+<<<SECTION footer>>>
+[38;5;242m/e/rpi (main)[0m
+↑12k ↓3.2k R86k W5.2k [38;5;244m31.0%/200k (auto)[0m               [38;5;242mclaude-sonnet-4-5 • high[0m
