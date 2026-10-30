@@ -292,6 +292,49 @@ async fn ordinary_calls_still_execute_next_to_a_recorded_call() {
     assert!(!by_id("ordinary").is_error);
 }
 
+/// An explicit retry is a new call with no recording, so it runs, even when it
+/// repeats a recorded call's arguments. A recording is never inherited.
+#[tokio::test]
+async fn an_explicit_retry_of_a_recorded_call_runs_once() {
+    let (tool, executions) = ShellTool::new();
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: vec![Arc::new(tool)],
+    };
+    let script = vec![
+        assistant_with(vec![streamed_call(
+            "replayed",
+            "git push",
+            Some(worker_recording("rejected", true, None)),
+        )]),
+        assistant_with(vec![streamed_call("retry", "git push", None)]),
+        common::assistant_text("done", StopReason::Stop),
+    ];
+    let (_events, new_messages) = run_and_collect(
+        vec![user_message("push it")],
+        context,
+        base_config(),
+        mock_stream_fn(script),
+    )
+    .await;
+    let results: Vec<_> = new_messages
+        .into_iter()
+        .filter_map(|message| match message {
+            rpi_agent::AgentMessage::ToolResult(result) => Some(*result),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(*executions.lock().expect("executions lock"), 1);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].tool_call_id, "replayed");
+    assert!(results[0].is_error);
+    assert_eq!(text_of(&results[0]), "rejected");
+    assert_eq!(results[1].tool_call_id, "retry");
+    assert_eq!(text_of(&results[1]), "executed locally");
+}
+
 #[tokio::test]
 async fn approval_hooks_never_see_or_gate_a_recorded_call() {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
