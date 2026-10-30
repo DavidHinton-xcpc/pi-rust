@@ -15,11 +15,12 @@
 //! ## Request/response envelope
 //!
 //! - **Request** (borrowed `StbStringRef` handed to `request_fn`): JSON
-//!   `{ model, context, options }`, where `model`/`context` are the serde
-//!   serializations of [`Model`](rpi_ai::Model)/[`Context`](rpi_ai::Context)
-//!   and `options` is a hand-built JSON of the [`SimpleStreamOptions`] fields
+//!   `{ model, context, options, capabilities }`, where `model`/`context` are
+//!   the serde serializations of [`Model`](rpi_ai::Model)/[`Context`](rpi_ai::Context),
+//!   `options` is a hand-built JSON of the [`SimpleStreamOptions`] fields
 //!   (that type is not `Serialize`; we mirror the field set
-//!   [`ExtensionProviderHooks`](crate::ExtensionProviderHooks) dispatches).
+//!   [`ExtensionProviderHooks`](crate::ExtensionProviderHooks) dispatches),
+//!   and `capabilities` is `{ "recordedToolCalls": 1 }`.
 //! - **Response** (the plugin-owned `out` `StbString`): an
 //!   [`AssistantMessage`] JSON. The host reclaims `out` via the plugin's
 //!   `plugin_free_string` (traveled with the registration), parses the JSON, and
@@ -237,15 +238,7 @@ async fn drive_plugin_provider(
         );
     }
 
-    // Build the request envelope JSON. `Model`/`Context` are Serialize;
-    // `SimpleStreamOptions` is not, so the `options` object is hand-built
-    // (mirrors `ExtensionProviderHooks::before_request`).
-    let request = serde_json::json!({
-        "model": serde_json::to_value(model).unwrap_or(serde_json::Value::Null),
-        "context": serde_json::to_value(ctx).unwrap_or(serde_json::Value::Null),
-        "options": options_json(opts),
-    });
-    let request_json = request.to_string();
+    let request_json = request_envelope_json(model, ctx, opts);
 
     // The fn pointers + user_data are `Copy`-able (fn ptrs) or plain raw (ud);
     // clone what spawn_blocking needs. `record` is `Clone` (owned strings).
@@ -1001,13 +994,21 @@ fn api_from_style(style: &str) -> rpi_ai::types::Api {
         .unwrap_or_else(|_| rpi_ai::types::Api::Other(style.to_string()))
 }
 
-/// Build the `{ model, context, options }` request envelope shared by the
-/// one-shot and streaming provider paths.
+/// Build the `{ model, context, options, capabilities }` request envelope
+/// shared by the one-shot and streaming provider paths. `Model`/`Context` are
+/// Serialize; `SimpleStreamOptions` is not, so the `options` object is
+/// hand-built (mirrors `ExtensionProviderHooks::before_request`).
+///
+/// `capabilities` names host behavior a plugin must not assume from the ABI
+/// version alone. `recordedToolCalls` is the `recorded` version this host
+/// decodes and never executes. A host without the key ignores `recorded` and
+/// runs the call, so a plugin must not send `recorded` unless it is present.
 fn request_envelope_json(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> String {
     serde_json::json!({
         "model": serde_json::to_value(model).unwrap_or(serde_json::Value::Null),
         "context": serde_json::to_value(ctx).unwrap_or(serde_json::Value::Null),
         "options": options_json(opts),
+        "capabilities": { "recordedToolCalls": 1 },
     })
     .to_string()
 }
@@ -2319,5 +2320,93 @@ mod tests {
         .await;
         let text = error.error_message.unwrap_or_default();
         assert!(text.contains("returned error code 7"), "{text}");
+    }
+
+    /// The request envelopes a capturing provider has seen.
+    type SeenRequests = Mutex<Vec<serde_json::Value>>;
+
+    fn seen(req: StbStringRef, user_data: *mut c_void) {
+        let seen = unsafe { &*(user_data as *const SeenRequests) };
+        let request = serde_json::from_str(unsafe { req.as_str() }).expect("request JSON");
+        seen.lock().unwrap().push(request);
+    }
+
+    extern "C" fn capturing_request(
+        req: StbStringRef,
+        out: *mut StbString,
+        user_data: *mut c_void,
+    ) -> i32 {
+        seen(req, user_data);
+        let message = AssistantMessage::empty(rpi_ai::types::Api::Faux, "pluggy", "m", 0);
+        unsafe { *out = StbString::from_string(serde_json::to_string(&message).unwrap()) };
+        0
+    }
+
+    extern "C" fn capturing_stream(
+        req: StbStringRef,
+        _emit: Option<rpi_plugin_sdk::ProviderStreamEmitFn>,
+        _emit_user_data: *mut c_void,
+        _control: *const rpi_plugin_sdk::ProviderStreamControl,
+        _completion: Option<rpi_plugin_sdk::ProviderStreamCompletionFn>,
+        _completion_user_data: *mut c_void,
+        out: *mut StbString,
+        user_data: *mut c_void,
+    ) -> i32 {
+        capturing_request(req, out, user_data)
+    }
+
+    /// A plugin may only send `recorded` to a host that honors it: an older
+    /// host ignores the key and runs the call. Both request paths therefore
+    /// advertise the recording version this host decodes, and a plugin that
+    /// finds no such capability must not send `recorded`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_request_paths_advertise_recorded_tool_calls() {
+        let requests = Box::new(SeenRequests::default());
+        for stream_fn in [
+            None,
+            Some(capturing_stream as rpi_plugin_sdk::ProviderStreamRequestFn),
+        ] {
+            let record = RegisteredProvider {
+                provider_id: "pluggy".to_string(),
+                base_url: "https://example".to_string(),
+                api_style: "faux".to_string(),
+                request_fn: capturing_request,
+                stream_fn,
+                plugin_free_string: stub_free,
+                user_data: &*requests as *const SeenRequests as *mut c_void,
+            };
+            let mut registry = ExtensionRegistry::new();
+            registry.register_provider(record.clone());
+            let provider = PluggableProvider::new(
+                record,
+                Arc::new(registry.snapshot()),
+                PluginKeepalive::empty(),
+                Handle::current(),
+            );
+            let model = Model::new(
+                "m",
+                "M",
+                rpi_ai::types::Api::Faux,
+                "pluggy",
+                "https://example",
+            );
+            let mut stream = provider
+                .stream_simple(
+                    &model,
+                    &Context::new(Vec::new()),
+                    &SimpleStreamOptions::default(),
+                )
+                .await;
+            while stream.next().await.is_some() {}
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(
+                request["capabilities"],
+                serde_json::json!({ "recordedToolCalls": 1 }),
+                "{request}"
+            );
+        }
     }
 }
