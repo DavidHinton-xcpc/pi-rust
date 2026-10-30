@@ -1004,9 +1004,10 @@ fn api_from_style(style: &str) -> rpi_ai::types::Api {
 /// hand-built (mirrors `ExtensionProviderHooks::before_request`).
 ///
 /// `capabilities` names host behavior a plugin must not assume from the ABI
-/// version alone. `recordedToolCalls` is the `recorded` version this host
-/// decodes and never executes. A host without the key ignores `recorded` and
-/// runs the call, so a plugin must not send `recorded` unless it is present.
+/// version alone. `recordedToolCalls` is the highest `recorded` version this
+/// host decodes (every version from 1 up to it) and never executes. A host
+/// without the key ignores `recorded` and runs the call, so a plugin must not
+/// send `recorded` unless the value is at least 1.
 fn request_envelope_json(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> String {
     serde_json::json!({
         "model": serde_json::to_value(model).unwrap_or(serde_json::Value::Null),

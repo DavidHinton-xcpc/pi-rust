@@ -386,23 +386,34 @@ extern "C" fn on_before_agent_start(
 `recorded` 的形状与 Cursor replay worker 发出的一致：
 `{"version":1,"isError":false,"result":{"content":[{"type":"text","text":"..."}],"details":{},"terminate":true}}`。
 `result.content` 只允许 `text` 和 `image` 块；`result.details` 与 `result.terminate` 可省略。
-`terminate: true` 会像实时工具结果一样结束这一批工具调用。只有 `{"version":1}` 这类残缺记录
+`terminate: true` 会像实时工具结果一样结束这一批工具调用。`{"version":1}` 这类残缺记录
 （崩溃前写入）、版本不是 `1` 的记录、字段为 `null`、含未知顶层字段或形状不合法的记录，都会被
 宿主当作错误工具结果返回，同样不执行。只有在调用确实已经发生
 过时才能带 `recorded`；不带该字段的调用行为与以前完全一致。
 
 **先检查宿主能力。** 不认识 `recorded` 的旧宿主会忽略这个字段，在本地执行调用；C ABI
-没有变化也挡不住这一点。请求信封顶层的 `capabilities` 对象说明宿主支持什么：只有
-`capabilities.recordedToolCalls` 为 `1`（宿主能解码的 `recorded` 版本）时，插件才可以发送
+没有变化也挡不住这一点。请求信封顶层的 `capabilities` 对象说明宿主支持什么：
+`capabilities.recordedToolCalls` 是宿主能解码的最高 `recorded` 版本，宣告 `n` 表示能解码
+`1` 到 `n` 的每个版本。插件只有在该值 `>= 1`（且不小于自己发送的 `version`）时才可以发送
 `recorded`。没有这个键就是旧宿主，插件不得发送 `recorded`，应让这一轮以错误结束，而不是把
 已经执行过的调用当普通调用交给宿主。
 
+用 SDK 桥接（`export_provider!`、`provider::drive`、`provider::drive_with_context`）写的
+provider 由桥接执行这条检查：宿主没有宣告 `recordedToolCalls >= 1` 时，含 `recorded` 调用、
+本可执行的最终消息会变成 `Error` 终态（文本为 `host does not support recorded tool calls`，
+不带内容，保留用量）。工厂在桥接调用期间可以用 `provider::host_capabilities()` 读取本次请求的
+`capabilities`（旧宿主为 `null`），再交给它构造的 provider。它只在请求线程上有值，其他线程
+（包括 `drive_with_context` 下 provider 自己 spawn 的任务）都读到 `null`，所以要在工厂里读取并保存。
+桥接自己的检查直接读请求，不受影响。桥接会把 `recorded` 同时放进
+`toolcall_end` 块和 `out`。
+
 **`recorded` 与最终 `out`。** 宿主执行的是 `out` 里的调用，所以终态之前会用 `out` 核对每个在
 `toolcall_end` 上带过 `recorded` 的调用：按 `id` 找到 `out` 中的同一调用，并要求 `name` 与
-`arguments` 相同。该调用在 `out` 中没有 `recorded` 键时，宿主补上流中的记录（显式 `null`
-也照样补上，仍是错误结果、不执行）；两边记录相同则不变。以下任一情况都会让这一轮以
-`Error` 终态结束，本地不执行任何调用：`out` 中没有该 `id`、同一 `id` 出现多次、`name` 或
-`arguments` 不同、记录不同，或带 `recorded` 的 `toolcall_end` 没有 `id`。只在 `out` 中带
+`arguments` 相同（按 JSON 值比较：对象键顺序无关，但 `1` 与 `1.0` 不同）。该调用在 `out`
+中没有 `recorded` 键时，宿主补上流中的记录（显式 `null` 也照样补上，仍是错误结果、不执行）；
+两边记录相同则不变。以下任一情况都会让这一轮以 `Error` 终态结束，本地不执行任何调用：`out`
+中没有该 `id`、同一 `id` 出现多次、`name` 或 `arguments` 不同、记录不同，或带 `recorded` 的
+`toolcall_end` 没有 `id`。错误文本是固定的，不含调用 `id`，以免被当作可重试的瞬时错误。只在 `out` 中带
 `recorded` 同样有效。插件返回非零、`out` 为空或无法解析、请求被取消时，终态本来就是
 `Error`/`Aborted`，不会执行任何调用。建议在 `toolcall_end` 和 `out` 中带同一份 `recorded`。
 
