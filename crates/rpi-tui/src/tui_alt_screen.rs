@@ -1157,21 +1157,24 @@ impl TuiAltScreen {
 
         // Render layout frame. Components inside the frame read the geometry
         // this renderer polled (frame-scoped), not the process-wide cache.
-        let frame = if reuse_scroll_content {
-            crate::terminal_image::with_frame_cell_geometry(cells, || {
+        // EVERY component that can size an image renders inside this one
+        // scope, overlays included: the body frame and the overlays of the
+        // same frame must be laid out for the same cell geometry, or an
+        // overlay image keeps the old row count while the body below it has
+        // already resized.
+        let (frame, mut visible) = crate::terminal_image::with_frame_cell_geometry(cells, || {
+            let frame = if reuse_scroll_content {
                 render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
-            })
-        } else {
-            crate::terminal_image::with_frame_cell_geometry(cells, || {
+            } else {
                 render_layout_frame(root_component.clone(), width, height)
-            })
-        };
-
-        // Get screen lines and composite modal overlays above the layout.
-        let mut visible = frame.lines.clone();
-        self.jump_to_end
-            .paint(&frame, &mut visible, self.has_overlay());
-        self.paint_overlays(&mut visible, width, height);
+            };
+            // Get screen lines and composite modal overlays above the layout.
+            let mut visible = frame.lines.clone();
+            self.jump_to_end
+                .paint(&frame, &mut visible, self.has_overlay());
+            self.paint_overlays(&mut visible, width, height);
+            (frame, visible)
+        });
 
         // Cursor markers are an internal layout protocol, not terminal output.
         // Extract the location first, then strip every marker before diffing or
