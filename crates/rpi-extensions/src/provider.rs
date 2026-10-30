@@ -624,10 +624,14 @@ async fn drive_streaming_plugin_provider(
             message.stop_reason,
             rpi_ai::types::StopReason::Error | rpi_ai::types::StopReason::Aborted
         ) {
-            message = error_message(
-                record,
-                &format!("plugin provider {} {reason}", record.provider_id),
-            );
+            // Constant text: the harness retries errors whose text looks
+            // transient, and plugin-chosen ids or names could match that.
+            let text =
+                format!("plugin provider final message drops a recorded tool call: {reason}");
+            message = AssistantMessage {
+                usage: message.usage,
+                ..error_message(record, &text)
+            };
         }
     }
     if message.provider.is_empty() {
@@ -1400,11 +1404,16 @@ impl StreamMapper {
     /// with no id, two recorded calls or two final calls sharing an id, a final
     /// message without the id, a different name or arguments, or a different
     /// recording. Calls never reported as recorded are left alone.
-    fn reconcile_recorded(&self, message: &mut AssistantMessage) -> Result<(), String> {
+    fn reconcile_recorded(&self, message: &mut AssistantMessage) -> Result<(), &'static str> {
         for observed in &self.recorded_calls {
             let id = &observed.id;
+            let reject = |reason: &'static str| {
+                // The id stays out of the error text (see the driver); log it.
+                tracing::warn!(tool_call_id = %id, reason, "plugin provider final message drops a recorded tool call");
+                Err(reason)
+            };
             if id.is_empty() {
-                return Err("streamed a recorded tool call without an id".into());
+                return reject("a recorded call has no id");
             }
             if self
                 .recorded_calls
@@ -1413,33 +1422,25 @@ impl StreamMapper {
                 .count()
                 > 1
             {
-                return Err(format!("streamed two recorded tool calls with id {id:?}"));
+                return reject("two recorded calls share an id");
             }
             let mut finals = message.content.iter_mut().filter_map(|block| match block {
                 Content::ToolCall(call) if &call.id == id => Some(call),
                 _ => None,
             });
             let Some(call) = finals.next() else {
-                return Err(format!(
-                    "final message is missing recorded tool call {id:?}"
-                ));
+                return reject("the call is missing");
             };
             if finals.next().is_some() {
-                return Err(format!("final message repeats recorded tool call {id:?}"));
+                return reject("the call is repeated");
             }
             if call.name != observed.name || call.arguments != observed.arguments {
-                return Err(format!(
-                    "final message changes the name or arguments of recorded tool call {id:?}"
-                ));
+                return reject("its name or arguments changed");
             }
             match &call.recorded {
                 None => call.recorded = observed.recorded.clone(),
                 Some(recorded) if Some(recorded) == observed.recorded.as_ref() => {}
-                Some(_) => {
-                    return Err(format!(
-                        "final message has a different recording for tool call {id:?}"
-                    ))
-                }
+                Some(_) => return reject("its recording differs"),
             }
         }
         Ok(())
@@ -2152,37 +2153,37 @@ mod tests {
                 "different recording",
                 vec![end_chunk(0, "c1", recorded())],
                 vec![final_call("c1", Some(recording("other")))],
-                "different recording",
+                "its recording differs",
             ),
             (
                 "null versus recording",
                 vec![end_chunk(0, "c1", Some(serde_json::Value::Null))],
                 vec![final_call("c1", recorded())],
-                "different recording",
+                "its recording differs",
             ),
             (
                 "missing id",
                 vec![end_chunk(0, "c1", recorded())],
                 vec![final_call("c2", None)],
-                "missing",
+                "the call is missing",
             ),
             (
                 "renamed",
                 vec![end_chunk(0, "c1", recorded())],
                 vec![renamed],
-                "name or arguments",
+                "its name or arguments changed",
             ),
             (
                 "new arguments",
                 vec![end_chunk(0, "c1", recorded())],
                 vec![new_arguments],
-                "name or arguments",
+                "its name or arguments changed",
             ),
             (
                 "duplicate final id",
                 vec![end_chunk(0, "c1", recorded())],
                 vec![final_call("c1", None), final_call("c1", None)],
-                "repeats",
+                "the call is repeated",
             ),
             (
                 "duplicate streamed id",
@@ -2191,24 +2192,25 @@ mod tests {
                     end_chunk(1, "c1", Some(recording("other"))),
                 ],
                 vec![final_call("c1", None)],
-                "two recorded",
+                "two recorded calls share an id",
             ),
             (
                 "no id",
                 vec![end_chunk(0, "", recorded())],
                 vec![final_call("", None)],
-                "without an id",
+                "a recorded call has no id",
             ),
         ];
         for (case, chunks, calls, reason) in cases {
             let mapper = mapper_after(chunks);
             let mut message = final_with(calls);
             let error = mapper.reconcile_recorded(&mut message).expect_err(case);
-            assert!(error.contains(reason), "{case}: {error}");
+            assert_eq!(error, reason, "{case}");
         }
     }
 
     /// The bytes a scripted streaming plugin emits and returns.
+    #[derive(Default)]
     struct ScriptedStream {
         chunks: Vec<serde_json::Value>,
         out: String,
@@ -2297,15 +2299,22 @@ mod tests {
     /// sees an executable copy of the call.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_contradicting_final_message_fails_the_turn() {
+        let mut out = final_with(vec![final_call("c2", None)]);
+        out.usage.input = 11;
+        out.usage.output = 7;
         let error = error_terminal(ScriptedStream {
             chunks: recorded_stream(),
-            out: serde_json::to_string(&final_with(vec![final_call("c2", None)])).unwrap(),
-            rc: 0,
+            out: serde_json::to_string(&out).unwrap(),
+            ..Default::default()
         })
         .await;
         assert!(error.content.is_empty(), "{error:?}");
-        let text = error.error_message.unwrap_or_default();
-        assert!(text.contains("missing recorded tool call \"c1\""), "{text}");
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("plugin provider final message drops a recorded tool call: the call is missing")
+        );
+        // The plugin's usage for the turn is still reported.
+        assert_eq!(error.usage, out.usage);
     }
 
     /// A plugin that fails after streaming a recorded call keeps its own error:
@@ -2314,8 +2323,8 @@ mod tests {
     async fn a_failed_request_keeps_its_own_error_after_a_recorded_call() {
         let error = error_terminal(ScriptedStream {
             chunks: recorded_stream(),
-            out: String::new(),
             rc: 7,
+            ..Default::default()
         })
         .await;
         let text = error.error_message.unwrap_or_default();
