@@ -270,12 +270,12 @@ pub fn upsert_oauth_token(
 }
 
 /// Replace `provider_id`'s OAuth token only if the stored one still has the
-/// `expected` access and refresh values. Returns `false`, writing nothing, when
+/// `expected` access, refresh and expiry. Returns `false`, writing nothing, when
 /// a login or logout replaced or removed it meanwhile, so a late refresh result
 /// never undoes that user action.
 pub fn replace_oauth_token_if_unchanged(
     provider_id: &str,
-    expected: (&str, &str),
+    expected: (&str, &str, i64),
     access: String,
     refresh: String,
     expires: i64,
@@ -286,8 +286,8 @@ pub fn replace_oauth_token_if_unchanged(
     let mut store = read_auth()?;
     let unchanged = matches!(
         store.get(provider_id),
-        Some(Credential::Oauth { access, refresh, .. })
-            if (access.as_str(), refresh.as_str()) == expected
+        Some(Credential::Oauth { access, refresh, expires })
+            if (access.as_str(), refresh.as_str(), *expires) == expected
     );
     if unchanged {
         store.insert(

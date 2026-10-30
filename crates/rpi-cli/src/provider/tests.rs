@@ -398,10 +398,11 @@ mod package_oauth_refresh {
         assert_eq!(refreshes(), 100);
     }
 
-    /// Runs a login (`replace_login`) or a logout while a refresh of the same
-    /// provider is paused inside the package, then reports whether the user's
-    /// action survived. The worker is always released and joined first.
-    fn auth_change_survives_refresh(replace_login: bool) -> bool {
+    /// Runs a login (`Some((access, refresh, expires))`) or a logout (`None`)
+    /// while a refresh of the same provider is paused inside the package, then
+    /// reports whether the user's action survived. The worker is always released
+    /// and joined first.
+    fn auth_change_survives_refresh(login: Option<(&str, &str, i64)>) -> bool {
         use rpi_runtime::credentials::OAuthRefresher;
         let _env = TestEnv::new();
         let _reset = session(true);
@@ -416,32 +417,33 @@ mod package_oauth_refresh {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let entered = SLOW_ENTERED.load(SeqCst);
-        if replace_login {
-            config::upsert_oauth_token(
-                "acme",
-                "new-login-access".into(),
-                "new-login-refresh".into(),
-                FRESH_EXPIRY,
-            )
-            .unwrap();
-        } else {
-            assert!(config::delete_credential("acme").unwrap());
+        match login {
+            Some((access, refresh, expires)) => {
+                config::upsert_oauth_token("acme", access.into(), refresh.into(), expires).unwrap()
+            }
+            None => assert!(config::delete_credential("acme").unwrap()),
         }
         SLOW_RELEASE.store(true, SeqCst);
         let _ = worker.join().unwrap();
         assert!(entered, "refresh callback did not start");
         let stored = config::read_oauth_token("acme").unwrap();
-        if replace_login {
-            matches!(stored, Some(config::Credential::Oauth { access, refresh, .. }) if access == "new-login-access" && refresh == "new-login-refresh")
-        } else {
-            stored.is_none()
+        match login {
+            Some(expected) => matches!(
+                stored,
+                Some(config::Credential::Oauth {
+                    access,
+                    refresh,
+                    expires,
+                }) if (access.as_str(), refresh.as_str(), expires) == expected
+            ),
+            None => stored.is_none(),
         }
     }
 
     #[test]
     fn a_refresh_does_not_restore_a_credential_logged_out_meanwhile() {
         assert!(
-            auth_change_survives_refresh(false),
+            auth_change_survives_refresh(None),
             "refresh silently restored the credential after logout"
         );
     }
@@ -449,8 +451,21 @@ mod package_oauth_refresh {
     #[test]
     fn a_refresh_does_not_overwrite_a_login_saved_meanwhile() {
         assert!(
-            auth_change_survives_refresh(true),
+            auth_change_survives_refresh(Some((
+                "new-login-access",
+                "new-login-refresh",
+                FRESH_EXPIRY
+            ))),
             "refresh overwrote a newer login with the old account's result"
+        );
+    }
+
+    /// Review #144 reproduction: same tokens as the refresh started from, new expiry.
+    #[test]
+    fn a_refresh_does_not_overwrite_a_login_with_the_same_tokens_and_a_new_expiry() {
+        assert!(
+            auth_change_survives_refresh(Some(("old-access", "blocked-refresh", FRESH_EXPIRY))),
+            "refresh overwrote a login with the same tokens and a new expiry"
         );
     }
 

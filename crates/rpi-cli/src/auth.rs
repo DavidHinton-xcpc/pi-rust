@@ -257,7 +257,7 @@ fn refresh_stored_oauth(
     if refresh.trim().is_empty() {
         return Err(RefreshError::Invalid);
     }
-    let started_from = (access.clone(), refresh.clone());
+    let started_from = (access.clone(), refresh.clone(), expires);
     let response = rpi_extensions::request_oauth(
         snapshot,
         provider,
@@ -293,7 +293,7 @@ fn refresh_stored_oauth(
     };
     let committed = config::replace_oauth_token_if_unchanged(
         provider,
-        (&started_from.0, &started_from.1),
+        (&started_from.0, &started_from.1, started_from.2),
         token.access.clone(),
         refresh,
         token.expires_at,
