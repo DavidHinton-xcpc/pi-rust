@@ -116,13 +116,14 @@ fn assistant_with(content: Vec<Content>) -> AssistantMessage {
 /// Run one assistant turn carrying `content`, then return the executions count
 /// and every tool result the loop committed, in order.
 async fn run_turn(content: Vec<Content>) -> (usize, Vec<rpi_ai::types::ToolResultMessage>) {
-    run_turn_with(content, None).await
+    run_turn_with(content, None, None).await
 }
 
-/// [`run_turn`] with an optional `before_tool_call` hook installed.
+/// [`run_turn`] with optional `before_tool_call` and `after_tool_call` hooks.
 async fn run_turn_with(
     content: Vec<Content>,
     before: Option<rpi_agent::BeforeToolCall>,
+    after: Option<rpi_agent::AfterToolCall>,
 ) -> (usize, Vec<rpi_ai::types::ToolResultMessage>) {
     let (tool, executions) = ShellTool::new();
     let context = AgentContext {
@@ -136,6 +137,7 @@ async fn run_turn_with(
     ];
     let mut config = base_config();
     config.before_tool_call = before;
+    config.after_tool_call = after;
     let (_events, new_messages) = run_and_collect(
         vec![user_message("run it")],
         context,
@@ -350,6 +352,41 @@ async fn approval_hooks_never_see_or_gate_a_recorded_call() {
             streamed_call("recorded", "rm -rf target", Some(recording)),
             streamed_call("ordinary", "echo hi", None),
         ],
+        Some(hook),
+        None,
+    )
+    .await;
+
+    assert_eq!(executed, 1);
+    assert_eq!(
+        *seen.lock().expect("seen lock"),
+        vec!["ordinary".to_string()]
+    );
+    let recorded = results
+        .iter()
+        .find(|r| r.tool_call_id == "recorded")
+        .unwrap();
+    assert_eq!(text_of(recorded), "recorded output");
+}
+
+#[tokio::test]
+async fn after_tool_call_never_sees_a_recorded_call() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hook_seen = Arc::clone(&seen);
+    let hook: rpi_agent::AfterToolCall = Arc::new(move |ctx, _signal| {
+        hook_seen
+            .lock()
+            .expect("seen lock")
+            .push(ctx.tool_call.id.clone());
+        Box::pin(async move { None })
+    });
+    let recording = worker_recording("recorded output", false, Some(true));
+    let (executed, results) = run_turn_with(
+        vec![
+            streamed_call("recorded", "rm -rf target", Some(recording)),
+            streamed_call("ordinary", "echo hi", None),
+        ],
+        None,
         Some(hook),
     )
     .await;
