@@ -1904,4 +1904,38 @@ mod tests {
         );
         assert_eq!(tool_call.arguments["command"], "rm -rf target");
     }
+
+    /// A plugin written before `recorded` existed sends `toolcall_end` without
+    /// the key. Its call must stay an ordinary call that the loop executes.
+    #[test]
+    fn tool_call_end_without_a_recording_is_an_ordinary_call() {
+        let mut mapper = StreamMapper::new(rpi_ai::types::Api::Faux, "pluggy".into(), "m".into());
+        let mut ends = Vec::new();
+        for chunk in [
+            serde_json::json!({"type":"toolcall_start","contentIndex":0,"id":"c1","name":"echo"}),
+            serde_json::json!({"type":"toolcall_end","contentIndex":0,"id":"c1","name":"echo","arguments":{"text":"hi"}}),
+        ] {
+            if let Some(event) = mapper.apply(chunk) {
+                if let AssistantMessageEvent::ToolCallEnd { tool_call, .. } = event {
+                    ends.push(tool_call);
+                }
+            }
+            while let Some(deferred) = mapper.take_deferred() {
+                if let Some(AssistantMessageEvent::ToolCallEnd { tool_call, .. }) =
+                    mapper.apply(deferred)
+                {
+                    ends.push(tool_call);
+                }
+            }
+        }
+        let [tool_call] = ends.as_slice() else {
+            panic!("expected one ToolCallEnd, got {}", ends.len());
+        };
+        assert_eq!(tool_call.recorded, None);
+        assert!(serde_json::to_value(tool_call)
+            .unwrap()
+            .get("recorded")
+            .is_none());
+        assert_eq!(tool_call.arguments["text"], "hi");
+    }
 }
