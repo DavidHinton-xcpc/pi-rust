@@ -1322,8 +1322,9 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// Same request envelope and final-response contract as [`ProviderRequestFn`],
 /// plus a per-chunk channel and the cancellation protocol:
 ///
-/// - `req_json` — borrowed `{ model, context, options }` envelope (never freed by
-///   the plugin).
+/// - `req_json` — borrowed `{ model, context, options, capabilities }` envelope
+///   (never freed by the plugin). `capabilities` is absent on hosts that predate
+///   it; see `recorded` below.
 /// - `emit` + `emit_user_data` — the host's per-chunk callback. `emit` is `None`
 ///   only if the host cannot accept chunks; a plugin then degrades to buffering
 ///   and returning the message through `out`. While the caller is cancelled the
@@ -1372,6 +1373,20 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// Unknown `type` values are ignored (forward compatibility). A `*_delta` may
 /// carry an optional `partial` object (a full assistant message) to override the
 /// host-side accumulated snapshot; otherwise the host accumulates deltas itself.
+///
+/// A `toolcall_end` may carry `recorded` when the call already ran upstream: the
+/// host then uses the recording as the tool result and never executes the call
+/// locally. Its shape is `{"version":1,"isError":false,"result":{"content":[...],"terminate":false}}`,
+/// and a call without the key executes as usual. A host that predates
+/// `recorded` ignores it and executes the call, so a plugin may send `recorded`
+/// only when the request's top-level `capabilities.recordedToolCalls` is at
+/// least `1`. That value is the highest recording version the host decodes; a
+/// host that advertises `n` decodes every version from `1` to `n`. The
+/// `provider` bridge applies this check itself.
+/// The host holds `out` to every recorded `toolcall_end`: a final call with the
+/// same `id`, `name` and `arguments` but no `recorded` key gets the streamed
+/// recording, and a missing, repeated or conflicting call ends the turn with an
+/// error instead of running it.
 pub type ProviderStreamRequestFn = extern "C" fn(
     req_json: StbStringRef,
     emit: Option<ProviderStreamEmitFn>,

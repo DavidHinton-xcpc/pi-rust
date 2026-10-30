@@ -177,6 +177,12 @@ multiple providers, keep one `export_plugin!` entrypoint and use
 `provider::register` and `provider::drive` for each provider instead.
 The bridge forwards streaming events, honors host cancellation and owns a
 per-request runtime, so no worker survives plugin unloading.
+`provider::host_capabilities()` returns the request's `capabilities` object
+(`null` on older hosts) on the request thread while the bridge is driving it, so
+a factory can pass it to its provider. On any other thread, including tasks
+spawned under `drive_with_context`, it is `null`; read it in the factory. A provider may set `ToolCall::recorded` only when
+`recordedToolCalls` is at least `1`; on a host without it, the bridge turns a
+final message carrying a recorded call into an error.
 
 The `provider` feature enables `json` and the AI, Tokio and HTTP dependencies.
 It is **off by default**; tool-only plugins retain the lightweight ABI SDK,

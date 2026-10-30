@@ -282,6 +282,7 @@ mod tests {
                         name: "tool".into(),
                         arguments: serde_json::json!({"x": 1}),
                         thought_signature: None,
+                        recorded: None,
                     },
                     partial: message.clone(),
                 },

@@ -1099,6 +1099,7 @@ impl StreamState {
                 arguments: parse_streaming_json(Some(&tool.arguments)),
                 thought_signature: None,
                 namespace: None,
+                recorded: None,
             };
             if let Some(slot) = self.output.content.get_mut(tool.content_index) {
                 *slot = Content::ToolCall(call.clone());

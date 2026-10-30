@@ -217,7 +217,9 @@ rpi auth check --provider vendor-example --extension /path/to/provider.dll --jso
 
 - 检测可选槽位，优先 `register_streaming_provider`，旧宿主缺少该能力时降级
   `register_provider`。使用 SDK 的结构体大小与能力检测，不直接假定尾部字段存在。
-- 请求为 `{model, context, options}` JSON。增量在生成期间立即通过 `emit` 提交；不能先
+- 请求为 `{model, context, options, capabilities}` JSON。`capabilities.recordedToolCalls`
+  是宿主能解码的最高 `recorded` 版本；只有它 `>= 1` 时才能发送 `recorded`，SDK 桥接会自动
+  检查，工厂可用 `provider::host_capabilities()` 读取。增量在生成期间立即通过 `emit` 提交；不能先
   缓冲完整响应再切片伪造流式。事件粒度不保证等于 token 或 HTTP chunk。
 - 宿主可以合并已经入队、属于同一内容块的相邻纯文本或 thinking 增量，单批最多 4 KiB；
   单个超大增量原样传递。合并不等待新数据，完整快照、元数据、未知字段、工具调用及块切换
