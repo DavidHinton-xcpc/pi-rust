@@ -30,7 +30,7 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -65,7 +65,7 @@ use crate::resource_dirs::{
 };
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
-    PluginDiagnostics, PluginToolAdapter, TeeEmitter,
+    PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
 };
 
 /// The coding tools registered by the CLI by default.
@@ -74,7 +74,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs
 /// The default coding system prompt for the CLI's built-in tools.
 ///
 /// This retains the two-argument API for library callers. Session startup and
-/// reload use [`default_system_prompt_with_tools`] with the actual active tools.
+/// reload use [`default_system_prompt_with_tool_prompts`] with the actual active
+/// tools and their winning extension metadata.
 pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
     let tools = BUILTIN_TOOL_NAMES
         .iter()
@@ -87,53 +88,75 @@ pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> Strin
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 ///
 /// `tools` is the active tool set after `--tools`/`--exclude-tools` and
-/// extension merging: the prompt lists only those tools and keeps only the
-/// guidelines that mention one of them, so a restricted run is never told it
-/// can edit or track todos (pi builds its list from the selected tools too).
+/// extension merging. Like pi, the text list includes only tools with an
+/// explicit prompt snippet; other active tools remain available through their
+/// provider-facing schemas. Tool-specific guidelines still follow the full
+/// active set, so restricted runs get no guidance for unavailable tools.
 pub fn default_system_prompt_with_tools(
     cwd: &str,
     prior_reasoning_replayed: bool,
     tools: &[String],
 ) -> String {
-    let has = |name: &str| tools.iter().any(|tool| tool == name);
-    let todo_hint = if has("todo") {
-        "\n  Keep the steps of multi-step work in the todo tool and mark them done as you go."
-    } else {
-        ""
-    };
+    default_system_prompt_with_tool_prompts(cwd, prior_reasoning_replayed, tools, &BTreeMap::new())
+}
+
+/// Render pi-style explicit prompt contributions for the active tool set.
+/// Entries override built-in metadata, including an empty entry for an
+/// extension that replaces a built-in without contributing a prompt snippet.
+/// Inactive metadata is ignored. Schemas and callable tools are not modified.
+pub fn default_system_prompt_with_tool_prompts(
+    cwd: &str,
+    prior_reasoning_replayed: bool,
+    tools: &[String],
+    overrides: &BTreeMap<String, ToolPromptMetadata>,
+) -> String {
+    let metadata: BTreeMap<_, _> = tools
+        .iter()
+        .map(|name| {
+            let prompt = overrides
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| ToolPromptMetadata {
+                    prompt_snippet: builtin_tool_snippet(name).map(str::to_owned),
+                    prompt_guidelines: Vec::new(),
+                })
+                .normalized();
+            (name.as_str(), prompt)
+        })
+        .collect();
     // The working-state rule must match what actually comes back on the next
     // request. With `compat.requiresThinkingAsText` (or the native thinking
     // channels of anthropic/responses) the model *does* see its own reasoning
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
-    // One rule covers the plan, the todo tool and the anti-repetition line, so
-    // none of them is stated twice.
     let working_state_rule = if prior_reasoning_replayed {
-        format!(
-            "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
-  the plan. Continue from the last unfinished step, and when a step lands, say which one.{todo_hint}
+        "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
+  the plan. Continue from the last unfinished step, and when a step lands, say which one.
   Re-stating the same plan without acting on it is a bug, not progress."
-        )
     } else {
-        format!(
-            "- Your reasoning is not carried into your next turn; only your visible replies and tool
+        "- Your reasoning is not carried into your next turn; only your visible replies and tool
   output come back. Before each batch of tool calls, write one short line naming the step you
-  are on and what remains, and say which step is done when it lands.{todo_hint}
+  are on and what remains, and say which step is done when it lands.
   Re-stating the same plan without acting on it is a bug, not progress."
-        )
     };
 
-    let tool_lines = if tools.is_empty() {
+    // The text list is a selective summary, not the tool registry. In
+    // particular, do not repeat extension tool names without a prompt snippet.
+    let tool_lines = tools
+        .iter()
+        .filter_map(|name| {
+            metadata
+                .get(name.as_str())?
+                .prompt_snippet
+                .as_ref()
+                .map(|snippet| format!("- {name:<5} — {snippet}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tool_lines = if tool_lines.is_empty() {
         "(none)".to_string()
     } else {
-        tools
-            .iter()
-            .map(|name| match builtin_tool_snippet(name) {
-                Some(snippet) => format!("- {name:<5} — {snippet}"),
-                None => format!("- {name}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        tool_lines
     };
 
     // Tool-specific rules (Bash on Windows, docs before guessing) live in the
@@ -144,11 +167,27 @@ pub fn default_system_prompt_with_tools(
         "- Be concise in your responses",
         "- Show file paths clearly when working with files",
         "- Prefer the smallest change that solves the problem",
-        &working_state_rule,
+        working_state_rule,
         "- Read only what you need. If a file or search result was already shown earlier in this
   conversation, use it instead of fetching it again.",
     ];
-    let guidelines = guidelines.join("\n");
+    // Tools contribute rules even without snippets. Like pi, trim and dedupe
+    // across the full active set and the core rules, preserving first occurrence.
+    let mut seen = HashSet::new();
+    let tool_rules = tools
+        .iter()
+        .flat_map(|name| &metadata[name.as_str()].prompt_guidelines)
+        .map(String::as_str);
+    let core_rules = guidelines
+        .iter()
+        .map(|rule| rule.strip_prefix("- ").unwrap_or(rule));
+    let guidelines = tool_rules
+        .chain(core_rules)
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && seen.insert(*rule))
+        .map(|rule| format!("- {rule}"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
@@ -157,11 +196,30 @@ You help users by reading files, executing commands, editing code, and writing n
 Available tools:
 {tool_lines}
 
+In addition to the tools above, you may have access to other custom tools depending on the project.
+
 Guidelines:
 {guidelines}
 
 Current working directory: {cwd}"
     )
+}
+
+/// Take metadata from the same winning extension definitions used for tool
+/// merging, including empty metadata for overrides. Called on startup/reload.
+fn extension_tool_prompt_metadata(
+    session: &ExtensionSession,
+) -> BTreeMap<String, ToolPromptMetadata> {
+    session
+        .snapshot()
+        .map(|snapshot| {
+            snapshot
+                .tools()
+                .iter()
+                .map(|tool| (tool.tool.name.clone(), tool.prompt.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One-line prompt descriptions of the tools rpi itself registers.
@@ -515,18 +573,25 @@ pub async fn build_prepared(
     // working-state rule is worded (see `default_system_prompt`).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            Some(path) => {
+                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
+            None => default_prompt(),
         },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_prompt(),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -1648,19 +1713,26 @@ where
     let mut active = active_tool_names(&tools, &effective_args);
     active = filter_active_tool_names(active, &effective_args);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            Some(path) => {
+                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
+            None => default_prompt(),
         },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_prompt(),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
@@ -3665,10 +3737,10 @@ mod tests {
             lower.contains("reasoning is not") && lower.contains("carried into your next turn"),
             "the prompt must explain that reasoning does not survive the turn: {p}"
         );
-        // …and the remedy: keep state visible, use the todo tool.
+        // Working state stays visible; extension-specific rules require opt-in.
         assert!(
-            lower.contains("visible") && lower.contains("todo tool"),
-            "the prompt must point at visible text and the todo tool: {p}"
+            lower.contains("visible") && !lower.contains("todo tool"),
+            "the prompt must keep state visible without inventing extension rules: {p}"
         );
         // …plus the anti-repetition rule itself.
         assert!(
@@ -3721,9 +3793,13 @@ mod tests {
         for replayed in [false, true] {
             let p =
                 default_system_prompt_with_tools("/tmp/proj", replayed, &default_prompt_tools());
-            for phrase in ["the same plan", "todo tool", "Windows", "guessing"] {
+            for phrase in ["the same plan", "Windows", "guessing"] {
                 assert_eq!(p.matches(phrase).count(), 1, "{phrase:?} repeated: {p}");
             }
+            assert!(
+                !p.contains("todo tool"),
+                "extension rules require explicit metadata"
+            );
         }
     }
 
