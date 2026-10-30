@@ -1376,7 +1376,13 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// A `toolcall_end` may carry `recorded` when the call already ran upstream: the
 /// host then uses the recording as the tool result and never executes the call
 /// locally. Its shape is `{"version":1,"isError":false,"result":{"content":[...],"terminate":false}}`,
-/// and a call without the key executes as usual.
+/// and a call without the key executes as usual. A host that predates
+/// `recorded` ignores it and executes the call, so a plugin may send `recorded`
+/// only when the request's top-level `capabilities.recordedToolCalls` is `1`.
+/// The host holds `out` to every recorded `toolcall_end`: a final call with the
+/// same `id`, `name` and `arguments` but no `recorded` key gets the streamed
+/// recording, and a missing, repeated or conflicting call ends the turn with an
+/// error instead of running it.
 pub type ProviderStreamRequestFn = extern "C" fn(
     req_json: StbStringRef,
     emit: Option<ProviderStreamEmitFn>,

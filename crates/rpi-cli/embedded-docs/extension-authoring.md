@@ -391,6 +391,21 @@ extern "C" fn on_before_agent_start(
 宿主当作错误工具结果返回，同样不执行。只有在调用确实已经发生
 过时才能带 `recorded`；不带该字段的调用行为与以前完全一致。
 
+**先检查宿主能力。** 不认识 `recorded` 的旧宿主会忽略这个字段，在本地执行调用；C ABI
+没有变化也挡不住这一点。请求信封顶层的 `capabilities` 对象说明宿主支持什么：只有
+`capabilities.recordedToolCalls` 为 `1`（宿主能解码的 `recorded` 版本）时，插件才可以发送
+`recorded`。没有这个键就是旧宿主，插件不得发送 `recorded`，应让这一轮以错误结束，而不是把
+已经执行过的调用当普通调用交给宿主。
+
+**`recorded` 与最终 `out`。** 宿主执行的是 `out` 里的调用，所以终态之前会用 `out` 核对每个在
+`toolcall_end` 上带过 `recorded` 的调用：按 `id` 找到 `out` 中的同一调用，并要求 `name` 与
+`arguments` 相同。该调用在 `out` 中没有 `recorded` 键时，宿主补上流中的记录（显式 `null`
+也照样补上，仍是错误结果、不执行）；两边记录相同则不变。以下任一情况都会让这一轮以
+`Error` 终态结束，本地不执行任何调用：`out` 中没有该 `id`、同一 `id` 出现多次、`name` 或
+`arguments` 不同、记录不同，或带 `recorded` 的 `toolcall_end` 没有 `id`。只在 `out` 中带
+`recorded` 同样有效。插件返回非零、`out` 为空或无法解析、请求被取消时，终态本来就是
+`Error`/`Aborted`，不会执行任何调用。建议在 `toolcall_end` 和 `out` 中带同一份 `recorded`。
+
 约定：
 
 - **`out` 仍是最终消息。** 回调只送增量；插件返回时写入 `out` 的完整

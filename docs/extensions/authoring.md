@@ -244,6 +244,9 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 
 `toolcall_end` 可带可选的 `recorded` 字段，表示该调用已在远端执行过：宿主把它当作已完成的
 工具结果，绝不在本地再次执行（形状与版本规则见 `docs/rpi-tool/extension-authoring.md`）。
+插件只能在请求信封的 `capabilities.recordedToolCalls` 为 `1` 时发送 `recorded`；旧宿主没有
+这个键，会忽略 `recorded` 并执行调用。流中带过 `recorded` 的调用在 `out` 中必须是同一
+`id`、`name` 和 `arguments`：缺少记录时宿主会补上，冲突或缺失则这一轮以 `Error` 结束。
 
 两点约定：
 
