@@ -12,8 +12,7 @@ on:
     branches: [main]
     paths:
       - "pages/**"
-      - "demo/ansi_grid.py"
-      - "demo/build_glyph_demo.py"
+      - "demo/**"
       - "crates/rpi-cli/examples/glyph_capture.rs"
       - "crates/rpi-tui/src/**"
       - "crates/rpi-cli/src/interactive_tui/**"
@@ -21,8 +20,7 @@ on:
   pull_request:
     paths:
       - "pages/**"
-      - "demo/ansi_grid.py"
-      - "demo/build_glyph_demo.py"
+      - "demo/**"
       - "crates/rpi-cli/examples/glyph_capture.rs"
   workflow_dispatch:
 
