@@ -1960,10 +1960,9 @@ mod tests {
             serde_json::json!({"type":"toolcall_start","contentIndex":0,"id":"c1","name":"shell"}),
             serde_json::json!({"type":"toolcall_end","contentIndex":0,"id":"c1","name":"shell","arguments":{"command":"rm -rf target"},"recorded":recording}),
         ] {
-            if let Some(event) = mapper.apply(chunk) {
-                if let AssistantMessageEvent::ToolCallEnd { tool_call, .. } = event {
-                    ends.push(tool_call);
-                }
+            if let Some(AssistantMessageEvent::ToolCallEnd { tool_call, .. }) = mapper.apply(chunk)
+            {
+                ends.push(tool_call);
             }
             while let Some(deferred) = mapper.take_deferred() {
                 if let Some(AssistantMessageEvent::ToolCallEnd { tool_call, .. }) =
@@ -1993,10 +1992,9 @@ mod tests {
             serde_json::json!({"type":"toolcall_start","contentIndex":0,"id":"c1","name":"echo"}),
             serde_json::json!({"type":"toolcall_end","contentIndex":0,"id":"c1","name":"echo","arguments":{"text":"hi"}}),
         ] {
-            if let Some(event) = mapper.apply(chunk) {
-                if let AssistantMessageEvent::ToolCallEnd { tool_call, .. } = event {
-                    ends.push(tool_call);
-                }
+            if let Some(AssistantMessageEvent::ToolCallEnd { tool_call, .. }) = mapper.apply(chunk)
+            {
+                ends.push(tool_call);
             }
             while let Some(deferred) = mapper.take_deferred() {
                 if let Some(AssistantMessageEvent::ToolCallEnd { tool_call, .. }) =
