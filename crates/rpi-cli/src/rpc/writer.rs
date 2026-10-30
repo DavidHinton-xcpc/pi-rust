@@ -2,10 +2,14 @@
 use std::io::Write;
 
 #[derive(Clone)]
-pub(crate) struct RpcWriter(tokio::sync::mpsc::Sender<Vec<u8>>);
+pub(crate) struct RpcWriter {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mode: crate::args::RpcMessageUpdates,
+}
 
 pub(crate) fn start_rpc_writer<W: Write + Send + 'static>(
     mut output: W,
+    mode: crate::args::RpcMessageUpdates,
 ) -> (
     RpcWriter,
     tokio::task::JoinHandle<std::io::Result<()>>,
@@ -27,17 +31,17 @@ pub(crate) fn start_rpc_writer<W: Write + Send + 'static>(
         }
         result
     });
-    (RpcWriter(tx), task, failed)
+    (RpcWriter { sender: tx, mode }, task, failed)
 }
 
 pub(crate) async fn write_line(out: &RpcWriter, value: &serde_json::Value) {
     let mut line = value.to_string().into_bytes();
     line.push(b'\n');
-    let _ = out.0.send(line).await;
+    let _ = out.sender.send(line).await;
 }
 
 pub(crate) async fn write_agent_event(out: &RpcWriter, event: &rpi_agent::events::AgentEvent) {
-    let mut line = super::events::encode(event).unwrap_or_else(|_| b"null".to_vec());
+    let mut line = super::events::encode(event, out.mode).unwrap_or_else(|_| b"null".to_vec());
     line.push(b'\n');
-    let _ = out.0.send(line).await;
+    let _ = out.sender.send(line).await;
 }
