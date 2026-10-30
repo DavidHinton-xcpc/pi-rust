@@ -63,6 +63,8 @@ mod lifetime_tests;
 mod performance;
 mod queue;
 #[cfg(test)]
+mod review183;
+#[cfg(test)]
 mod stream_tests;
 
 /// Reserve child capacity before spawning the producer; move this ownership
