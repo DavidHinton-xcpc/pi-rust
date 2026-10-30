@@ -219,9 +219,9 @@ rules the SDK enforces:
 These are not stylistic preferences — violating any of them is undefined
 behaviour at the boundary.
 
-### Preview custom entries with runtime actions
+### Query custom entries with runtime actions
 
-`RuntimeActionId::GetSessionBranch` uses the same preview-only query as RPC
+`RuntimeActionId::GetSessionBranch` uses the same canonical query as RPC
 `get_session_branch`, without the RPC `type`/`id` envelope. For example, pass
 this JSON to the runtime-action SDK call:
 
@@ -236,7 +236,9 @@ let action = rpi_plugin_sdk::RuntimeActionId::GetSessionBranch;
 // Submit `action` and `args` through the runtime_action slot.
 ```
 
-`customTypes` is required and non-empty. The other three fields are optional;
+`customTypes` is required and non-empty; each identifier must be non-blank.
+Identifiers match the exact stored string, preserving case and whitespace.
+The other three fields are optional;
 order defaults to `oldestFirst`. `afterSeq` is exclusive in the selected order:
 `seq > afterSeq` for `oldestFirst`, `seq < afterSeq` for `newestFirst`.
 Entries must be on the selected branch and match a requested custom
@@ -246,6 +248,14 @@ type; ordering and limit apply globally across those types. The result is
 Empty `{}`, unknown keys, and retired `customType`, `custom_type`, `custom_types`,
 or `after_seq` query keys fail explicitly, including mixed old/new requests.
 This does **not** change `AppendEntry`'s singular `customType` write argument.
+
+This query contract is a breaking change from the older unfiltered action.
+Upgrade hosts and consumers together. Consumers requiring filtered semantics
+must check for **`filtered == true`** and reject a successful response without
+that marker: older hosts can ignore the arguments and return the whole branch.
+Action ID 20 and the binary ABI/layout are unchanged, so a successful plugin
+load or ABI/size check alone does not prove support for this query contract.
+Do not silently fall back to `{}` or replay an unfiltered response.
 
 ## Compatibility
 

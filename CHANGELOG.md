@@ -11,6 +11,10 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (rpc/extensions):** `get_session_branch` / `GetSessionBranch` now require an explicit non-empty `customTypes` array, support exclusive `afterSeq`, order and global limit, and reject unfiltered/legacy query arguments. Upgrade hosts and clients together; require `filtered: true` in replies because older ABI-compatible hosts may ignore filters. Custom-type identifiers match exactly, and bounded multi-type queries limit each storage read before merging. The append/write protocol and binary plugin ABI are unchanged.
+
 ### Fixed
 
 - *(tui)* keep the editor's wrap width independent of the caret's row: a row used to wrap one column earlier while the caret sat on it, so the same draft reflowed (and the input box grew a line) once the caret moved away

@@ -1190,9 +1190,9 @@ pub(crate) struct BranchEntryQuery {
 
 impl BranchEntryQuery {
     fn entry_queries(&self) -> Vec<EntryQuery> {
-        let per_query_limit = (self.custom_types.len() == 1)
-            .then_some(self.limit)
-            .flatten();
+        // A global top-L entry must be within its type's top L under the same
+        // order/cursor. Bound cloned payloads before the global merge as well.
+        let per_query_limit = self.limit;
         self.custom_types
             .iter()
             .map(|custom_type| EntryQuery {
@@ -1252,7 +1252,7 @@ pub(crate) async fn find_branch_entries(
     Ok(entries)
 }
 
-/// Preview-only custom-entry query. Reject unknown/legacy arguments even when
+/// Canonical custom-entry query. Reject unknown/legacy arguments even when
 /// valid modern arguments are also present; never fall back to a full scan.
 pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<BranchEntryQuery, String> {
     let args = msg
@@ -1276,8 +1276,7 @@ pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<BranchEntryQ
     for value in values {
         let custom_type = value
             .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
             .ok_or("get_session_branch: every `customTypes` item must be a non-empty string")?;
         if !custom_types.iter().any(|existing| existing == custom_type) {
             custom_types.push(custom_type.to_owned());
@@ -2233,7 +2232,7 @@ mod tests {
     use rpi_harness::session::types::OperationError;
 
     #[test]
-    fn session_branch_query_requires_modern_preview_arguments() {
+    fn session_branch_query_requires_canonical_arguments() {
         let query = branch_entry_query(&serde_json::json!({
             "customTypes": ["alpha", "beta", "alpha"], "afterSeq": 42,
         }))
@@ -2249,6 +2248,7 @@ mod tests {
             serde_json::json!({"customTypes": []}),
             serde_json::json!({"customTypes": "alpha"}),
             serde_json::json!({"customTypes": [""]}),
+            serde_json::json!({"customTypes": [" \t "]}),
             serde_json::json!({"customTypes": ["alpha", 1]}),
             serde_json::json!({"customTypes": ["alpha"], "limit": 0}),
             serde_json::json!({"customTypes": ["alpha"], "limit": 1.5}),
@@ -2260,8 +2260,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_branch_multi_type_limit_is_pushed_to_each_storage_query() {
+        for order in ["oldestFirst", "newestFirst"] {
+            let request = branch_entry_query(&serde_json::json!({
+                "customTypes": ["alpha", "beta", "alpha"],
+                "limit": 2, "order": order, "afterSeq": 42,
+            }))
+            .unwrap();
+            let queries = request.entry_queries();
+            assert_eq!(queries.len(), 2);
+            for query in queries {
+                assert_eq!(query.limit, Some(2));
+                assert_eq!(query.order, Some(request.order));
+                assert_eq!(query.cursor, Some(EntryCursor { after_seq: 42 }));
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn session_branch_preview_filters_merges_and_respects_fork_bounds() {
+    async fn session_branch_exact_type_identities_round_trip_rpc_and_actions() {
+        use rpi_extensions::RuntimeActionHost;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (host, cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+            vec![],
+            std::env::temp_dir(),
+            tokio::runtime::Handle::current(),
+            Default::default(),
+            rpi_extensions::ToolCallContext::default(),
+        );
+        crate::extensions_actions::HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+        let names = ["alpha", " alpha ", "beta", " beta "];
+        for (index, name) in names.iter().enumerate() {
+            let args = serde_json::json!({"customType": name, "data": {"n": index}});
+            if index % 2 == 0 {
+                host.append_entry(args).await.unwrap();
+            } else {
+                rpc_append_entry(&harness, &args).await.unwrap();
+            }
+        }
+        let request = branch_entry_query(&serde_json::json!({
+            "customTypes": ["alpha", " alpha ", "beta", " beta ", "alpha"],
+        }))
+        .unwrap();
+        assert_eq!(request.custom_types, names);
+        let mut input = String::new();
+        let mut expected = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let args = serde_json::json!({"customTypes": [name]});
+            let result = host.get_session_branch(args.clone()).await.unwrap();
+            assert_eq!(result["count"], 1);
+            assert_eq!(result["entries"][0]["customType"], *name);
+            assert_eq!(result["entries"][0]["data"]["n"], index);
+            let mut envelope = args;
+            envelope["type"] = serde_json::json!("get_session_branch");
+            envelope["id"] = serde_json::json!(index);
+            input.push_str(&format!("{envelope}\n"));
+            expected.push(result);
+        }
+        let output = RpcOutput::default();
+        assert_eq!(
+            rpc_with_io(
+                &harness,
+                None,
+                vec![],
+                rpi_extensions::UiDialogMailbox::new(),
+                None,
+                tokio::io::BufReader::new(input.as_bytes()),
+                output.clone(),
+            )
+            .await,
+            0
+        );
+        let messages = output.messages();
+        for (index, expected) in expected.into_iter().enumerate() {
+            let response = messages
+                .iter()
+                .find(|message| message["id"] == index)
+                .unwrap();
+            assert_eq!(response["data"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_branch_filters_merge_and_respect_fork_bounds() {
         use rpi_harness::session::types::{ForkOptions, ForkPosition, SessionRepo};
         use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionRepo, Session};
         let repo = InMemorySessionRepo::new(

@@ -47,7 +47,7 @@ pub enum Command {
         #[serde(rename = "beforeSeq")]
         before_seq: Option<u64>,
     },
-    /// Preview custom entries on the selected branch. Query validation is shared
+    /// Query custom entries on the selected branch. Query validation is shared
     /// with the runtime action (required non-empty `customTypes`; optional
     /// `afterSeq`, `limit`, `order`), after removing the RPC envelope.
     GetSessionBranch,

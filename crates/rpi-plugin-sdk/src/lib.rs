@@ -1092,7 +1092,7 @@ pub enum RuntimeActionId {
     /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
     /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
     SetEditorText = 19,
-    /// Preview custom entries on the current main branch. Args:
+    /// Query custom entries on the current main branch. Args:
     /// `{"customTypes":["durable-state","other-custom-type"],"afterSeq":42,
     /// "limit":20,"order":"newestFirst"}`. `customTypes` is required and
     /// non-empty; the other fields are optional. Default order: `oldestFirst`.
@@ -1103,6 +1103,9 @@ pub enum RuntimeActionId {
     /// unknown keys and legacy `customType`/`custom_type`/`custom_types`/
     /// `after_seq` query arguments are errors, including mixed old/new requests.
     /// This does not change AppendEntry's singular `customType` write argument.
+    /// Type identifiers match exactly (including case and whitespace).
+    /// Consumers must require `filtered == true`: older ABI-compatible hosts
+    /// may ignore the query and return the unfiltered branch instead.
     GetSessionBranch = 20,
     /// Inspect or finish a plugin-owned stdio server lifecycle. Args:
     /// `{"op":"status"}` or `{"op":"finish","exitCode":0}`. Only the
