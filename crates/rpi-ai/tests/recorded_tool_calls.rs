@@ -111,3 +111,50 @@ fn recorded_tool_call_survives_stream_frames_and_the_reducer() {
         recording()
     );
 }
+
+#[test]
+fn frames_without_a_recording_reduce_to_an_ordinary_call() {
+    // Frames written before `recorded` existed have no key. Recovery reads them
+    // from storage, so they must reduce to an ordinary, executable call.
+    let Content::ToolCall(call) = serde_json::from_value::<Content>(call_json(None)).unwrap()
+    else {
+        panic!("expected a tool call");
+    };
+    let mut base = AssistantMessage::empty(Api::Faux, "external", "model", 0);
+    base.stop_reason = StopReason::ToolUse;
+    base.content.push(Content::ToolCall(call.clone()));
+    let partial = Arc::new(base.clone());
+    let events = [
+        AssistantMessageEvent::Start {
+            partial: Arc::new(AssistantMessage::empty(Api::Faux, "external", "model", 0)),
+        },
+        AssistantMessageEvent::ToolCallStart {
+            content_index: 0,
+            partial: Arc::clone(&partial),
+        },
+        AssistantMessageEvent::ToolCallEnd {
+            content_index: 0,
+            tool_call: call,
+            partial,
+        },
+    ];
+
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let mut frames = Vec::new();
+    for event in &events {
+        if let Some(frame) = encoder.encode(event).expect("event encodes") {
+            frames.push(frame);
+        }
+    }
+    let wire = serde_json::to_value(&frames).unwrap();
+    assert!(
+        !wire.to_string().contains("\"recorded\""),
+        "an ordinary call writes no recorded key"
+    );
+    let frames: Vec<AssistantMessageFrame> = serde_json::from_value(wire).unwrap();
+    let reduced = reduce_frames(&frames).unwrap().expect("a reduced message");
+    let Content::ToolCall(reduced_call) = &reduced.content[0] else {
+        panic!("expected a tool call block");
+    };
+    assert_eq!(reduced_call.recorded, None);
+}
