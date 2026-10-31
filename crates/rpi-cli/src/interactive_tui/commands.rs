@@ -351,7 +351,12 @@ impl SlashCommand for ThemeCommand {
                 &ctx.state.theme_manager,
                 registry.as_ref(),
             ) {
-                Ok(message) => add_note_message(&ctx.chat, &message),
+                Ok(message) => {
+                    if let Ok(mut active) = ctx.state.active_theme_spec.lock() {
+                        *active = Some(spec.clone());
+                    }
+                    add_note_message(&ctx.chat, &message);
+                }
                 Err(message) => add_error_message(&ctx.chat, &message),
             }
             ctx.tui.request_render(false);

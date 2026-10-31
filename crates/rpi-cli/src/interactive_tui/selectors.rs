@@ -529,7 +529,12 @@ pub(super) fn open_theme_selector(
             &state_sel.theme_manager,
             registry.as_ref(),
         ) {
-            Ok(message) => add_note_message(&chat_sel, &message),
+            Ok(message) => {
+                if let Ok(mut active) = state_sel.active_theme_spec.lock() {
+                    *active = Some(item.value.clone());
+                }
+                add_note_message(&chat_sel, &message);
+            }
             Err(message) => add_error_message(&chat_sel, &message),
         }
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);

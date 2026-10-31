@@ -1050,6 +1050,7 @@ pub async fn build_prepared(
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
+        discovered_theme_paths: Arc::new(std::sync::Mutex::new(discovered.theme_paths.clone())),
         args: reload_args,
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
@@ -1200,6 +1201,11 @@ pub struct ReloadContext {
     /// Startup consumers reuse this value so extension code cannot change the
     /// effective policy by mutating the process cwd while it is loading.
     pub project_trusted: bool,
+    /// Theme file paths contributed by extensions via `resources_discover`,
+    /// shared so the TUI theme registry can merge them. Filled at startup,
+    /// replaced on every `/reload` (paths are unattributed — the v1 divergence
+    /// documented in `rpi-extensions::resources`).
+    pub discovered_theme_paths: Arc<std::sync::Mutex<Vec<String>>>,
     /// The parsed args (cloned) — `--no-*`/`--tools`/`--exclude-tools`/
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
@@ -1603,6 +1609,11 @@ where
         .snapshot_arc()
         .map(|snap| rpi_extensions::emit_resources_discover(&cwd_str, "reload", &snap))
         .unwrap_or_default();
+    // Publish the fresh theme paths so the TUI registry rebuild sees the same
+    // set the skill/prompt loaders just consumed.
+    if let Ok(mut guard) = ctx.discovered_theme_paths.lock() {
+        *guard = discovered.theme_paths.clone();
+    }
 
     // ---- 4. Re-run the Part-A loaders (same precedence + --no-* gates) ----
     let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
