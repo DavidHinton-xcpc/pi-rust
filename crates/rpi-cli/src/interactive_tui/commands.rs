@@ -365,10 +365,8 @@ impl SlashCommand for ThemeCommand {
                             &ctx.state.theme_watcher,
                             Some(&spec),
                             registry_now,
-                            move |result| match result {
-                                Ok(message) => add_note_message(&chat_watcher, &message),
-                                Err(message) => add_error_message(&chat_watcher, &message),
-                            },
+                            &ctx.state.theme_manager,
+                            theme_watch_notify(chat_watcher, ctx.tui.clone()),
                         );
                     }
                     add_note_message(&ctx.chat, &message);

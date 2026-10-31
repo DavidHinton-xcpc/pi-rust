@@ -1363,6 +1363,7 @@ pub async fn interactive_tui(
     // and is re-targeted by selection and reload.
     {
         let chat_ref = chat_container.clone();
+        let tui_ref = tui.clone();
         let registry_snapshot = state.theme_registry.read().ok().map(|r| r.clone());
         crate::themes::restart_theme_watcher(
             &state.theme_watcher,
@@ -1370,10 +1371,8 @@ pub async fn interactive_tui(
             registry_snapshot
                 .as_ref()
                 .unwrap_or(&crate::themes::ThemeRegistry::default()),
-            move |result| match result {
-                Ok(message) => add_note_message(&chat_ref, &message),
-                Err(message) => add_error_message(&chat_ref, &message),
-            },
+            &state.theme_manager,
+            theme_watch_notify(chat_ref, tui_ref),
         );
     }
 
@@ -3652,10 +3651,8 @@ pub async fn interactive_tui(
                         &state.theme_watcher,
                         state.active_theme_spec().as_deref(),
                         &registry,
-                        move |result| match result {
-                            Ok(message) => add_note_message(&chat_ref, &message),
-                            Err(message) => add_error_message(&chat_ref, &message),
-                        },
+                        &state.theme_manager,
+                        theme_watch_notify(chat_ref, tui.clone()),
                     );
                 }
                 if outcome.had_errors {

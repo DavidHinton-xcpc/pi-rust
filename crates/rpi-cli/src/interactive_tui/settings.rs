@@ -434,10 +434,8 @@ pub(super) fn open_settings_theme_selector(
                         &state_sel.theme_watcher,
                         Some(&item.value),
                         registry_now,
-                        move |result| match result {
-                            Ok(message) => add_note_message(&chat_watcher, &message),
-                            Err(message) => add_error_message(&chat_watcher, &message),
-                        },
+                        &state_sel.theme_manager,
+                        theme_watch_notify(chat_watcher, tui_sel.clone()),
                     );
                 }
                 add_note_message(&chat_sel, &message);
