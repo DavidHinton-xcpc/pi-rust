@@ -1001,7 +1001,13 @@ pub async fn interactive_tui(
     let theme_registry = if no_themes {
         crate::themes::ThemeRegistry::default()
     } else {
-        let (registry, diagnostics) = crate::themes::ThemeRegistry::discover(&cwd, project_trusted);
+        let (mut registry, diagnostics) =
+            crate::themes::ThemeRegistry::discover(&cwd, project_trusted);
+        // Extension-contributed themes (`resources_discover` themePaths) merge
+        // after the static dirs; `--no-themes` suppresses them like discovery.
+        if let Ok(paths) = reload_context.discovered_theme_paths.lock() {
+            registry.merge_discovered(&paths);
+        }
         for diagnostic in &diagnostics {
             eprintln!("warning: {diagnostic}");
         }
@@ -1020,6 +1026,16 @@ pub async fn interactive_tui(
             }
         }
     }
+    // Record which spec is active (the persisted form) so `/reload` can detect
+    // that the active file theme vanished and fall back to the default.
+    let active_theme_spec: Option<String> =
+        theme.and_then(
+            |spec| match crate::themes::resolve_spec_in(spec, Some(&theme_registry)) {
+                crate::themes::ThemeSpec::Preset(_) => Some(spec.to_string()),
+                crate::themes::ThemeSpec::File(path) if path.is_file() => Some(spec.to_string()),
+                crate::themes::ThemeSpec::File(_) => None,
+            },
+        );
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
@@ -1284,6 +1300,7 @@ pub async fn interactive_tui(
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
         theme_registry: std::sync::RwLock::new(theme_registry),
+        active_theme_spec: std::sync::Mutex::new(active_theme_spec),
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(show_images),
@@ -3565,13 +3582,34 @@ pub async fn interactive_tui(
                 // dir surfaces as a warning, never a reload failure.
                 if !reload_ctx.args.no_themes {
                     if let Some(reload_trusted) = outcome.project_trusted {
-                        let (registry, diagnostics) =
+                        let (mut registry, diagnostics) =
                             crate::themes::ThemeRegistry::discover(&reload_ctx.cwd, reload_trusted);
+                        let discovered = reload_ctx
+                            .discovered_theme_paths
+                            .lock()
+                            .map(|paths| paths.clone())
+                            .unwrap_or_default();
+                        registry.merge_discovered(&discovered);
                         for diagnostic in &diagnostics {
                             eprintln!("warning: {diagnostic}");
                         }
+                        // A reload can remove the active file theme (its package
+                        // went away or no longer returns the path); fall back to
+                        // the default preset with a notice instead of rendering
+                        // with a palette nothing can re-resolve.
+                        let active = state.active_theme_spec.lock().ok().and_then(|g| g.clone());
                         if let Ok(mut guard) = state.theme_registry.write() {
-                            *guard = registry;
+                            *guard = registry.clone();
+                        }
+                        if let Some(notice) = crate::themes::reconcile_after_reload(
+                            active.as_deref(),
+                            &registry,
+                            &state.theme_manager,
+                        ) {
+                            add_note_message(&chat_container, &notice);
+                            if let Ok(mut active) = state.active_theme_spec.lock() {
+                                *active = Some("dark".to_string());
+                            }
                         }
                     }
                 }

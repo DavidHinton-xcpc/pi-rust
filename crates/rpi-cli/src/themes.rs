@@ -160,6 +160,25 @@ pub struct ThemeRegistry {
 }
 
 impl ThemeRegistry {
+    /// Merge bare extension-contributed theme file paths (`resources_discover`
+    /// `themePaths`) into this registry.
+    ///
+    /// Priority sits **after** the static dirs: a static dir theme of the same
+    /// stem wins, extension themes fill the remaining names. This matches the
+    /// skill/prompt precedence (static first-wins, discovered lower). Paths are
+    /// concrete `.json` files (the pi contract, unlike skills' dir-or-file);
+    /// names are file stems. v1 divergence (documented upstream parity gap):
+    /// paths are unattributed, so diagnostics can only name the path.
+    pub fn merge_discovered(&mut self, paths: &[String]) {
+        for path in paths {
+            let path = PathBuf::from(path);
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            self.entries.entry(name.to_string()).or_insert(path);
+        }
+    }
+
     /// Scan the global + project theme dirs. Project themes win on name
     /// conflicts. `project_trusted == false` skips the project dir entirely
     /// (the same trust boundary as skills: an untrusted repo must not shape
@@ -244,6 +263,37 @@ fn scan_dir(
     }
 }
 
+/// Reconcile a rebuilt registry after `/reload`: if the currently active file
+/// theme (tracked as its spec value) is no longer resolvable, fall back to the
+/// default preset and return the user-facing notice; otherwise leave the theme
+/// alone and return `None`.
+///
+/// Resolution mirrors startup: registry name first (the persisted form for
+/// discovered themes), then a direct path. A file that still exists keeps
+/// working across reloads even though it came from a package that reloaded.
+pub fn reconcile_after_reload(
+    active_spec: Option<&str>,
+    registry: &ThemeRegistry,
+    session_manager: &ThemeManager,
+) -> Option<String> {
+    let active_spec = active_spec?;
+    if active_spec == "dark" || active_spec == "light" || active_spec == "monochrome" {
+        return None;
+    }
+    let still_resolvable = match resolve_spec_in(active_spec, Some(registry)) {
+        ThemeSpec::File(path) => path.is_file(),
+        ThemeSpec::Preset(_) => true,
+    };
+    if still_resolvable {
+        return None;
+    }
+    session_manager.apply_preset(ThemePreset::Dark);
+    rpi_tui::theme::apply_theme_preset(ThemePreset::Dark);
+    Some(format!(
+        "Theme \"{active_spec}\" is no longer available; reverted to the default dark theme."
+    ))
+}
+
 /// Apply a theme spec (preset or file path) live and persist it.
 ///
 /// Shared by `/theme <name>`, the `/theme` selector, and the settings panel:
@@ -295,6 +345,63 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn merge_discovered_fills_after_static_dirs() {
+        let root = std::env::temp_dir().join(format!("rpi-themes-ext-{}", std::process::id()));
+        let project = root.join("proj/.rpi/themes");
+        write_theme(&project, "shared.json");
+        let ext_a = root.join("pkgA/themes/shared.json");
+        let ext_b = root.join("pkgB/themes/extra.json");
+        write_theme(&ext_a.parent().unwrap(), "shared.json");
+        write_theme(&ext_b.parent().unwrap(), "extra.json");
+
+        let (mut registry, _) = ThemeRegistry::discover_from(None, Some(&project));
+        registry.merge_discovered(&[
+            ext_a.to_string_lossy().to_string(),
+            ext_b.to_string_lossy().to_string(),
+            "/does/not/matter.md".to_string(), // non-json path is still keyed by stem
+        ]);
+        assert!(registry.get("shared").unwrap().starts_with(&project));
+        assert!(registry.get("extra").unwrap().ends_with("extra.json"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_keeps_preset_and_existing_file() {
+        let manager = ThemeManager::new();
+        // Preset specs never fall back.
+        assert!(
+            reconcile_after_reload(Some("light"), &ThemeRegistry::default(), &manager).is_none()
+        );
+        // No active spec: nothing to do.
+        assert!(reconcile_after_reload(None, &ThemeRegistry::default(), &manager).is_none());
+        // An existing file theme stays.
+        let dir = std::env::temp_dir().join(format!("rpi-themes-recon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = temp_theme_file(&dir, "ocean.json", "#123456");
+        assert!(reconcile_after_reload(
+            Some(&path.to_string_lossy()),
+            &ThemeRegistry::default(),
+            &manager
+        )
+        .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_falls_back_when_active_theme_vanishes() {
+        let manager = ThemeManager::new();
+        manager.apply_preset(ThemePreset::Light);
+        let (registry, _) = ThemeRegistry::discover_from(None, None);
+        let notice = reconcile_after_reload(Some("gone-theme"), &registry, &manager);
+        assert!(notice.is_some());
+        assert!(notice.unwrap().contains("gone-theme"));
+        assert!(matches!(
+            manager.get().colors.accent,
+            rpi_tui::theme::Color::Ansi256(108)
+        ));
     }
 
     #[test]
