@@ -3582,10 +3582,8 @@ pub async fn interactive_tui(
                 // dir surfaces as a warning, never a reload failure.
                 if !reload_ctx.args.no_themes {
                     if let Some(reload_trusted) = outcome.project_trusted {
-                        let (mut registry, diagnostics) = crate::themes::ThemeRegistry::discover(
-                            &reload_ctx.cwd,
-                            reload_trusted,
-                        );
+                        let (mut registry, diagnostics) =
+                            crate::themes::ThemeRegistry::discover(&reload_ctx.cwd, reload_trusted);
                         let discovered = reload_ctx
                             .discovered_theme_paths
                             .lock()
