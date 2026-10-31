@@ -1301,6 +1301,7 @@ pub async fn interactive_tui(
         theme_manager,
         theme_registry: std::sync::RwLock::new(theme_registry),
         active_theme_spec: std::sync::Mutex::new(active_theme_spec),
+        theme_watcher: std::sync::Mutex::new(None),
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(show_images),
@@ -1352,6 +1353,29 @@ pub async fn interactive_tui(
             }
         }
     });
+
+    // Hot-reload the active theme file (native fs-watch contract): an edit to
+    // the JSON re-parses and re-applies live; a broken in-progress edit keeps
+    // the current palette and surfaces the parse error instead of dropping the
+    // user back to the default. Presets are immutable and `--no-themes`
+    // suppresses the watcher entirely, so only file themes poll (one task,
+    // one mtime entry — see fs_watch.rs). The handle lives in the state slot
+    // and is re-targeted by selection and reload.
+    {
+        let chat_ref = chat_container.clone();
+        let registry_snapshot = state.theme_registry.read().ok().map(|r| r.clone());
+        crate::themes::restart_theme_watcher(
+            &state.theme_watcher,
+            state.active_theme_spec().as_deref(),
+            registry_snapshot
+                .as_ref()
+                .unwrap_or(&crate::themes::ThemeRegistry::default()),
+            move |result| match result {
+                Ok(message) => add_note_message(&chat_ref, &message),
+                Err(message) => add_error_message(&chat_ref, &message),
+            },
+        );
+    }
 
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
@@ -3581,6 +3605,7 @@ pub async fn interactive_tui(
                 // the previous registry stays untouched too. A broken theme
                 // dir surfaces as a warning, never a reload failure.
                 if !reload_ctx.args.no_themes {
+                    let mut rebuilt = None;
                     if let Some(reload_trusted) = outcome.project_trusted {
                         let (mut registry, diagnostics) =
                             crate::themes::ThemeRegistry::discover(&reload_ctx.cwd, reload_trusted);
@@ -3607,11 +3632,31 @@ pub async fn interactive_tui(
                             &state.theme_manager,
                         ) {
                             add_note_message(&chat_container, &notice);
-                            if let Ok(mut active) = state.active_theme_spec.lock() {
-                                *active = Some("dark".to_string());
-                            }
+                            state.set_active_theme_spec(Some("dark".to_string()));
                         }
+                        rebuilt = Some(registry);
                     }
+                    // The registry may now resolve a different file for the
+                    // active name; re-target the watcher either way (with the
+                    // rebuilt registry when the reload completed, the previous
+                    // one after a hard failure kept the old resources).
+                    let registry = rebuilt.unwrap_or_else(|| {
+                        state
+                            .theme_registry
+                            .read()
+                            .map(|guard| guard.clone())
+                            .unwrap_or_default()
+                    });
+                    let chat_ref = chat_container.clone();
+                    crate::themes::restart_theme_watcher(
+                        &state.theme_watcher,
+                        state.active_theme_spec().as_deref(),
+                        &registry,
+                        move |result| match result {
+                            Ok(message) => add_note_message(&chat_ref, &message),
+                            Err(message) => add_error_message(&chat_ref, &message),
+                        },
+                    );
                 }
                 if outcome.had_errors {
                     // Hard failure: the summary itself carries the error detail

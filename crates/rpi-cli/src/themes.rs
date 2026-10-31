@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rpi_tui::theme::{global_theme_manager, Theme, ThemeManager, ThemePreset};
 use rpi_tui::theme_json::ThemeJson;
@@ -263,6 +264,44 @@ fn scan_dir(
     }
 }
 
+/// Swap the theme watcher onto the current active spec.
+///
+/// File themes get an mtime watcher (poll → re-parse → apply → notify via the
+/// `notify` callback); presets and unresolvable specs drop any existing watcher
+/// (nothing to poll). The old handle is closed first so at most one poll task
+/// runs. The caller owns the handle slot plus the current spec (this module
+/// stays independent of the TUI state type); `registry` is the snapshot the
+/// watcher re-applies through.
+pub fn restart_theme_watcher<N>(
+    slot: &Mutex<Option<crate::fs_watch::WatchHandle>>,
+    active_spec: Option<&str>,
+    registry: &ThemeRegistry,
+    notify: N,
+) where
+    N: Fn(Result<String, String>) + Send + Sync + 'static,
+{
+    let path = active_spec.and_then(|spec| match resolve_spec_in(spec, None) {
+        ThemeSpec::File(path) if path.is_file() => Some(path),
+        _ => None,
+    });
+    if let Some(handle) = slot.lock().ok().and_then(|mut guard| guard.take()) {
+        handle.close();
+    }
+    if let Some(path) = path {
+        let registry = registry.clone();
+        let spec = active_spec.unwrap_or_default().to_string();
+        let handle = crate::fs_watch::watch_path(path, move || {
+            // Re-apply through the CURRENT registry so a name-persisted spec
+            // follows the file the registry points at.
+            let result = apply_and_persist(&spec, &global_theme_manager(), Some(&registry));
+            notify(result);
+        });
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(handle);
+        }
+    }
+}
+
 /// Reconcile a rebuilt registry after `/reload`: if the currently active file
 /// theme (tracked as its spec value) is no longer resolvable, fall back to the
 /// default preset and return the user-facing notice; otherwise leave the theme
@@ -402,6 +441,65 @@ mod tests {
             manager.get().colors.accent,
             rpi_tui::theme::Color::Ansi256(108)
         ));
+    }
+
+    #[test]
+    fn restart_watcher_targets_files_only_and_swaps_handles() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("rpi-theme-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = temp_theme_file(&dir, "ocean.json", "#112233");
+        let spec = path.to_string_lossy().to_string();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let slot: Mutex<Option<crate::fs_watch::WatchHandle>> = Mutex::new(None);
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            let hits_ref = hits.clone();
+
+            // File spec: a watcher is installed.
+            let registry = ThemeRegistry::default();
+            restart_theme_watcher(&slot, Some(&spec), &registry, move |_result| {
+                hits_ref.fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(slot.lock().unwrap().is_some());
+
+            // Preset spec: the watcher is dropped.
+            restart_theme_watcher(&slot, Some("dark"), &registry, |_| {});
+            assert!(slot.lock().unwrap().is_none());
+
+            // Re-install and edit the file: the callback fires (bounded wait;
+            // the fs_watch poll is 1s) and re-applies through the registry.
+            let hits_ref2 = hits.clone();
+            restart_theme_watcher(&slot, Some(&spec), &registry, move |_result| {
+                hits_ref2.fetch_add(1, Ordering::SeqCst);
+            });
+            // Let the spawned task take its baseline mtime snapshot before
+            // writing, otherwise the edit lands in the baseline and never
+            // registers as a change.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::fs::write(
+                &path,
+                r##"{"name":"ocean.json","colors":{"accent":"#445566"}}"##,
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while hits.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(hits.load(Ordering::SeqCst) >= 1, "mtime change must fire");
+            assert!(
+                slot.lock().unwrap().is_some(),
+                "watcher survives after firing"
+            );
+            restart_theme_watcher(&slot, None, &registry, |_| {});
+            assert!(slot.lock().unwrap().is_none());
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

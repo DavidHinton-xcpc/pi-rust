@@ -427,8 +427,18 @@ pub(super) fn open_settings_theme_selector(
             registry.as_ref(),
         ) {
             Ok(message) => {
-                if let Ok(mut active) = state_sel.active_theme_spec.lock() {
-                    *active = Some(item.value.clone());
+                state_sel.set_active_theme_spec(Some(item.value.clone()));
+                let chat_watcher = chat_sel.clone();
+                if let Some(registry_now) = registry.as_ref() {
+                    crate::themes::restart_theme_watcher(
+                        &state_sel.theme_watcher,
+                        Some(&item.value),
+                        registry_now,
+                        move |result| match result {
+                            Ok(message) => add_note_message(&chat_watcher, &message),
+                            Err(message) => add_error_message(&chat_watcher, &message),
+                        },
+                    );
                 }
                 add_note_message(&chat_sel, &message);
             }
