@@ -401,6 +401,7 @@ async fn run_loop(
                 new_messages,
             )
             .await
+                && !(config.signal.is_cancelled() && !tool_calls.is_empty())
             {
                 emit_event(
                     emit,
@@ -412,14 +413,46 @@ async fn run_loop(
                 return Ok(LoopOutcome::Completed);
             }
 
-            // Keep the upstream ordering here: steering is drained after the
-            // tool batch settles, even when the run was cancelled. This makes
-            // messages queued while a blocking tool was active part of the
-            // returned transcript/context instead of leaving them stranded in
-            // the queue. The next stream observes the cancelled signal and
-            // produces the terminal aborted assistant message.
+            // Retain steering queued during the tool batch even on abort. A
+            // cancelled tool continuation must end with a NEW terminal assistant:
+            // public callers return messages, not LoopOutcome, and the harness
+            // derives/persists its authoritative outcome from that assistant.
             pending_messages = drain_steering(config).await;
-            if config.signal.is_cancelled() && pending_messages.is_empty() {
+            if config.signal.is_cancelled() && !tool_calls.is_empty() {
+                emit_event(emit, AgentEvent::TurnStart).await;
+                let aborted = AgentMessage::Assistant(Box::new(AssistantMessage::terminal(
+                    message.api.clone(),
+                    message.provider.clone(),
+                    message.model.clone(),
+                    StopReason::Aborted,
+                    "Operation aborted",
+                    crate::clock::now_ms(),
+                )));
+                // Do not call a provider just to manufacture an abort, or mutate
+                // the original tool-call assistant and its settled tool results.
+                for message in pending_messages
+                    .drain(..)
+                    .chain(std::iter::once(aborted.clone()))
+                {
+                    emit_event(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+                    current_context.messages.push(message.clone());
+                    new_messages.push(message.clone());
+                    emit_event(emit, AgentEvent::MessageEnd { message }).await;
+                }
+                emit_event(
+                    emit,
+                    AgentEvent::TurnEnd {
+                        message: aborted,
+                        tool_results: Vec::new(),
+                    },
+                )
+                .await;
                 emit_event(
                     emit,
                     AgentEvent::AgentEnd {
