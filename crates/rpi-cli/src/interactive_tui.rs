@@ -80,19 +80,18 @@ use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
 use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
-use rpi_tui::{
-    apply_theme_preset, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
-    AssistantMessageOptions, AutocompleteItem, AutocompleteManager, AutocompleteSuggestions,
-    BashExecutionComponent, BashTruncation, CombinedAutocompleteProvider, Component, Container,
-    DynamicBorder, Editor, EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable,
-    FollowMode, FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal,
-    ScrollView, ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList,
-    SettingItem, SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider,
-    Spacer, StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
-    ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState,
-    TUI,
-};
 use rpi_tui::{bold as tui_bold, theme as current_theme};
+use rpi_tui::{
+    AltScreenSearch, AssistantBlock, AssistantMessageComponent, AssistantMessageOptions,
+    AutocompleteItem, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
+    BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
+    EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
+    FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
+    ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
+    SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
+    StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ToolExecutionComponent,
+    ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState, TUI,
+};
 
 #[allow(unused_imports)]
 use rpi_tui::BashStatus;
@@ -912,7 +911,7 @@ pub async fn interactive_tui(
     extra_messages: &[String],
     initial_images: Vec<rpi_ai::types::ImageContent>,
     theme: Option<&str>,
-    _no_themes: bool,
+    no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -1008,6 +1007,18 @@ pub async fn interactive_tui(
             }
         }
     }
+    // Custom theme discovery (issue series 3/5). `--no-themes` already folded
+    // into `theme == None` upstream, but discovery has its own switch so a
+    // bare `--no-themes` also suppresses directory scanning.
+    let theme_registry = if no_themes {
+        crate::themes::ThemeRegistry::default()
+    } else {
+        let (registry, diagnostics) = crate::themes::ThemeRegistry::discover(&cwd, project_trusted);
+        for diagnostic in &diagnostics {
+            eprintln!("warning: {diagnostic}");
+        }
+        registry
+    };
 
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
@@ -1272,6 +1283,7 @@ pub async fn interactive_tui(
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
+        theme_registry: std::sync::RwLock::new(theme_registry),
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(show_images),
@@ -3543,6 +3555,22 @@ pub async fn interactive_tui(
                     reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
                 );
                 state.set_markdown_transformer_with_reinstall(fresh_transformer);
+                // Rebuild the custom-theme registry: extension reloads can
+                // change project trust (`/trust` flow) and the session cwd is
+                // fixed per TUI, so re-resolve both. A broken theme dir
+                // surfaces as a warning, never a reload failure.
+                if !reload_ctx.args.no_themes {
+                    let (registry, diagnostics) = crate::themes::ThemeRegistry::discover(
+                        &reload_ctx.cwd,
+                        reload_ctx.project_trusted,
+                    );
+                    for diagnostic in &diagnostics {
+                        eprintln!("warning: {diagnostic}");
+                    }
+                    if let Ok(mut guard) = state.theme_registry.write() {
+                        *guard = registry;
+                    }
+                }
                 if outcome.had_errors {
                     // Hard failure: the summary itself carries the error detail
                     // (e.g. "Settings reload failed: …"), so render it as an

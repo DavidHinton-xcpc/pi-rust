@@ -320,24 +320,48 @@ impl SlashCommand for ThemeCommand {
         let name = args.trim().to_ascii_lowercase();
         if !name.is_empty() {
             // /theme <name> — direct apply + persist (matches /settings Theme).
-            let preset = match name.as_str() {
-                "light" => ThemePreset::Light,
-                "monochrome" => ThemePreset::Monochrome,
-                "dark" => ThemePreset::Dark,
-                _ => {
-                    add_error_message(
-                        &ctx.chat,
-                        &format!("Unknown theme \"{name}\". Valid: dark, light, monochrome."),
-                    );
-                    ctx.tui.request_render(false);
-                    return;
-                }
+            // Built-in presets first, then discovered custom themes (file
+            // stems). Both paths go through the shared apply helper.
+            let is_preset = matches!(name.as_str(), "light" | "monochrome" | "dark");
+            let resolved = if is_preset {
+                Some(name.clone())
+            } else {
+                let registry = ctx
+                    .state
+                    .theme_registry
+                    .read()
+                    .ok()
+                    .map(|registry| registry.clone());
+                registry.and_then(|registry| {
+                    registry
+                        .get(&name)
+                        .map(|path| path.to_string_lossy().to_string())
+                })
             };
-            apply_theme_preset(preset);
-            let mut settings = crate::settings::load_settings().unwrap_or_default();
-            settings.theme = Some(name.clone());
-            let _ = crate::settings::save_settings(&settings);
-            add_note_message(&ctx.chat, &format!("Theme set to {name} (saved)."));
+            let Some(spec) = resolved else {
+                add_error_message(
+                    &ctx.chat,
+                    &format!(
+                        "Unknown theme \"{name}\". Valid: dark, light, monochrome, or a discovered theme."
+                    ),
+                );
+                ctx.tui.request_render(false);
+                return;
+            };
+            let registry = ctx
+                .state
+                .theme_registry
+                .read()
+                .ok()
+                .map(|registry| registry.clone());
+            match crate::themes::apply_and_persist(
+                &spec,
+                &ctx.state.theme_manager,
+                registry.as_ref(),
+            ) {
+                Ok(message) => add_note_message(&ctx.chat, &message),
+                Err(message) => add_error_message(&ctx.chat, &message),
+            }
             ctx.tui.request_render(false);
             ctx.tui.render_now(true);
             return;

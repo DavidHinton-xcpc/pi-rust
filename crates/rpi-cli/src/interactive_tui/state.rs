@@ -280,6 +280,10 @@ pub(super) struct TuiState {
     /// `theme()` is read-only after OnceLock init, so per-instance state is the
     /// only way to apply a preset at runtime.
     pub(super) theme_manager: Arc<ThemeManager>,
+    /// Discovered custom theme files (name → path), rebuilt on `/reload`.
+    /// Empty when `--no-themes` is set or no theme dirs exist. Listing is
+    /// lazy: paths only, parsed when selected.
+    pub(super) theme_registry: std::sync::RwLock<crate::themes::ThemeRegistry>,
     /// The alt-screen handle, held so `set_status` can reflect run state in the
     /// terminal window title ("rpi — working" / "rpi"). `None` in unit tests
     /// that never call `set_status` with a title.
