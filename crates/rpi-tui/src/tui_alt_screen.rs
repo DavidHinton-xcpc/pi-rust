@@ -175,7 +175,9 @@ pub struct TuiAltScreen {
     resize_dirty: AtomicBool,
     scroll_top: Mutex<usize>,
     stick_to_bottom: Mutex<bool>,
-    current_frame: Mutex<Option<LayoutFrame>>,
+    /// Share the immutable painted frame with input without cloning its layout
+    /// tree and visible strings for every mouse event.
+    current_frame: Mutex<Option<Arc<LayoutFrame>>>,
     /// When true, render into the terminal's main buffer and let the terminal
     /// own scrollback (upstream's default `regular` mode).
     main_screen_mode: Mutex<bool>,
@@ -501,15 +503,12 @@ impl TuiAltScreen {
         let Some(frame) = self.current_frame.lock().ok().and_then(|f| f.clone()) else {
             return false;
         };
-        let (columns, rows) = {
-            let Ok(terminal) = self.terminal.lock() else {
-                return false;
-            };
-            (terminal.info().columns, terminal.info().rows)
-        };
+        // Resolve against the geometry actually painted, not the terminal's
+        // live size. Taking the terminal lock here would also stall the input
+        // reader behind render diffing and slow writes, queuing stale drags.
         let changed = self
             .selection
-            .handle_mouse_event(event, &frame, rows, columns);
+            .handle_mouse_event(event, &frame, frame.height, frame.width);
         if changed {
             self.request_render_reusing_scroll_content();
         }
@@ -1305,7 +1304,7 @@ impl TuiAltScreen {
         // Its scroll snapshots must describe the screen the user actually saw,
         // not a frame still being assembled or an already-mutated live cache.
         if let Ok(mut current) = self.current_frame.lock() {
-            *current = Some(frame);
+            *current = Some(Arc::new(frame));
         }
         // Store current screen
         if let Ok(mut prev) = self.previous_screen.lock() {
@@ -1895,6 +1894,111 @@ mod tests {
         let frame = output.lock().unwrap().clone();
         assert!(frame.contains("\x1b[12;1H"), "got: {frame:?}");
         assert_eq!(*tui.painted_size.lock().unwrap(), (60, 12));
+    }
+
+    #[test]
+    fn selection_burst_does_not_wait_for_terminal_output() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use std::sync::mpsc;
+
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), false, None));
+        tui.set_layout_root(Some(Arc::new(ScrollView::simple(Arc::new(Text::new(
+            "prefix TARGET suffix",
+            0,
+            0,
+        ))))));
+        tui.start_readerless();
+        tui.enable_render_coalescing();
+        let painted = tui.current_frame.lock().unwrap().clone().unwrap();
+        output.lock().unwrap().clear();
+
+        // Model the render thread holding the terminal during a slow write.
+        // Input must keep consuming events and park only the latest repaint.
+        let terminal_guard = tui.terminal.lock().unwrap();
+        let input_tui = tui.clone();
+        let (tx, rx) = mpsc::channel();
+        let input = std::thread::spawn(move || {
+            let mouse = |kind, column| MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            input_tui
+                .handle_selection_mouse_event(&mouse(MouseEventKind::Down(MouseButton::Left), 7));
+            for i in 0..200 {
+                input_tui.handle_selection_mouse_event(&mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    8 + i % 10,
+                ));
+            }
+            input_tui
+                .handle_selection_mouse_event(&mouse(MouseEventKind::Up(MouseButton::Left), 12));
+            tx.send(input_tui.selection_text()).unwrap();
+        });
+        let selected = rx.recv_timeout(Duration::from_secs(2));
+        // Release and join even on failure, so a regression cannot hang the suite.
+        drop(terminal_guard);
+        input.join().unwrap();
+        assert_eq!(
+            selected
+                .expect("mouse input must not wait for the terminal lock")
+                .as_deref(),
+            Some("TARGET")
+        );
+        assert!(output.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            &painted,
+            tui.current_frame.lock().unwrap().as_ref().unwrap()
+        ));
+        assert!(tui.flush_pending_render());
+        assert!(output.lock().unwrap().contains("\x1b[7mTARGET"));
+        assert!(!Arc::ptr_eq(
+            &painted,
+            tui.current_frame.lock().unwrap().as_ref().unwrap()
+        ));
+        assert_eq!(painted.lines[0], "prefix TARGET suffix");
+        assert!(!tui.flush_pending_render());
+    }
+
+    #[test]
+    fn selection_uses_painted_dimensions_until_resize_is_rendered() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new(
+            "header\nmiddle\nprefix TARGET suffix",
+            0,
+            0,
+        ))));
+        tui.start_readerless();
+        tui.enable_render_coalescing();
+
+        // The terminal has resized, but input still refers to the old painted
+        // frame. Mixing its layout with the live size would clamp to row 0.
+        *size.lock().unwrap() = (8, 1);
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 12),
+            (MouseEventKind::Up(MouseButton::Left), 12),
+        ] {
+            tui.handle_selection_mouse_event(&MouseEvent {
+                kind,
+                column,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(tui.selection_text().as_deref(), Some("TARGET"));
+        assert!(tui.flush_pending_render());
+        assert!(
+            tui.selection_text().is_none(),
+            "reflow clears the old selection"
+        );
     }
 
     #[test]
