@@ -97,6 +97,34 @@ pub fn apply_loaded(loaded: &LoadedTheme, session_manager: &ThemeManager) {
     session_manager.set(loaded.theme.clone());
 }
 
+/// Resolve a `--theme`/settings spec against the discovery registry and apply
+/// it. Kept as one helper so the startup call site cannot resolve before the
+/// registry is built (the saved value may be a registry name, which only
+/// resolves when the registry is in scope).
+pub fn apply_startup_spec(
+    value: &str,
+    registry: Option<&ThemeRegistry>,
+    session_manager: &ThemeManager,
+) -> Result<(), String> {
+    apply_spec(&resolve_spec_in(value, registry), session_manager)
+}
+
+/// Resolve a `/theme <name>` argument to the spec `apply_and_persist`
+/// consumes. Built-in presets are case-folded; discovered custom themes keep
+/// the original case because the registry is case-sensitive and discovery
+/// preserves file stems (`/theme Ocean` must find `Ocean.json`).
+/// Returns `None` when the name matches neither a preset nor the registry.
+pub fn resolve_command_theme(arg: &str, registry: Option<&ThemeRegistry>) -> Option<String> {
+    let folded = arg.to_ascii_lowercase();
+    let is_preset = matches!(folded.as_str(), "light" | "monochrome" | "dark");
+    if is_preset {
+        return Some(folded);
+    }
+    registry
+        .and_then(|registry| registry.get(arg))
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// Resolve + apply a theme spec at TUI startup.
 ///
 /// Returns `Err(message)` when a file spec fails to load; the caller falls
@@ -537,5 +565,51 @@ mod tests {
             rpi_tui::theme::Color::Rgb(0, 255, 0)
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // review_pr200: the saved selector name (a registry name, not a cwd
+    // relative path) must survive a restart once the registry is in scope.
+    #[test]
+    fn review_pr200_startup_saved_registry_name_round_trips() {
+        let root = std::env::temp_dir().join(format!("rpi-theme-start-{}", std::process::id()));
+        let project = root.join("proj/.rpi/themes");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = temp_theme_file(&project, "ocean.json", "#112233");
+        let (registry, _) = ThemeRegistry::discover_from(None, Some(&project));
+
+        // Startup order contract: the registry exists before the saved spec
+        // is resolved. `apply_startup_spec` takes the registry explicitly, so
+        // the name resolves instead of degrading to a cwd-relative path.
+        let manager = ThemeManager::new();
+        apply_startup_spec("ocean", Some(&registry), &manager).unwrap();
+        assert_eq!(
+            manager.get().colors.accent,
+            rpi_tui::theme::Color::Rgb(17, 34, 51)
+        );
+
+        // Control: without the registry the same value is a missing cwd file.
+        let err = apply_startup_spec("ocean", None, &ThemeManager::new()).unwrap_err();
+        assert!(err.contains("ocean"), "{err}");
+        let _ = path;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // review_pr200: /theme <name> keeps custom-name case for the registry
+    // lookup (case-sensitive stems) while presets stay case-folded.
+    #[test]
+    fn review_pr200_command_theme_preserves_custom_case() {
+        let root = std::env::temp_dir().join(format!("rpi-theme-case-{}", std::process::id()));
+        let project = root.join("proj/.rpi/themes");
+        write_theme(&project, "Ocean.json");
+        let (registry, _) = ThemeRegistry::discover_from(None, Some(&project));
+
+        let resolved = resolve_command_theme("Ocean", Some(&registry)).expect("Ocean resolves");
+        assert!(resolved.ends_with("Ocean.json"), "{resolved}");
+        // Folded lookup would miss the stem; pin that this is not what happens.
+        assert!(registry.get("ocean").is_none());
+        // Presets still fold, and unknown names return None.
+        assert_eq!(resolve_command_theme("DARK", None).as_deref(), Some("dark"));
+        assert!(resolve_command_theme("Nope", Some(&registry)).is_none());
+        std::fs::remove_dir_all(&root).ok();
     }
 }

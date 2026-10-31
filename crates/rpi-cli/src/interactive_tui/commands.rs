@@ -317,32 +317,24 @@ impl SlashCommand for ThemeCommand {
         "Choose a theme (selector)"
     }
     fn execute(&self, ctx: &CommandContext, args: &str) {
-        let name = args.trim().to_ascii_lowercase();
-        if !name.is_empty() {
+        let arg = args.trim();
+        if !arg.is_empty() {
             // /theme <name> — direct apply + persist (matches /settings Theme).
-            // Built-in presets first, then discovered custom themes (file
-            // stems). Both paths go through the shared apply helper.
-            let is_preset = matches!(name.as_str(), "light" | "monochrome" | "dark");
-            let resolved = if is_preset {
-                Some(name.clone())
-            } else {
-                let registry = ctx
-                    .state
-                    .theme_registry
-                    .read()
-                    .ok()
-                    .map(|registry| registry.clone());
-                registry.and_then(|registry| {
-                    registry
-                        .get(&name)
-                        .map(|path| path.to_string_lossy().to_string())
-                })
-            };
+            // Resolution lives in `resolve_command_theme`: presets case-fold,
+            // custom themes keep the original case (registry lookup is
+            // case-sensitive, discovery preserves file stems).
+            let registry = ctx
+                .state
+                .theme_registry
+                .read()
+                .ok()
+                .map(|registry| registry.clone());
+            let resolved = crate::themes::resolve_command_theme(arg, registry.as_ref());
             let Some(spec) = resolved else {
                 add_error_message(
                     &ctx.chat,
                     &format!(
-                        "Unknown theme \"{name}\". Valid: dark, light, monochrome, or a discovered theme."
+                        "Unknown theme \"{arg}\". Valid: dark, light, monochrome, or a discovered theme."
                     ),
                 );
                 ctx.tui.request_render(false);

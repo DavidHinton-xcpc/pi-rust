@@ -995,21 +995,9 @@ pub async fn interactive_tui(
     // components keep styled text, so doing this after the welcome banner left
     // the first screen in the dark palette until it was rebuilt.
     let theme_manager = Arc::new(ThemeManager::new());
-    if let Some(spec) = theme {
-        // `--theme` / settings: preset name or theme file path. A file that
-        // fails to load warns and falls back to the built-in default without
-        // vetoing startup (`emit_startup_warnings` style); the TUI still comes
-        // up in the dark palette and `/theme` remains available.
-        match crate::themes::apply_spec(&crate::themes::resolve_spec(spec), &theme_manager) {
-            Ok(()) => {}
-            Err(message) => {
-                eprintln!("warning: {message}; using the built-in default theme");
-            }
-        }
-    }
-    // Custom theme discovery (issue series 3/5). `--no-themes` already folded
-    // into `theme == None` upstream, but discovery has its own switch so a
-    // bare `--no-themes` also suppresses directory scanning.
+    // Build the discovery registry before resolving the saved spec: selector
+    // and settings persist a registry name (e.g. "ocean"), which only
+    // resolves to its file when the registry is already in scope.
     let theme_registry = if no_themes {
         crate::themes::ThemeRegistry::default()
     } else {
@@ -1019,7 +1007,19 @@ pub async fn interactive_tui(
         }
         registry
     };
-
+    if let Some(spec) = theme {
+        // `--theme` / settings: preset name, registry name, or theme file
+        // path. A file that fails to load warns and falls back to the
+        // built-in default without vetoing startup (`emit_startup_warnings`
+        // style); the TUI still comes up in the dark palette and `/theme`
+        // remains available.
+        match crate::themes::apply_startup_spec(spec, Some(&theme_registry), &theme_manager) {
+            Ok(()) => {}
+            Err(message) => {
+                eprintln!("warning: {message}; using the built-in default theme");
+            }
+        }
+    }
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
@@ -3557,18 +3557,22 @@ pub async fn interactive_tui(
                 state.set_markdown_transformer_with_reinstall(fresh_transformer);
                 // Rebuild the custom-theme registry: extension reloads can
                 // change project trust (`/trust` flow) and the session cwd is
-                // fixed per TUI, so re-resolve both. A broken theme dir
-                // surfaces as a warning, never a reload failure.
+                // fixed per TUI, so re-resolve both. Use the policy this
+                // reload actually resolved (`resolve_project_trust` over the
+                // effective args), not the immutable startup snapshot;
+                // after a hard failure the previous resources were kept, so
+                // the previous registry stays untouched too. A broken theme
+                // dir surfaces as a warning, never a reload failure.
                 if !reload_ctx.args.no_themes {
-                    let (registry, diagnostics) = crate::themes::ThemeRegistry::discover(
-                        &reload_ctx.cwd,
-                        reload_ctx.project_trusted,
-                    );
-                    for diagnostic in &diagnostics {
-                        eprintln!("warning: {diagnostic}");
-                    }
-                    if let Ok(mut guard) = state.theme_registry.write() {
-                        *guard = registry;
+                    if let Some(reload_trusted) = outcome.project_trusted {
+                        let (registry, diagnostics) =
+                            crate::themes::ThemeRegistry::discover(&reload_ctx.cwd, reload_trusted);
+                        for diagnostic in &diagnostics {
+                            eprintln!("warning: {diagnostic}");
+                        }
+                        if let Ok(mut guard) = state.theme_registry.write() {
+                            *guard = registry;
+                        }
                     }
                 }
                 if outcome.had_errors {
