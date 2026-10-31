@@ -410,9 +410,9 @@ impl Terminal for ProcessTerminal {
         }
         self.configure_mouse_tracking();
         self.hide_cursor();
-        // Enable bracketed paste mode so pasted text arrives as a single
-        // Event::Paste instead of individual key events (which would trigger
-        // submit per line for multi-line pastes).
+        // Request bracketed paste. Unix crossterm decodes it as Event::Paste;
+        // the Windows console backend still needs its native paste collector
+        // because console translation can strip the bracket markers.
         self.write("\x1b[?2004h");
         #[cfg(unix)]
         if keyboard_protocol_enabled() && self.is_tty() && io::stdin().is_terminal() {
