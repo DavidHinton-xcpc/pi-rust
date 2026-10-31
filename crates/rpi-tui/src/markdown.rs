@@ -1521,6 +1521,41 @@ mod tests {
     }
 
     #[test]
+    fn review_pr196_table_cell_keeps_a_sequence_intact_at_terminal_widths() {
+        // ZWJ / skin-tone sequences are one display unit: the wrapper must
+        // never split them into continuation rows (the woman on one row, the
+        // laptop on the next). Reproduces at an ordinary 80-column width and
+        // in a one-column cell at width 6 — not only an extremely narrow
+        // terminal.
+        for emoji in ["👩‍💻", "👍🏽"] {
+            let source = format!(
+                "| e | content |\n|---|---|\n| {emoji} | {} |",
+                "x".repeat(800)
+            );
+            let lines = Markdown::new(source, 0, 0).render(80);
+            let plain = crate::ansi::strip_ansi(&lines.join("\n"));
+            assert!(
+                plain.contains(emoji),
+                "{emoji:?} split across body rows: {plain}"
+            );
+
+            let narrow = Markdown::new(format!("| {emoji} |\n|---|"), 0, 0).render(6);
+            let plain = crate::ansi::strip_ansi(&narrow.join("\n"));
+            assert!(plain.contains(emoji), "{emoji:?} split at width 6: {plain}");
+        }
+    }
+
+    #[test]
+    fn review_pr196_inline_reset_then_combining_mark_survives_render() {
+        // The inline renderer's bold reset SGR can land in the same grapheme
+        // as a following combining mark; the shared wrapper dropped the
+        // visible remainder, so the accent vanished from renderer output.
+        let rows = Markdown::new("**a**\u{301}b", 0, 0).render(80);
+        let plain = crate::ansi::strip_ansi(&rows.join("\n"));
+        assert!(plain.contains('\u{301}'), "accent lost: {plain}");
+    }
+
+    #[test]
     fn test_base_style_reopened_after_inline_code_reset() {
         // Regression: inline code (and other colored spans) terminate with an
         // `SGR 0` reset, which used to drop the enclosing base style for the

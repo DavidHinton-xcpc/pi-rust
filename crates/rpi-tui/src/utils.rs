@@ -321,28 +321,9 @@ pub fn wrap_text_with_ansi(s: &str, max_width: usize) -> Vec<String> {
     let mut pending_style = String::new();
 
     for grapheme in s.graphemes(true) {
-        // A cluster may still contain a whole escape sequence (they are
-        // single-scalar in practice, but keep the scanner exact).
-        if grapheme.starts_with('\x1b') || in_escape {
-            for c in grapheme.chars() {
-                if in_escape {
-                    pending_style.push(c);
-                    if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
-                        in_escape = false;
-                    }
-                    continue;
-                }
-
-                if c == '\x1b' {
-                    in_escape = true;
-                    pending_style.push(c);
-                    continue;
-                }
-            }
-            continue;
-        }
-
-        if grapheme == "\n" {
+        // CRLF segments as one grapheme but is a line break like a bare \n
+        // (a lone \r keeps the pre-existing contract: dropped as a control).
+        if grapheme == "\r\n" || grapheme == "\n" {
             if !pending_style.is_empty() {
                 current_line.push_str(&pending_style);
                 pending_style.clear();
@@ -353,28 +334,67 @@ pub fn wrap_text_with_ansi(s: &str, max_width: usize) -> Vec<String> {
             continue;
         }
 
-        if grapheme.chars().all(|c| c < ' ' || c == '\x7f') {
+        // ESC starts its own cluster (controls segment apart), so the control
+        // filter must never swallow it; `in_escape` means the tail of a
+        // sequence is spread over the following clusters.
+        if !grapheme.starts_with('\x1b')
+            && !in_escape
+            && grapheme.chars().all(|c| c < ' ' || c == '\x7f')
+        {
             continue;
         }
 
-        let cluster_width = UnicodeWidthStr::width(grapheme);
-
-        if current_width + cluster_width > max_width && current_width > 0 {
-            // Start a new line
+        // Split the cluster into ANSI control sequences and the printable
+        // remainder. A combining mark can share a cluster with an SGR
+        // terminator (`m` + U+0301): consuming the whole cluster at the `m`
+        // discarded the visible remainder, losing the accent.
+        let mut rest = grapheme;
+        loop {
+            if in_escape {
+                let mut consumed = 0;
+                for c in rest.chars() {
+                    consumed += c.len_utf8();
+                    pending_style.push(c);
+                    if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
+                        in_escape = false;
+                        break;
+                    }
+                }
+                rest = &rest[consumed..];
+                if in_escape {
+                    // The sequence continues in the next cluster.
+                    break;
+                }
+            }
+            if rest.starts_with('\x1b') {
+                in_escape = true;
+                pending_style.push('\x1b');
+                rest = &rest[1..];
+                continue;
+            }
+            if rest.is_empty() {
+                break;
+            }
+            // Printable remainder (zero-width marks included): it is the tail
+            // of one display unit and is never split further.
+            let cluster_width = UnicodeWidthStr::width(rest);
+            if current_width + cluster_width > max_width && current_width > 0 && cluster_width > 0 {
+                // Start a new line
+                if !pending_style.is_empty() {
+                    current_line.push_str(&pending_style);
+                }
+                lines.push(current_line);
+                current_line = String::new();
+                current_width = 0;
+            }
             if !pending_style.is_empty() {
                 current_line.push_str(&pending_style);
+                pending_style.clear();
             }
-            lines.push(current_line);
-            current_line = String::new();
-            current_width = 0;
+            current_line.push_str(rest);
+            current_width += cluster_width;
+            break;
         }
-
-        if !pending_style.is_empty() {
-            current_line.push_str(&pending_style);
-            pending_style.clear();
-        }
-        current_line.push_str(grapheme);
-        current_width += cluster_width;
     }
 
     if !current_line.is_empty() {
@@ -552,6 +572,36 @@ mod tests {
                 "{seq:?} overflowed the wrap width: {lines:?}"
             );
         }
+    }
+
+    #[test]
+    fn wrap_preserves_crlf_line_breaks() {
+        // CRLF segments as one grapheme; dropping it as controls glued the
+        // rows together ("firstsecond"), losing the newline contract the
+        // per-char wrapper had.
+        assert_eq!(
+            wrap_text_with_ansi("first\r\nsecond", 80),
+            ["first", "second"]
+        );
+        // A bare \r keeps the existing contract: dropped as a control.
+        assert_eq!(wrap_text_with_ansi("first\rsecond", 80), ["firstsecond"]);
+    }
+
+    #[test]
+    fn wrap_keeps_visible_tail_after_an_ansi_sequence_inside_a_cluster() {
+        // A combining mark can share a cluster with the SGR terminator (`m` +
+        // U+0301); consuming the whole cluster at the `m` lost the accent.
+        let lines = wrap_text_with_ansi("a\x1b[31m\u{301}b", 80);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains('\u{301}'),
+            "combining mark after SGR was dropped: {lines:?}"
+        );
+        // A sequence spanning clusters still terminates correctly.
+        assert_eq!(
+            strip_ansi(&wrap_text_with_ansi("\x1b[31mred\x1b[0m", 80).join("")),
+            "red"
+        );
     }
 
     #[test]
