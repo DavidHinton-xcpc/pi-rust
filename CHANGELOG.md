@@ -11,6 +11,10 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- *(tui)* markdown table cells wrap without splitting a displayed Unicode sequence: `wrap_text_with_ansi`, `visible_width` and the per-column width floor now measure grapheme clusters (and whole ANSI-free spans) instead of summing scalars, so a ZWJ sequence (`👩‍💻`), a skin-tone modifier (`👍🏽`) or a VS16 sequence (`❤️`) stays on one row at ordinary and narrow terminal widths
+
 ## [0.15.0](https://github.com/bigfish1913/pi-rust/compare/v0.14.0...v0.15.0) - 2026-10-30
 
 ### Added
