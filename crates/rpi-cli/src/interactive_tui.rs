@@ -996,14 +996,17 @@ pub async fn interactive_tui(
     // components keep styled text, so doing this after the welcome banner left
     // the first screen in the dark palette until it was rebuilt.
     let theme_manager = Arc::new(ThemeManager::new());
-    if let Some(preset) = match theme {
-        Some("light") => Some(ThemePreset::Light),
-        Some("monochrome") => Some(ThemePreset::Monochrome),
-        Some("dark") => Some(ThemePreset::Dark),
-        _ => None,
-    } {
-        apply_theme_preset(preset);
-        theme_manager.apply_preset(preset);
+    if let Some(spec) = theme {
+        // `--theme` / settings: preset name or theme file path. A file that
+        // fails to load warns and falls back to the built-in default without
+        // vetoing startup (`emit_startup_warnings` style); the TUI still comes
+        // up in the dark palette and `/theme` remains available.
+        match crate::themes::apply_spec(&crate::themes::resolve_spec(spec), &theme_manager) {
+            Ok(()) => {}
+            Err(message) => {
+                eprintln!("warning: {message}; using the built-in default theme");
+            }
+        }
     }
 
     // ---- TUI + containers ----
