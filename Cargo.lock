@@ -2215,6 +2215,7 @@ dependencies = [
  "futures",
  "globset",
  "image",
+ "jsonschema",
  "nix",
  "regex",
  "rpi-agent",

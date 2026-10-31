@@ -102,6 +102,15 @@ pub enum Command {
     SetThinkingLevel {
         level: rpi_ai::types::ThinkingLevel,
     },
+    ConfigureExternalTools {
+        tools: Vec<rpi_tools::tools::external::ExternalToolDefinition>,
+    },
+    // Outcome validation is presence-aware in ExternalTools::respond: Option
+    // would conflate explicit null with an absent outcome.
+    ExternalToolResponse {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     GetAvailableTools,
     SetActiveTools {
         tools: Vec<String>,
@@ -142,6 +151,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "set_model",
     "get_available_thinking_levels",
     "set_thinking_level",
+    "configure_external_tools",
+    "external_tool_response",
     "get_available_tools",
     "set_active_tools",
     "ui_dialog_response",
@@ -179,7 +190,7 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
-        "supportedEvents": ["session_entry_committed"],
+        "supportedEvents": ["session_entry_committed", "external_tool_request", "external_tool_request_closed"],
         "semantics": {
             "messageUpdates": mode.as_str(),
             "promptResponse": "accepted",

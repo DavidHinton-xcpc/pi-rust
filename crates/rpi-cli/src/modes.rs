@@ -334,7 +334,7 @@ async fn rpc_with_io<R, W>(
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
     message_updates: crate::args::RpcMessageUpdates,
-    input: R,
+    mut input: R,
     output: W,
 ) -> i32
 where
@@ -347,6 +347,18 @@ where
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
     let (stdout, writer_task, writer_failed) = start_rpc_writer(output, message_updates);
     let pump_stop = tokio_util::sync::CancellationToken::new();
+    let external_tools =
+        crate::rpc::external_tools::ExternalTools::new(stdout.clone(), Arc::downgrade(&lane));
+    let mut external_names = Vec::new();
+    let mut owner = RpcOwner {
+        harness,
+        backend: external_tools.clone(),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
+        pump_stop: pump_stop.clone(),
+        failed: writer_failed.clone(),
+        mailbox: ui_dialog.clone(),
+        armed: true,
+    };
 
     // Publish generic commit metadata after successful Session appends. The
     // event is intentionally not a durable-state payload: consumers reread
@@ -461,9 +473,6 @@ where
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
-    use tokio::io::AsyncBufReadExt;
-
-    let mut lines = input.lines();
     write_line(&stdout, &rpc_protocol::ready(message_updates)).await;
 
     loop {
@@ -472,18 +481,32 @@ where
                 cancel_on_exit = true;
                 break;
             }
-            line = lines.next_line() => line,
+            line = crate::rpc::framing::read_frame(&mut input) => line,
         };
         let line = match incoming {
             Ok(Some(line)) => line,
             Ok(None) => break, // EOF
             Err(error) => {
                 eprintln!("[rpi] rpc stdin error: {error}");
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                writer_failed.cancel();
                 cancel_on_exit = true;
                 break;
             }
         };
-        let line = line.trim();
+        let line = match std::str::from_utf8(&line) {
+            Ok(line) => line.trim(),
+            Err(_) => {
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                writer_failed.cancel();
+                cancel_on_exit = true;
+                break;
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -584,6 +607,9 @@ where
             }
             "stop" => {
                 cancel_on_exit = true;
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
                 write_line(
                     &stdout,
                     &rpc_protocol::response(
@@ -614,6 +640,7 @@ where
                     let _ = task.await;
                 }
                 run_cancel = tokio_util::sync::CancellationToken::new();
+                owner.run_cancel = run_cancel.clone();
                 let cancel_task = run_cancel.clone();
                 // Resuming spends the tokens the interrupted run never did, so it
                 // only proceeds when recovery actually left a pending run.
@@ -725,15 +752,32 @@ where
 
         let result = match kind.as_str() {
             "abort" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
-                // This also covers abort arriving before the task enters the lane.
+                // Keep wrapper cancellation for pre-admission aborts, but signal
+                // an admitted harness run before retiring external broker waiters.
                 run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.abort();
                 Ok(serde_json::json!({"aborted": true}))
             }
-            "abort" => lane
-                .abort()
+            "abort" => {
+                let result = lane.abort().await.map_err(|e| e.to_string());
+                external_tools.abort();
+                result.map(|_| serde_json::json!({"aborted": true}))
+            }
+            "configure_external_tools" => {
+                rpc_configure_external_tools(
+                    &lane,
+                    harness,
+                    run_active.load(std::sync::atomic::Ordering::Acquire),
+                    &external_tools,
+                    &mut external_names,
+                    &msg,
+                )
                 .await
-                .map(|_| serde_json::json!({"aborted": true}))
-                .map_err(|e| e.to_string()),
+            }
+            "external_tool_response" => external_tools
+                .respond(&msg)
+                .map(|accepted| serde_json::json!({"accepted": accepted})),
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
@@ -769,13 +813,28 @@ where
     ui_dialog.detach();
     if cancel_on_exit {
         run_cancel.cancel();
+        let _ = lane.abort().await;
     }
+    // EOF makes future external replies impossible. Disable the backend before
+    // joining, without cancelling an otherwise healthy model-only run.
+    external_tools.shutdown();
     for task in command_tasks {
         let _ = task.await;
     }
     let mut exit_code = 0;
-    if let Some(task) = run_task {
-        if let Err(error) = task.await {
+    // A broken transport during healthy EOF waiting must still cancel the run.
+    if let Some(mut task) = run_task {
+        let result = tokio::select! {
+            biased;
+            result = &mut task => result,
+            _ = writer_failed.cancelled() => {
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                task.await
+            }
+        };
+        if let Err(error) = result {
             eprintln!("[rpi] rpc prompt task failed: {error}");
             exit_code = 1;
         }
@@ -802,7 +861,32 @@ where
             exit_code = 1;
         }
     }
+    owner.armed = false;
     exit_code
+}
+
+// Synchronous cleanup survives cancellation/drop of the RPC owner future.
+// The run is signalled before retiring waiters, preserving aborted settlement.
+struct RpcOwner<'a> {
+    harness: &'a AgentHarness,
+    backend: Arc<crate::rpc::external_tools::ExternalTools>,
+    run_cancel: tokio_util::sync::CancellationToken,
+    pump_stop: tokio_util::sync::CancellationToken,
+    failed: tokio_util::sync::CancellationToken,
+    mailbox: rpi_extensions::UiDialogMailbox,
+    armed: bool,
+}
+impl Drop for RpcOwner<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.run_cancel.cancel();
+            self.backend.shutdown();
+            self.failed.cancel();
+            self.pump_stop.cancel();
+            self.mailbox.detach();
+            self.harness.session().set_entry_commit_publisher(None);
+        }
+    }
 }
 
 fn rpc_get_commands(snapshot: Option<&rpi_extensions::RegistrySnapshot>) -> serde_json::Value {
@@ -1901,6 +1985,75 @@ async fn rpc_get_available_thinking_levels(lane: &Arc<dyn AgentLane>) -> serde_j
     serde_json::json!({"levels": levels})
 }
 
+async fn rpc_configure_external_tools(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    run_active: bool,
+    backend: &Arc<crate::rpc::external_tools::ExternalTools>,
+    old_names: &mut Vec<String>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use rpi_harness::types::HarnessTool;
+    use rpi_tools::tools::external::{
+        create_external_tool, validate_external_tool_definitions, ExternalToolDefinition,
+    };
+    if run_active
+        || lane
+            .snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .active
+            .is_some()
+    {
+        return Err("cannot configure external tools while a run is active".into());
+    }
+    let definitions: Vec<ExternalToolDefinition> =
+        serde_json::from_value(msg["tools"].clone()).map_err(|e| e.to_string())?;
+    let mut registry = harness.get_tools().await.map_err(|e| e.to_string())?;
+    registry.retain(|tool| !old_names.contains(&tool.tool.schema().name));
+    // Reserve security/native names even when unavailable or disabled at launch.
+    let mut reserved = [
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "powershell",
+        "docs",
+        "grep",
+        "find",
+        "ls",
+        "image",
+        "permissions",
+        "permission",
+        "ask_user",
+        "plan_mode_start",
+        "plan_mode_complete",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect::<Vec<_>>();
+    reserved.extend(registry.iter().map(|tool| tool.tool.schema().name.clone()));
+    validate_external_tool_definitions(&definitions, &reserved).map_err(|e| e.to_string())?;
+    let names = definitions
+        .iter()
+        .map(|def| def.name.clone())
+        .collect::<Vec<_>>();
+    let mut active = lane.get_active_tools().await.map_err(|e| e.to_string())?;
+    active.retain(|name| !old_names.contains(name));
+    active.extend(names.clone());
+    registry.extend(
+        definitions
+            .into_iter()
+            .map(|def| HarnessTool::new(create_external_tool(def, backend.clone()))),
+    );
+    harness
+        .set_tools(registry, Some(active.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    *old_names = names.clone();
+    Ok(serde_json::json!({"tools": names, "activeTools": active}))
+}
+
 async fn rpc_get_available_tools(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
@@ -2233,6 +2386,10 @@ mod tests {
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    include!("rpc/external_tools_configuration_tests.rs");
+    include!("rpc/external_tools_lifecycle_tests.rs");
+    include!("rpc/external_tools_abort_outcome_tests.rs");
 
     #[test]
     fn session_branch_query_requires_canonical_arguments() {
