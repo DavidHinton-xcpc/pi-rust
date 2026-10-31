@@ -307,10 +307,15 @@ impl ThemeJson {
     /// default palette.
     pub fn to_theme_colors(&self) -> Result<ThemeColors, ThemeJsonError> {
         let mut colors = ThemeColors::default();
-        for (token, slot) in TOKENS {
-            let Some(slot) = slot else { continue };
-            if let Some(value) = self.colors.get(*token) {
-                let color = self.resolve_value(value).map_err(|e| e.with_token(token))?;
+        // Validate every supplied known token even when it has no rendering
+        // slot yet; only tokens with a slot are written through.
+        for (token, value) in &self.colors {
+            let color = self.resolve_value(value).map_err(|e| e.with_token(token))?;
+            if let Some(slot) = TOKENS
+                .iter()
+                .find(|(name, _)| name == token)
+                .and_then(|(_, slot)| *slot)
+            {
                 slot(&mut colors, color);
             }
         }
@@ -559,6 +564,38 @@ mod tests {
     fn unknown_token_names_the_token() {
         let err = ThemeJson::parse(r##"{"name":"t","colors":{"mdHeadingg":"#fff"}}"##).unwrap_err();
         assert!(err.to_string().contains("mdHeadingg"), "{err}");
+    }
+
+    // review_pr198: slotless tokens (no ThemeColors consumer) must still be
+    // validated when the file is loaded, not only via resolved_color().
+    #[test]
+    fn review_pr198_slotless_invalid_value_fails_load() {
+        let theme = ThemeJson::parse(r##"{"name":"t","colors":{"syntaxComment":"#gggggg"}}"##)
+            .expect("probe input must parse");
+        let err = theme.to_theme().unwrap_err();
+        assert!(err.to_string().contains("colors.syntaxComment"), "{err}");
+        assert!(err.to_string().contains("#gggggg"), "{err}");
+    }
+
+    #[test]
+    fn review_pr198_slotless_var_cycle_fails_load() {
+        let theme = ThemeJson::parse(
+            r#"{"name":"t","vars":{"a":"b","b":"a"},"colors":{"thinkingHigh":"a"}}"#,
+        )
+        .expect("probe input must parse");
+        let err = theme.to_theme().unwrap_err();
+        assert!(err.to_string().contains("colors.thinkingHigh"), "{err}");
+        assert!(err.to_string().contains("circular"), "{err}");
+    }
+
+    #[test]
+    fn review_pr198_valid_slotless_token_still_loads() {
+        let theme = ThemeJson::parse(
+            r##"{"name":"t","colors":{"syntaxComment":"#8abeb7","accent":"#1f9"}}"##,
+        )
+        .unwrap();
+        let colors = theme.to_theme_colors().unwrap();
+        assert_eq!(colors.accent, Color::Rgb(17, 255, 153));
     }
 
     #[test]
