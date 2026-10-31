@@ -347,7 +347,8 @@ where
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
     let (stdout, writer_task, writer_failed) = start_rpc_writer(output, message_updates);
     let pump_stop = tokio_util::sync::CancellationToken::new();
-    let external_tools = crate::rpc::external_tools::ExternalTools::new(stdout.clone());
+    let external_tools =
+        crate::rpc::external_tools::ExternalTools::new(stdout.clone(), Arc::downgrade(&lane));
     let mut external_names = Vec::new();
     let mut owner = RpcOwner {
         harness,

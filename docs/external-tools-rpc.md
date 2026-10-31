@@ -72,9 +72,10 @@ error results preserve explicit content/structured data in the error message,
 **not** unknown raw metadata. Nothing is silently truncated.
 
 Native emits `external_tool_request_closed {requestId}` on completion, timeout,
-cancellation or future drop. Its synchronous RAII enqueue is mandatory: a full
-or closed queue signals authoritative transport failure. Request retirement is
-synchronous and does not depend on output delivery or detached tasks.
+cancellation or future drop. Normal returns finalize its synchronous enqueue
+explicitly; RAII is the fallback for dropped futures. A full or closed queue
+signals authoritative transport failure. Request retirement is synchronous and
+does not depend on output delivery or detached tasks.
 
 ## Transport and ownership
 
@@ -88,8 +89,11 @@ deadline; ordinary healthy producers retain backpressure without that deadline.
 Every awaited producer wakes on transport failure. Enqueue acceptance does not
 promise OS delivery. Failed closure enqueue is authoritative failure too.
 
-Abort/stop/failure signal the foreground run before retiring waiters. EOF disables
-the backend and resolves outstanding calls before joining. An accepted ordinary
+Abort/stop/failure signal the foreground run before retiring failed waiters.
+The backend weakly references the foreground lane and awaits root cancellation
+before returning an output failure, including failure to enqueue a closure. This
+does not rely on the RPC owner being scheduled first or cancel only a tool's
+child token. EOF disables the backend and resolves outstanding calls before joining. An accepted ordinary
 healthy model-only prompt may finish after EOF, including runs longer than two
 seconds: there is no shutdown watchdog or process-exit timer. Registry-retained
 backends lose their writer on shutdown, including cancellation of the RPC owner

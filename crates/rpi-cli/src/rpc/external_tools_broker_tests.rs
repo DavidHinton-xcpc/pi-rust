@@ -2,7 +2,7 @@
 async fn malformed_outcomes_do_not_retire_waiter_and_duplicates_are_false() {
     let (writer, task, _) =
         super::super::writer::start_rpc_writer(std::io::sink(), Default::default());
-    let backend = ExternalTools::new(writer);
+    let backend = ExternalTools::detached(writer);
     let request = backend.broker.register().unwrap();
     let id = request.id.clone();
     for mut malformed in [

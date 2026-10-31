@@ -10,7 +10,7 @@ async fn external_configuration_is_atomic_and_preserves_native_active_selection(
     // built-in denylist, rather than testing only the reported active names.
     let (writer, writer_task, _) =
         crate::rpc::writer::start_rpc_writer(std::io::sink(), Default::default());
-    let backend = crate::rpc::external_tools::ExternalTools::new(writer.clone());
+    let backend = crate::rpc::external_tools::ExternalTools::detached(writer.clone());
     let tools = ["read", "write", "plugin_native"]
         .into_iter()
         .map(|name| {

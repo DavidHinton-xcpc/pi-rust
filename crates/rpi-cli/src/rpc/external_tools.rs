@@ -9,23 +9,42 @@ use rpi_agent::{
     types::{AgentToolResult, TextContentOrImage},
 };
 use rpi_ai::types::Content;
+use rpi_harness::agent_harness::AgentLane;
 use rpi_tools::tools::external::ExternalToolBackend;
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct ExternalTools {
     pub broker: ClientRequestBroker,
     writer: std::sync::Mutex<Option<RpcWriter>>,
     stop: CancellationToken,
+    // The RPC owner retains the strong lane; registry -> backend must not cycle.
+    lane: Option<Weak<dyn AgentLane>>,
 }
 impl ExternalTools {
-    pub fn new(writer: RpcWriter) -> Arc<Self> {
+    pub fn new(writer: RpcWriter, lane: Weak<dyn AgentLane>) -> Arc<Self> {
+        Self::with_lane(writer, Some(lane))
+    }
+    #[cfg(test)]
+    pub fn detached(writer: RpcWriter) -> Arc<Self> {
+        Self::with_lane(writer, None)
+    }
+    fn with_lane(writer: RpcWriter, lane: Option<Weak<dyn AgentLane>>) -> Arc<Self> {
         Arc::new(Self {
             broker: ClientRequestBroker::default(),
             writer: std::sync::Mutex::new(Some(writer)),
             stop: CancellationToken::new(),
+            lane,
         })
+    }
+    async fn abort_foreground(&self) {
+        if let Some(lane) = self.lane.as_ref().and_then(Weak::upgrade) {
+            let _ = lane.abort().await;
+        }
     }
     pub fn abort(&self) {
         self.broker.cancel_all();
@@ -200,47 +219,77 @@ impl ExternalToolBackend for ExternalTools {
             .clone()
             .ok_or(AgentError::Abort)?;
         let request = self.broker.register().map_err(AgentError::Tool)?;
-        let _close = CloseRequest {
+        let mut close = CloseRequest {
             writer: writer.clone(),
             id: request.id.clone(),
+            closed: false,
         };
         let event = json!({"type":"external_tool_request", "requestId":request.id, "toolName":name, "arguments":arguments});
         if event.to_string().len() + 1 > super::protocol::MAX_FRAME_BYTES {
+            close.close();
+            if writer.failure().is_cancelled() {
+                self.abort_foreground().await;
+            }
             return Err(AgentError::Validation(
                 "external arguments exceed frame limit".into(),
             ));
         }
         let failure = writer.failure();
         let operation = async {
-            writer
-                .write_bounded(&event)
-                .await
-                .map_err(|e| AgentError::Tool(e.to_string()))?;
+            if writer.write_bounded(&event).await.is_err() {
+                // Signal the ROOT, not the tool's child token, before this
+                // operation drops its captured request or returns to the loop.
+                self.abort_foreground().await;
+                return Err(AgentError::Abort);
+            }
             request
                 .wait(Duration::from_millis(MAX_TIMEOUT_MS), &cancel)
                 .await
                 .map_err(AgentError::Tool)
         };
+        // Keep the losing operation alive until the failure branch has awaited
+        // root cancellation; select's temporary futures otherwise drop too soon.
+        let operation = tokio::time::timeout(Duration::from_millis(MAX_TIMEOUT_MS), operation);
+        tokio::pin!(operation);
         let raw = tokio::select! {
             biased;
-            _ = self.stop.cancelled() => return Err(AgentError::Abort),
-            _ = cancel.cancelled() => return Err(AgentError::Abort),
-            _ = failure.cancelled() => return Err(AgentError::Abort),
-            result = tokio::time::timeout(Duration::from_millis(MAX_TIMEOUT_MS), operation) => result.map_err(|_| AgentError::Tool("external tool timed out".into()))??,
+            _ = self.stop.cancelled() => Err(AgentError::Abort),
+            _ = cancel.cancelled() => Err(AgentError::Abort),
+            _ = failure.cancelled() => {
+                self.abort_foreground().await;
+                Err(AgentError::Abort)
+            },
+            result = &mut operation => result.unwrap_or_else(|_| Err(AgentError::Tool("external tool timed out".into()))),
         };
-        decode_result(raw)
+        // Closing a successful or failed request can itself overflow stdout.
+        // Do it explicitly before returning; Drop is cancellation-only fallback.
+        close.close();
+        if failure.is_cancelled() {
+            self.abort_foreground().await;
+            return Err(AgentError::Abort);
+        }
+        decode_result(raw?)
     }
 }
 struct CloseRequest {
     writer: RpcWriter,
     id: String,
+    closed: bool,
+}
+impl CloseRequest {
+    fn close(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            let event = json!({"type":"external_tool_request_closed", "requestId":self.id});
+            self.writer.try_write_line(&event);
+        }
+    }
 }
 impl Drop for CloseRequest {
     fn drop(&mut self) {
-        // Nonblocking closure notification; failure is authoritative transport
-        // failure. Retirement itself remains synchronous on waiter drop.
-        let event = json!({"type":"external_tool_request_closed", "requestId":self.id});
-        self.writer.try_write_line(&event);
+        // Best effort for externally cancelled futures. Normal exits close
+        // explicitly and await foreground abort on authoritative queue failure.
+        self.close();
     }
 }
 
@@ -260,4 +309,5 @@ mod tests {
     include!("external_tools_result_tests.rs");
     include!("external_tools_broker_tests.rs");
     include!("external_tools_child_tests.rs");
+    include!("external_tools_failure_ordering_tests.rs");
 }

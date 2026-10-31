@@ -33,7 +33,7 @@ fn external_test_tool(backend: Arc<ExternalTools>) -> Arc<dyn rpi_agent::agent_t
 async fn child_scope_rejects_external_tools_without_emitting_even_with_spoofed_arguments() {
     let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (writer, task, _) = start_rpc_writer(ExternalEventCapture(tx), Default::default());
-    let backend = ExternalTools::new(writer);
+    let backend = ExternalTools::detached(writer);
     let tool = external_test_tool(backend.clone());
     // Real host scope, including a hostile false childAgent in the context.
     // Neither that value nor the caller's JSON may override host provenance.
@@ -68,7 +68,7 @@ async fn child_scope_rejects_external_tools_without_emitting_even_with_spoofed_a
 async fn root_external_tool_still_emits_and_settles_with_structured_content() {
     let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (writer, task, _) = start_rpc_writer(ExternalEventCapture(tx), Default::default());
-    let backend = ExternalTools::new(writer);
+    let backend = ExternalTools::detached(writer);
     let tool = external_test_tool(backend.clone());
     let raw = json!({"content":[{"type":"text","text":"answer"}],"structuredContent":{"x":2},"_meta":{"private":true}});
     let run = tool.execute(
@@ -117,7 +117,7 @@ async fn root_external_tool_still_emits_and_settles_with_structured_content() {
 async fn root_external_tool_cancellation_still_closes_and_retires_request() {
     let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (writer, task, _) = start_rpc_writer(ExternalEventCapture(tx), Default::default());
-    let backend = ExternalTools::new(writer);
+    let backend = ExternalTools::detached(writer);
     let tool = external_test_tool(backend.clone());
     let cancelled = CancellationToken::new();
     cancelled.cancel();
