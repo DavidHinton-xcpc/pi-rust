@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>spinner 转速曲线：250 t/s 封顶</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: #101418; color: #cfd8dc;
+    font-family: Consolas, "Cascadia Mono", "JetBrains Mono", monospace;
+    font-size: 14px;
+  }
+  h1 { font-size: 18px; color: #e8eaed; margin: 0 0 4px; }
+  p.sub { color: #78909c; margin: 0 0 16px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 16px 22px; align-items: center;
+    background: #1a2026; border: 1px solid #2a323a; border-radius: 8px;
+    padding: 12px 16px; margin-bottom: 16px;
+  }
+  .controls label { color: #90a4ae; }
+  .controls input[type=range] { width: 170px; vertical-align: middle; }
+  .controls b { color: #4fc3f7; font-size: 15px; }
+  .controls .derived { color: #ffb74d; }
+  button {
+    background: #26323c; color: #cfd8dc; border: 1px solid #37474f;
+    border-radius: 6px; padding: 6px 14px; cursor: pointer; font: inherit;
+  }
+  button:hover { background: #31414d; }
+  select { background: #26323c; color: #cfd8dc; border: 1px solid #37474f; border-radius: 6px; padding: 4px 8px; font: inherit; }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+  @media (max-width: 760px) { .duo { grid-template-columns: 1fr; } }
+  .big {
+    background: #0b0e11; border: 1px solid #263038; border-radius: 8px;
+    padding: 14px 18px; overflow: hidden;
+  }
+  .big.cur { border-color: #5e2e2e; }
+  .big.new { border-color: #2e6f5e; }
+  .big h2 { font-size: 14px; margin: 0 0 10px; color: #e8eaed; }
+  .term {
+    background: #000; border: 1px solid #1e272e; border-radius: 6px;
+    padding: 18px 16px; white-space: nowrap; overflow: hidden; font-size: 18px;
+  }
+  .term .spin { font-size: 40px; color: #4fc3f7; vertical-align: -6px; }
+  .term .msg { color: #90a4ae; }
+  .fpsrow { margin-top: 12px; font-size: 13px; color: #90a4ae; }
+  .fpsnum { font-size: 30px; font-weight: bold; }
+  .big.cur .fpsnum { color: #ef9a9a; }
+  .big.new .fpsnum { color: #a5d6a7; }
+  .bar { position: relative; height: 10px; background: #1a2026; border-radius: 5px; margin-top: 8px; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; transition: width .1s linear; }
+  .big.cur .bar i { background: #b35555; }
+  .big.new .bar i { background: #3f8f6f; }
+  .bar b { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #78909c; }
+  .barlab { display: flex; justify-content: space-between; color: #546e7a; font-size: 11px; margin-top: 4px; }
+  .param { color: #78909c; font-size: 12px; margin-top: 10px; line-height: 1.7; }
+  .param b { color: #ffb74d; }
+  canvas { background: #0b0e11; border: 1px solid #263038; border-radius: 8px; display: block; margin-bottom: 16px; max-width: 100%; }
+  .strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .mini {
+    background: #0b0e11; border: 1px solid #263038; border-radius: 8px;
+    padding: 10px 12px; overflow: hidden;
+  }
+  .mini.capped { border-color: #2e6f5e; }
+  .mini h3 { font-size: 12px; margin: 0 0 6px; color: #90a4ae; font-weight: normal; }
+  .mini h3 b { color: #e8eaed; font-size: 14px; }
+  .mini .spin { font-size: 26px; color: #4fc3f7; }
+  .mini .fps { font-size: 12px; color: #90a4ae; margin-top: 6px; }
+  .mini .fps b { color: #ffb74d; font-size: 14px; }
+  .mini .tag { display: inline-block; font-size: 10px; border-radius: 4px; padding: 1px 6px; margin-top: 6px; }
+  .mini.capped .tag { background: #1e3d2f; color: #a5d6a7; }
+  .mini:not(.capped) .tag { background: #33383d; color: #b0bec5; }
+  .mini .ref { color: #546e7a; font-size: 11px; margin-top: 4px; }
+  .legend { margin-top: 18px; color: #78909c; font-size: 12px; line-height: 1.8; }
+  .legend code { color: #b0bec5; background: #1a2026; padding: 1px 5px; border-radius: 4px; }
+  .legend b { color: #a5d6a7; }
+</style>
+</head>
+<body>
+<h1>spinner 转速曲线：随产量爬升，250 t/s 封顶</h1>
+<p class="sub">新机制：每 N 个 token 进一帧（转速 ∝ 吐字速率），达到封顶点后由时间闸门按住不再加快；完全静默时回退到 80ms 空闲节奏。左边现状、右边新方案吃同一条 token 流。</p>
+
+<div class="controls">
+  <button id="toggle">暂停输出</button>
+  <label>吐字速率 <b id="rateLabel">300</b> t/s <input id="rate" type="range" min="0" max="600" step="5" value="300"></label>
+  <label>封顶点 <b id="kneeLabel">250</b> t/s <input id="knee" type="range" min="100" max="500" step="10" value="250"></label>
+  <label>封顶转速 <b id="capLabel">16</b> ms/帧 <input id="cap" type="range" min="16" max="160" step="2" value="16"></label>
+  <label>帧样式 <select id="glyph">
+    <option value="braille" selected>braille ⠋⠙⠹…（现用）</option>
+    <option value="blocks">方块 ▖▘▝▗</option>
+    <option value="bars">块条 ▁▃▄▅▆▇</option>
+  </select></label>
+  <span class="derived" id="derived"></span>
+</div>
+
+<div class="duo">
+  <div class="big cur">
+    <h2>现状 · 每次重绘进一帧 <span style="color:#ef9a9a;font-size:12px">≥62 t/s 就一直顶满 62.5fps</span></h2>
+    <div class="term"><span class="spin" id="curSpin">⠋</span> <span class="msg">Working… <span id="curT">0s</span></span></div>
+    <div class="fpsrow"><span class="fpsnum" id="curFps">–</span> 帧/秒 · <span id="curCps">–</span> 圈/秒</div>
+    <div class="bar"><i id="curBar"></i><b style="left:19.2%"></b><b style="left:96.2%"></b></div>
+    <div class="barlab"><span>0</span><span>12.5（设计）</span><span>62.5（调度器上限）</span></div>
+    <div class="param">token 一来就把重绘顶到 16ms 节流上限，spinner 跟着重绘走，与速率基本无关。</div>
+  </div>
+  <div class="big new">
+    <h2>新方案 · 每 N token 进一帧 + 时间闸门 <span style="color:#a5d6a7;font-size:12px">封顶点处恰好到达上限</span></h2>
+    <div class="term"><span class="spin" id="newSpin">⠋</span> <span class="msg">Working… <span id="newT">0s</span></span></div>
+    <div class="fpsrow"><span class="fpsnum" id="newFps">–</span> 帧/秒 · <span id="newCps">–</span> 圈/秒</div>
+    <div class="bar"><i id="newBar"></i><b style="left:19.2%"></b><b style="left:96.2%"></b></div>
+    <div class="barlab"><span>0</span><span>12.5（设计）</span><span>62.5（调度器上限）</span></div>
+    <div class="param" id="newParam"></div>
+  </div>
+</div>
+
+<canvas id="chart" width="820" height="240"></canvas>
+
+<div class="strip" id="strip"></div>
+
+<div class="legend">
+  <b>机制与参数换算：</b><br>
+  · 每帧消耗 N 个 token：转速 = t/s ÷ N，随产量线性爬升；同时有时间闸门（封顶转速 ms）兜底，两条线恰好相交于封顶点：<b>封顶点 t/s = N × 1000 ÷ 封顶ms</b>。默认封顶点 250、封顶 16ms → N = 4，即 <code>250 = 4 × 1000/16</code>（封顶 62.5 帧/秒）。<br>
+  · 完全静默（连续 300ms 无 token，如思考中/工具运行中）时回退到 80ms 空闲节奏 = 12.5 帧/秒，与现状的空闲表现一致。<br>
+  · 下方档位条：固定速率各跑一路，绿色 = 已达封顶（转速不再随速率变化）；灰色 = 随产量爬升区。「现状xx」为该速率下现状的分析值对照。<br>
+  · 落地改法：流式 delta 处累加 token 计数（如 <code>drain_agent_events</code>），三处进帧点（editor.rs:1588、status_indicator.rs、loader.rs）改为「计数 ≥ N 或静默回退，且距上次进帧 ≥ 封顶ms」才进帧；editor.rs:1751 起的 spinner 测试同步改语义。
+</div>
+
+<script>
+(() => {
+  const GLYPHS = {
+    braille: ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'],
+    blocks:  ['▖','▘','▝','▗'],
+    bars:    ['▁','▃','▄','▅','▆','▇','▆','▅','▄','▃'],
+  };
+  const TICK = 16, IDLE_AFTER = 300, IDLE_FRAME_MS = 80;
+  const $ = id => document.getElementById(id);
+
+  let rate = 300, knee = 250, capMs = 16, streaming = true, glyphSet = 'braille';
+  let now = 0;
+
+  const N = () => knee * capMs / 1000;          // tokens per frame
+  const capFps = () => 1000 / capMs;
+  const curFpsOf = t => Math.max(12.5, Math.min(62.5, t));
+  const newFpsOf = t => t <= 0 ? 12.5 : Math.min(capFps(), t / N());
+  const fmt = v => Number.isInteger(v) ? String(v) : v.toFixed(1);
+
+  function refreshDerived() {
+    $('rateLabel').textContent = rate;
+    $('kneeLabel').textContent = knee;
+    $('capLabel').textContent = capMs;
+    $('derived').textContent = `→ N = ${fmt(N())} token/帧，封顶 ${fmt(capFps())} 帧/秒`;
+    $('newParam').innerHTML =
+      `封顶点 <b>${knee} t/s</b> · 封顶 <b>${fmt(capFps())} 帧/秒</b>（${capMs}ms/帧）· N = <b>${fmt(N())}</b> token/帧<br>` +
+      `转速 = 速率 ÷ N：<b>${Math.round(rate/N()*10)/10}</b> 帧/秒（当前速率）`;
+  }
+
+  // ---- 动画单元 ----
+  function mkUnit(mode, fixedRate) {
+    return {
+      mode, fixedRate, frame: 0, acc: 0,
+      lastAdv: -1e9, lastTok: -1e9, lastIdle: -1e9, hits: [],
+      spinEl: null, fpsEl: null, cpsEl: null, barEl: null, tEl: null,
+    };
+  }
+  const cur = mkUnit('cur'), neu = mkUnit('new');
+  cur.spinEl = $('curSpin'); cur.fpsEl = $('curFps'); cur.cpsEl = $('curCps'); cur.barEl = $('curBar'); cur.tEl = $('curT');
+  neu.spinEl = $('newSpin'); neu.fpsEl = $('newFps'); neu.cpsEl = $('newCps'); neu.barEl = $('newBar'); neu.tEl = $('newT');
+
+  const STRIP_RATES = [50, 100, 150, 200, 250, 300, 450];
+  const stripUnits = STRIP_RATES.map(r => {
+    const u = mkUnit('new', r);
+    const el = document.createElement('div');
+    el.className = 'mini';
+    el.innerHTML = `
+      <h3>固定 <b>${r}</b> t/s</h3>
+      <span class="spin">⠋</span>
+      <div class="fps">实测 <b>–</b> 帧/秒</div>
+      <span class="tag"></span>
+      <div class="ref"></div>`;
+    $('strip').appendChild(el);
+    u.el = el;
+    u.spinEl = el.querySelector('.spin');
+    u.fpsEl = el.querySelector('.fps b');
+    u.tagEl = el.querySelector('.tag');
+    u.refEl = el.querySelector('.ref');
+    return u;
+  });
+
+  // ---- token 采样（泊松近似）----
+  function sample(rps) {
+    const m = rps * TICK / 1000;
+    if (m <= 0) return 0;
+    let n = Math.floor(m);
+    if (Math.random() < m - n) n++;
+    return n;
+  }
+
+  function step(u, tokens) {
+    const frames = GLYPHS[glyphSet];
+    if (u.mode === 'cur') {
+      const idleDue = now - u.lastIdle >= 80;
+      if (idleDue) u.lastIdle = now;
+      if (tokens > 0 || idleDue) { u.frame = (u.frame + 1) % frames.length; u.hits.push(now); }
+    } else {
+      if (tokens > 0) {
+        u.acc += tokens; u.lastTok = now;
+        if (u.acc >= N() && now - u.lastAdv >= capMs) {
+          u.acc = 0; u.lastAdv = now;
+          u.frame = (u.frame + 1) % frames.length; u.hits.push(now);
+        }
+      } else if (now - u.lastAdv >= IDLE_FRAME_MS && now - u.lastTok >= IDLE_AFTER) {
+        u.lastAdv = now;
+        u.frame = (u.frame + 1) % frames.length; u.hits.push(now);
+      }
+    }
+  }
+
+  function draw(u) {
+    const frames = GLYPHS[glyphSet];
+    u.spinEl.textContent = frames[u.frame];
+    u.hits = u.hits.filter(t => t > now - 1000);
+    const fps = u.hits.length;
+    if (u.fpsEl) u.fpsEl.textContent = fmt(fps);
+    if (u.cpsEl) u.cpsEl.textContent = fmt(Math.round(fps / frames.length * 10) / 10);
+    if (u.barEl) u.barEl.style.width = Math.min(100, fps / 65 * 100) + '%';
+    if (u.tEl) {
+      const el = now / 1000;
+      u.tEl.textContent = el >= 60 ? `${Math.floor(el/60)}m${Math.floor(el%60)}s` : `${el.toFixed(0)}s`;
+    }
+  }
+
+  // ---- 曲线图 ----
+  const chart = $('chart'), cx = chart.getContext('2d');
+  const M = { l: 46, r: 14, t: 16, b: 30 }, XMAX = 600, YMAX = 70;
+  const px = t => M.l + (chart.width - M.l - M.r) * t / XMAX;
+  const py = f => chart.height - M.b - (chart.height - M.t - M.b) * f / YMAX;
+
+  function drawChart() {
+    cx.clearRect(0, 0, chart.width, chart.height);
+    cx.font = '11px Consolas, monospace';
+    // 网格
+    cx.strokeStyle = '#1a222a'; cx.fillStyle = '#546e7a'; cx.lineWidth = 1;
+    for (let t = 0; t <= XMAX; t += 100) {
+      cx.beginPath(); cx.moveTo(px(t), py(0)); cx.lineTo(px(t), py(YMAX)); cx.stroke();
+      cx.fillText(t, px(t) - 8, chart.height - 12);
+    }
+    for (let f = 0; f <= YMAX; f += 10) {
+      cx.beginPath(); cx.moveTo(px(0), py(f)); cx.lineTo(px(XMAX), py(f)); cx.stroke();
+      cx.fillText(f, 12, py(f) + 4);
+    }
+    cx.fillText('t/s →', chart.width - 46, chart.height - 12);
+    cx.save(); cx.translate(12, 22); cx.fillText('帧/秒', 0, 0); cx.restore();
+    // 空闲基线 12.5
+    cx.strokeStyle = '#3a4a55'; cx.setLineDash([3, 4]);
+    cx.beginPath(); cx.moveTo(px(0), py(12.5)); cx.lineTo(px(XMAX), py(12.5)); cx.stroke();
+    cx.setLineDash([]);
+    cx.fillStyle = '#78909c';
+    cx.fillText('空闲 12.5', px(XMAX) - 62, py(12.5) - 5);
+    // 现状曲线
+    cx.strokeStyle = '#ef9a9a'; cx.lineWidth = 2; cx.beginPath();
+    for (let t = 0; t <= XMAX; t += 5) {
+      const f = curFpsOf(t);
+      t === 0 ? cx.moveTo(px(t), py(f)) : cx.lineTo(px(t), py(f));
+    }
+    cx.stroke();
+    // 新方案曲线：0→封顶点线性，之后水平
+    cx.strokeStyle = '#a5d6a7'; cx.beginPath();
+    cx.moveTo(px(0), py(0)); cx.lineTo(px(knee), py(capFps())); cx.lineTo(px(XMAX), py(capFps()));
+    cx.stroke();
+    // 封顶点竖线
+    cx.strokeStyle = '#ffb74d'; cx.setLineDash([5, 4]);
+    cx.beginPath(); cx.moveTo(px(knee), py(0)); cx.lineTo(px(knee), py(YMAX)); cx.stroke();
+    cx.setLineDash([]);
+    cx.fillStyle = '#ffb74d';
+    cx.fillText(`封顶点 ${knee} t/s`, px(knee) + 6, py(capFps()) - 8);
+    // 当前工作点
+    cx.fillStyle = '#ef9a9a'; cx.beginPath(); cx.arc(px(rate), py(curFpsOf(rate)), 5, 0, 7); cx.fill();
+    cx.fillStyle = '#a5d6a7'; cx.beginPath(); cx.arc(px(rate), py(newFpsOf(rate)), 5, 0, 7); cx.fill();
+    // 图例
+    cx.fillStyle = '#ef9a9a'; cx.fillText('— 现状', px(0) + 8, py(66));
+    cx.fillStyle = '#a5d6a7'; cx.fillText('— 新方案（' + knee + ' 封顶）', px(0) + 66, py(66));
+  }
+
+  // ---- 主循环 ----
+  setInterval(() => {
+    now += TICK;
+    const tokens = streaming ? sample(rate) : 0;
+    step(cur, tokens); draw(cur);
+    step(neu, tokens); draw(neu);
+    for (const u of stripUnits) {
+      step(u, streaming ? sample(u.fixedRate) : 0);
+      draw(u);
+      u.el.classList.toggle('capped', u.fixedRate >= knee);
+      u.tagEl.textContent = u.fixedRate >= knee ? '已达上限' : '随产量爬升';
+      u.refEl.textContent = `现状 ${fmt(curFpsOf(u.fixedRate))}`;
+    }
+    drawChart();
+  }, TICK);
+
+  // ---- 控件 ----
+  $('rate').oninput = e => { rate = +e.target.value; refreshDerived(); };
+  $('knee').oninput = e => { knee = +e.target.value; refreshDerived(); };
+  $('cap').oninput  = e => { capMs = +e.target.value; refreshDerived(); };
+  $('glyph').onchange = e => { glyphSet = e.target.value; };
+  $('toggle').onclick = () => {
+    streaming = !streaming;
+    $('toggle').textContent = streaming ? '暂停输出' : '恢复输出';
+  };
+  refreshDerived();
+})();
+</script>
+</body>
+</html>
