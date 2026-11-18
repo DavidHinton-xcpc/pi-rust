@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型选择器 · 运行时设置字重 Demo</title>
+<style>
+  :root {
+    /* 未选中模型文字与「运行时设置」共用同一个字重 token */
+    --weight-regular: 400;
+    --weight-selected: 700;
+    --text: #1f2328;
+    --muted: #8a8f98;
+    --line: #eceef1;
+    --panel: #ffffff;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: #f7f8f9;
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- Demo 工具条（仅用于对比，不属于产品 UI） ---------- */
+  .demo-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 10px 16px;
+    font-size: 12px;
+    color: #5b616a;
+    background: #fff;
+    border-bottom: 1px solid #e9ebee;
+  }
+  .demo-bar label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .demo-bar .hint { color: #9aa0a8; }
+
+  /* ---------- 背景里的应用外壳（弱化，只为还原截图语境） ---------- */
+  .app-chrome {
+    max-width: 420px;
+    margin: 0 auto;
+    padding: 28px 14px 120px;
+    color: #c8ccd1;
+    font-size: 14px;
+    user-select: none;
+  }
+  .app-chrome .crumb { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .app-chrome .row { margin-top: 22px; }
+  .app-chrome .composer {
+    position: fixed;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
+    width: min(360px, calc(100vw - 28px));
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border: 1px solid #dfe2e6;
+    border-radius: 12px;
+    background: #fff;
+    color: var(--text);
+    font-size: 14px;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
+  }
+  .app-chrome .composer .clip { color: #9aa0a8; }
+  .app-chrome .composer .current { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .app-chrome .composer .chev { color: #9aa0a8; }
+
+  /* ---------- 模型选择面板 ---------- */
+  .panel {
+    position: relative;
+    z-index: 1;
+    width: min(330px, calc(100vw - 32px));
+    max-height: 520px;
+    margin: 8px auto 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--panel);
+    border: 1px solid #e6e8eb;
+    border-radius: 14px;
+    box-shadow: 0 12px 36px rgba(16, 24, 40, .12), 0 2px 6px rgba(16, 24, 40, .05);
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  .panel-header .sliders { width: 18px; height: 18px; color: var(--text); flex: 0 0 auto; }
+
+  /* 【改动点】标题不再加粗，与未选中的模型项使用同一个 --weight-regular。
+     用 div 而非 h1~h6，避免浏览器默认 font-weight: bold 把改动抵消掉。 */
+  .panel-title {
+    font-size: 16px;
+    line-height: 1.4;
+    font-weight: var(--weight-regular);
+    color: var(--text);
+  }
+  .panel-header .tab {
+    margin-left: auto;
+    font-size: 13px;
+    font-weight: var(--weight-regular);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .model-list {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 6px 20px 14px;
+    scrollbar-width: thin;
+    scrollbar-color: #c9cdd3 transparent;
+  }
+  .model-list::-webkit-scrollbar { width: 6px; }
+  .model-list::-webkit-scrollbar-thumb { background: #c9cdd3; border-radius: 3px; }
+
+  .group-label {
+    padding: 18px 0 4px;
+    font-size: 11px;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    font-weight: var(--weight-regular);
+    color: var(--muted);
+  }
+  .group + .group { border-top: 1px solid var(--line); }
+
+  .model-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 16px;
+    line-height: 1.55;
+    /* 未选中模型：常规字重 */
+    font-weight: var(--weight-regular);
+    color: var(--text);
+  }
+  .model-item .name { flex: 1 1 auto; }
+  .model-item .check { flex: 0 0 auto; width: 18px; color: var(--text); margin-top: 4px; }
+  .model-item.is-selected {
+    /* 选中项保持加粗（截图原样），与本次改动无关 */
+    font-weight: var(--weight-selected);
+  }
+
+  /* 【修改前】仅供 Demo 对比：只把标题恢复成加粗 */
+  .panel.is-before .panel-title { font-weight: var(--weight-selected); }
+</style>
+</head>
+<body>
+
+<div class="demo-bar">
+  <label><input type="checkbox" id="before-toggle"> 显示「修改前（加粗）」</label>
+  <span class="hint">默认即为修改后：运行时设置 = 400，与未选中模型一致；选中模型仍为 700。</span>
+</div>
+
+<main class="app-chrome">
+  <div class="crumb">模型 → GLM-5.3 Flash (WorkBuddy 教育版) &nbsp;|&nbsp; Workbu…</div>
+  <div class="row">模型 &nbsp;—&nbsp; V…</div>
+
+  <section class="panel" id="panel" aria-label="模型选择器">
+    <header class="panel-header">
+      <svg class="sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+        <path d="M4 7h10M18 7h2M4 17h2M10 17h10"/>
+        <circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>
+      </svg>
+      <div class="panel-title">运行时设置</div>
+      <span class="tab">上下文与工具</span>
+    </header>
+
+    <div class="model-list">
+      <div class="group">
+        <div class="group-label">WorkBuddy-CN</div>
+        <div class="model-item"><span class="name">GLM-5.3 Flash (WorkBuddy CN/教育版)</span></div>
+        <div class="model-item"><span class="name">DeepSeek V4.1 Flash (WorkBuddy CN, x0.11)</span></div>
+        <div class="model-item is-selected">
+          <span class="name">Hy4 (WorkBuddy CN/教育版，限时免费)</span>
+          <svg class="check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"/></svg>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-label">ZCode</div>
+        <div class="model-item"><span class="name">GLM-5.3 (ZCode 套餐)</span></div>
+        <div class="model-item"><span class="name">GLM-5.3-Flash (ZCode 套餐, 多模态)</span></div>
+      </div>
+
+      <div class="group">
+        <div class="group-label">WorkBuddy-Global</div>
+        <div class="model-item"><span class="name">Claude Sonnet 4.5 (WorkBuddy Global)</span></div>
+        <div class="model-item"><span class="name">GPT-5.1 (WorkBuddy Global)</span></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="composer" aria-hidden="true">
+    <span class="clip">📎</span>
+    <span class="current">Hy4 (WorkBuddy CN/教育版, …</span>
+    <span class="chev">⌄</span>
+    <span>中 ⌄</span>
+  </div>
+</main>
+
+<script>
+  // Demo-only：勾选后把标题切回加粗，方便与修改前对照。
+  document.getElementById('before-toggle').addEventListener('change', (event) => {
+    document.getElementById('panel').classList.toggle('is-before', event.target.checked);
+  });
+</script>
+</body>
+</html>

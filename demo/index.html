@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rpi demo pages</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 20px 64px;
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", sans-serif;
+    background: #f7f8f9; color: #1f2328;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 620px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 6px; font-weight: 500; }
+  p.sub { margin: 0 0 24px; font-size: 13px; color: #8a8f98; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li + li { margin-top: 10px; }
+  a {
+    display: block; padding: 14px 18px;
+    background: #fff; border: 1px solid #e6e8eb; border-radius: 12px;
+    color: inherit; text-decoration: none;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
+    transition: border-color .15s, box-shadow .15s;
+  }
+  a:hover { border-color: #c9cdd3; box-shadow: 0 4px 14px rgba(16, 24, 40, .08); }
+  a b { display: block; font-size: 15px; font-weight: 500; font-weight: var(--w, 500); }
+  a small { display: block; margin-top: 4px; font-size: 12px; color: #8a8f98; }
+  a code { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: #8a8f98; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>rpi demo pages</h1>
+  <p class="sub">静态对照页，零外部依赖，可直接分享。</p>
+  <ul>
+    <li><a href="../">
+      <b>rpi glyph 调整</b>
+      <small>真机 ANSI 逐格回放对比</small>
+    </a></li>
+    <li><a href="runtime-settings-weight-demo.html">
+      <b>模型选择器 · 运行时设置字重</b>
+      <small>标题由加粗改为 400，与未选中模型文字一致；顶部可切回「修改前」对照</small>
+      <code>runtime-settings-weight-demo.html</code>
+    </a></li>
+    <li><a href="spinner-speed-demo.html">
+      <b>spinner 转速曲线</b>
+      <small>250 t/s 封顶的转速与帧间隔调参</small>
+      <code>spinner-speed-demo.html</code>
+    </a></li>
+  </ul>
+</div>
+</body>
+</html>
