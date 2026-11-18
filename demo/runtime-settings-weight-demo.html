@@ -7,8 +7,10 @@
 <style>
   :root {
     /* 未选中模型文字与「运行时设置」共用同一个字重 token */
+    /* 与真实 rpi-web 一致：.dropdown-item 继承文档 400，
+       .dropdown-item[aria-selected="true"] 为 600（styles.css:2275）。 */
     --weight-regular: 400;
-    --weight-selected: 700;
+    --weight-selected: 600;
     --text: #1f2328;
     --muted: #8a8f98;
     --line: #eceef1;
@@ -151,7 +153,7 @@
   .model-item .name { flex: 1 1 auto; }
   .model-item .check { flex: 0 0 auto; width: 18px; color: var(--text); margin-top: 4px; }
   .model-item.is-selected {
-    /* 选中项保持加粗（截图原样），与本次改动无关 */
+    /* 选中项保持 600 强调（styles.css:2275），与本次改动无关 */
     font-weight: var(--weight-selected);
   }
 
@@ -163,7 +165,8 @@
 
 <div class="demo-bar">
   <label><input type="checkbox" id="before-toggle"> 显示「修改前（加粗）」</label>
-  <span class="hint">默认即为修改后：运行时设置 = 400，与未选中模型一致；选中模型仍为 700。</span>
+  <span class="hint">默认即为修改后：运行时设置 = 400，与未选中模型一致；选中模型仍为 600。</span>
+  <span class="hint">真实改动 <code>ui-slim.css:326</code> · PR #327</span>
 </div>
 
 <main class="app-chrome">
