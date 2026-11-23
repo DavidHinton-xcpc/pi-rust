@@ -230,8 +230,13 @@ pub enum SessionSelection {
     /// `--session-id <id>`: use the EXACT session id, creating it if missing.
     ByExactId { id: String, dir: PathBuf },
     /// `--fork <path|id>`: fork the given session into a new one and start in
-    /// the fork.
-    Fork { source: String, dir: PathBuf },
+    /// the fork. `entry_id` optionally cuts the new branch at a message.
+    Fork {
+        source: String,
+        dir: PathBuf,
+        entry_id: Option<String>,
+        position: rpi_harness::session::types::ForkPosition,
+    },
 }
 
 /// Decide the session selection from parsed args + the resolved cwd.
@@ -273,6 +278,8 @@ fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
         return SessionSelection::Fork {
             source: s.clone(),
             dir,
+            entry_id: args.fork_entry.clone(),
+            position: args.fork_position,
         };
     }
     if let Some(s) = &args.session_id {
@@ -2246,7 +2253,12 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
         SessionSelection::Latest { .. }
         | SessionSelection::ById { .. }
         | SessionSelection::ByExactId { .. } => restore_session(selection, cwd).await,
-        SessionSelection::Fork { source, dir } => fork_session_at_launch(source, dir, cwd).await,
+        SessionSelection::Fork {
+            source,
+            dir,
+            entry_id,
+            position,
+        } => fork_session_at_launch(source, dir, cwd, entry_id.as_deref(), *position).await,
     }
 }
 
@@ -2302,6 +2314,8 @@ async fn fork_session_at_launch(
     source: &str,
     dir: &Path,
     cwd: &str,
+    entry_id: Option<&str>,
+    position: rpi_harness::session::types::ForkPosition,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -2348,7 +2362,10 @@ async fn fork_session_at_launch(
                 cwd: cwd.to_string(),
                 metadata: None,
             },
-            &ForkOptions::default(),
+            &ForkOptions::Branch {
+                entry_id: entry_id.map(str::to_owned),
+                position: Some(position),
+            },
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
