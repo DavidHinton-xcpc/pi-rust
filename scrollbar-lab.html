@@ -25,10 +25,11 @@
   button, input, select { font: inherit; }
   a { color: var(--orange-deep); }
 
-  /* 实验室页面本身的滚动条也由右侧调节参数驱动 */
-  html {
-    scrollbar-width: thin;
-    scrollbar-color: #c9cdd3 transparent;
+  /* 实验室页面本身的滚动条也由右侧调节参数驱动。
+     Chrome 121+ 一旦看到 scrollbar-color，就会忽略 ::-webkit-scrollbar-*，
+     所以标准属性只在 Firefox 中声明。 */
+  @supports (-moz-appearance: none) {
+    html { scrollbar-width: thin; scrollbar-color: #c9cdd3 transparent; }
   }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -283,10 +284,14 @@
     var trackBorder = Number(s.trackInset) + 'px solid transparent';
     var lines = [];
     lines.push('/* rpi-web 滚动条 · 由 scrollbar-lab 生成 */');
-    lines.push('html {');
-    lines.push('  scroll-behavior: ' + (s.scrollBehavior === 'smooth' ? 'smooth' : 'auto') + ';');
-    lines.push('  scrollbar-width: ' + (s.ffWidth === 'thin' ? 'thin' : 'auto') + ';');
-    lines.push('  scrollbar-color: ' + s.ffThumb + ' ' + s.ffTrack + ';');
+    lines.push('html { scroll-behavior: ' + (s.scrollBehavior === 'smooth' ? 'smooth' : 'auto') + '; }');
+    lines.push('');
+    lines.push('/* Firefox 回退：只在 Firefox 声明标准属性，避免 Chrome 121+ 忽略 webkit 伪元素 */');
+    lines.push('@supports (-moz-appearance: none) {');
+    lines.push('  html {');
+    lines.push('    scrollbar-width: ' + (s.ffWidth === 'thin' ? 'thin' : 'auto') + ';');
+    lines.push('    scrollbar-color: ' + s.ffThumb + ' ' + s.ffTrack + ';');
+    lines.push('  }');
     lines.push('}');
     lines.push('');
     lines.push('::-webkit-scrollbar { width: ' + w + 'px; height: ' + w + 'px; }');
@@ -309,8 +314,7 @@
     }
     lines.push('');
     lines.push('@media (prefers-reduced-motion: reduce) {');
-    lines.push('  html { scroll-behavior: auto; }');
-    lines.push('  ::-webkit-scrollbar-thumb { transition: none; }');
+    lines.push('  ::-webkit-scrollbar-thumb { transition: none !important; }');
     lines.push('}');
     return lines.join('\n');
   }
