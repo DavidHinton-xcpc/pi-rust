@@ -144,7 +144,7 @@
 
       <section class="group">
         <h2>尺寸与形状</h2>
-        <div class="field"><label for="width">宽度</label><input id="width" type="range" min="4" max="24" step="1" /><span class="value" id="widthValue"></span></div>
+        <div class="field"><label for="width">宽度</label><input id="width" type="range" min="1" max="24" step="1" /><span class="value" id="widthValue"></span></div>
         <div class="field"><label for="radius">圆角</label><input id="radius" type="range" min="0" max="999" step="1" /><span class="value" id="radiusValue"></span></div>
         <div class="field"><label for="thumbInset">内缩</label><input id="thumbInset" type="range" min="0" max="6" step="1" /><span class="value" id="thumbInsetValue"></span></div>
         <div class="field"><label for="trackInset">轨道留白</label><input id="trackInset" type="range" min="0" max="6" step="1" /><span class="value" id="trackInsetValue"></span></div>
@@ -181,6 +181,16 @@
       </section>
 
       <section class="group">
+        <h2>自动隐藏 · 滚动后渐隐</h2>
+        <div class="check-row"><span>启用自动隐藏</span><input id="autoHide" type="checkbox" /></div>
+        <div class="field"><label for="hideDelay">隐藏延迟</label><input id="hideDelay" type="range" min="0" max="3000" step="100" /><span class="value" id="hideDelayValue"></span></div>
+        <div class="field"><label for="fadeDuration">渐隐时长</label><input id="fadeDuration" type="range" min="0" max="2000" step="50" /><span class="value" id="fadeDurationValue"></span></div>
+        <div class="field"><label for="hiddenOpacity">隐藏透明度</label><input id="hiddenOpacity" type="range" min="0" max="100" step="5" /><span class="value" id="hiddenOpacityValue"></span></div>
+        <div class="check-row"><span>悬停时显示</span><input id="showOnHover" type="checkbox" /></div>
+        <p class="note">开启后在右侧区域滚动一下：滑块会在停止滚动、延迟过后渐隐到设定透明度。生成代码含配套 JS。</p>
+      </section>
+
+      <section class="group">
         <h2>Firefox 回退</h2>
         <div class="field"><label for="ffWidth">宽度</label><select id="ffWidth">
           <option value="auto">auto</option>
@@ -206,7 +216,7 @@
 
       <div class="panel preview-card">
         <div class="card-label"><strong>主页面滚动条</strong><span>整页滚动 · 当前参数</span></div>
-        <div class="scroll-area" id="mainScrollSample">
+        <div class="scroll-area sb-auto-hide" id="mainScrollSample">
           <h3>把玩这些参数</h3>
           <p>当前页面的滚动条也由左侧参数实时驱动。滚动这个区域或整个页面，观察轨道、滑块、圆角、透明度和过渡动画的组合效果。</p>
           <div class="rows" id="rows"></div>
@@ -221,7 +231,7 @@
 
       <div class="panel preview-card">
         <div class="card-label"><strong>内部滚动容器</strong><span>模拟代码面板 / 终端窗口</span></div>
-        <div class="inner-box" id="innerBox"></div>
+        <div class="inner-box sb-auto-hide" id="innerBox"></div>
       </div>
 
       <div class="panel preview-card output" id="css-output">
@@ -240,14 +250,14 @@
   'use strict';
 
   var PRESETS = {
-    classic: { label: '经典灰', values: { width: 10, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#c9cdd3', hoverColor: '#a8adb5', activeColor: '#8d939c', trackOpacity: 40, thumbOpacity: 100, transitionMs: 150, easing: 'ease', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, ffWidth: 'thin', ffThumb: '#c9cdd3', ffTrack: '#ffffff' } },
-    orange: { label: 'rpi 橙', values: { width: 12, radius: 999, thumbInset: 2, trackInset: 1, trackColor: '#f4f1e9', thumbColor: '#ec6b38', hoverColor: '#a84422', activeColor: '#7d3219', trackOpacity: 60, thumbOpacity: 100, transitionMs: 200, easing: 'ease-out', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, ffWidth: 'thin', ffThumb: '#ec6b38', ffTrack: '#f4f1e9' } },
-    minimal: { label: '极细线', values: { width: 5, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#6f706d', hoverColor: '#101113', activeColor: '#101113', trackOpacity: 0, thumbOpacity: 85, transitionMs: 100, easing: 'linear', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: false, mobileThin: false, ffWidth: 'thin', ffThumb: '#6f706d', ffTrack: '#ffffff' } },
-    soft: { label: '柔和胶囊', values: { width: 14, radius: 999, thumbInset: 3, trackInset: 2, trackColor: '#e9e5da', thumbColor: '#ec6b38', hoverColor: '#f08a5d', activeColor: '#a84422', trackOpacity: 100, thumbOpacity: 95, transitionMs: 250, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, ffWidth: 'auto', ffThumb: '#d99b7c', ffTrack: '#e9e5da' } },
-    terminal: { label: '终端暗色', values: { width: 9, radius: 0, thumbInset: 0, trackInset: 0, trackColor: '#171819', thumbColor: '#4c534f', hoverColor: '#7eb59d', activeColor: '#ec6b38', trackOpacity: 100, thumbOpacity: 100, transitionMs: 120, easing: 'ease-in-out', scrollBehavior: 'auto', hoverEnabled: true, activeEnabled: true, mobileThin: false, ffWidth: 'thin', ffThumb: '#4c534f', ffTrack: '#171819' } },
-    none: { label: '几乎隐藏', values: { width: 4, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#b9b9b5', hoverColor: '#6f706d', activeColor: '#6f706d', trackOpacity: 0, thumbOpacity: 45, transitionMs: 200, easing: 'ease', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: false, mobileThin: false, ffWidth: 'thin', ffThumb: '#b9b9b5', ffTrack: '#ffffff' } }
+    classic: { label: '经典灰', values: { width: 10, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#c9cdd3', hoverColor: '#a8adb5', activeColor: '#8d939c', trackOpacity: 40, thumbOpacity: 100, transitionMs: 150, easing: 'ease', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, autoHide: false, hideDelay: 900, fadeDuration: 350, hiddenOpacity: 15, showOnHover: true, ffWidth: 'thin', ffThumb: '#c9cdd3', ffTrack: '#ffffff' } },
+    orange: { label: 'rpi 橙', values: { width: 12, radius: 999, thumbInset: 2, trackInset: 1, trackColor: '#f4f1e9', thumbColor: '#ec6b38', hoverColor: '#a84422', activeColor: '#7d3219', trackOpacity: 60, thumbOpacity: 100, transitionMs: 200, easing: 'ease-out', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, autoHide: false, hideDelay: 900, fadeDuration: 350, hiddenOpacity: 15, showOnHover: true, ffWidth: 'thin', ffThumb: '#ec6b38', ffTrack: '#f4f1e9' } },
+    minimal: { label: '极细线', values: { width: 2, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#6f706d', hoverColor: '#101113', activeColor: '#101113', trackOpacity: 0, thumbOpacity: 85, transitionMs: 100, easing: 'linear', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: false, mobileThin: false, autoHide: false, hideDelay: 900, fadeDuration: 350, hiddenOpacity: 15, showOnHover: true, ffWidth: 'thin', ffThumb: '#6f706d', ffTrack: '#ffffff' } },
+    soft: { label: '柔和胶囊', values: { width: 14, radius: 999, thumbInset: 3, trackInset: 2, trackColor: '#e9e5da', thumbColor: '#ec6b38', hoverColor: '#f08a5d', activeColor: '#a84422', trackOpacity: 100, thumbOpacity: 95, transitionMs: 250, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, autoHide: false, hideDelay: 900, fadeDuration: 350, hiddenOpacity: 15, showOnHover: true, ffWidth: 'auto', ffThumb: '#d99b7c', ffTrack: '#e9e5da' } },
+    terminal: { label: '终端暗色', values: { width: 9, radius: 0, thumbInset: 0, trackInset: 0, trackColor: '#171819', thumbColor: '#4c534f', hoverColor: '#7eb59d', activeColor: '#ec6b38', trackOpacity: 100, thumbOpacity: 100, transitionMs: 120, easing: 'ease-in-out', scrollBehavior: 'auto', hoverEnabled: true, activeEnabled: true, mobileThin: false, autoHide: false, hideDelay: 900, fadeDuration: 350, hiddenOpacity: 15, showOnHover: true, ffWidth: 'thin', ffThumb: '#4c534f', ffTrack: '#171819' } },
+    none: { label: '完全隐藏', values: { width: 1, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#b9b9b5', hoverColor: '#6f706d', activeColor: '#6f706d', trackOpacity: 0, thumbOpacity: 0, transitionMs: 200, easing: 'ease', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: false, mobileThin: false, autoHide: true, hideDelay: 400, fadeDuration: 500, hiddenOpacity: 0, showOnHover: true, ffWidth: 'thin', ffThumb: '#b9b9b5', ffTrack: '#ffffff' } }
   };
-  var CONTROL_IDS = ['width','radius','thumbInset','trackInset','trackColor','thumbColor','hoverColor','activeColor','trackOpacity','thumbOpacity','transitionMs','easing','scrollBehavior','hoverEnabled','activeEnabled','mobileThin','ffWidth','ffThumb','ffTrack'];
+  var CONTROL_IDS = ['width','radius','thumbInset','trackInset','trackColor','thumbColor','hoverColor','activeColor','trackOpacity','thumbOpacity','transitionMs','easing','scrollBehavior','hoverEnabled','activeEnabled','mobileThin','autoHide','hideDelay','fadeDuration','hiddenOpacity','showOnHover','ffWidth','ffThumb','ffTrack'];
   var DEFAULTS = Object.assign({}, PRESETS.classic.values);
   var state = Object.assign({}, DEFAULTS);
   var activePreset = 'classic';
@@ -280,8 +290,15 @@
     var hoverBg = alphaThumb === 1 ? s.hoverColor : rgba(s.hoverColor, alphaThumb);
     var activeBg = alphaThumb === 1 ? s.activeColor : rgba(s.activeColor, alphaThumb);
     var trans = Number(s.transitionMs) + 'ms ' + safeEasing(s.easing);
-    var thumbBorder = Number(s.thumbInset) + 'px solid transparent';
-    var trackBorder = Number(s.trackInset) + 'px solid transparent';
+    var fade = Number(s.fadeDuration) + 'ms ' + safeEasing(s.easing);
+    // 隐藏态的背景色：在滑块色基础上叠加隐藏透明度，用 background-color 过渡实现渐隐
+    var hiddenAlpha = alphaThumb * (Number(s.hiddenOpacity) / 100);
+    var hiddenBg = hiddenAlpha === 0 ? 'transparent' : rgba(s.thumbColor, hiddenAlpha);
+    // 内缩/留白不能超过宽度的一半，否则 1px 滚动条会被整条吃掉
+    var ti = Math.min(Number(s.thumbInset), Math.floor(w / 2));
+    var tki = Math.min(Number(s.trackInset), Math.floor(w / 2));
+    var thumbBorder = ti + 'px solid transparent';
+    var trackBorder = tki + 'px solid transparent';
     var lines = [];
     lines.push('/* rpi-web 滚动条 · 由 scrollbar-lab 生成 */');
     lines.push('html { scroll-behavior: ' + (s.scrollBehavior === 'smooth' ? 'smooth' : 'auto') + '; }');
@@ -301,15 +318,23 @@
     lines.push('  border-radius: ' + (Number(s.radius) >= 999 ? '999px' : Number(s.radius) + 'px') + ';');
     lines.push('  border: ' + thumbBorder + ';');
     lines.push('  background-clip: padding-box;');
-    lines.push('  transition: background-color ' + trans + ';');
+    lines.push('  transition: background-color ' + (s.autoHide ? fade : trans) + ';');
     lines.push('}');
     if (s.hoverEnabled) lines.push('::-webkit-scrollbar-thumb:hover { background: ' + hoverBg + '; }');
     if (s.activeEnabled) lines.push('::-webkit-scrollbar-thumb:active { background: ' + activeBg + '; }');
     lines.push('::-webkit-scrollbar-corner { background: transparent; }');
+    if (s.autoHide) {
+      lines.push('');
+      lines.push('/* 自动隐藏：JS 滚动时移除 .sb-hidden，停止并延迟后加回，滑块以 background-color 渐隐 */');
+      lines.push('.sb-auto-hide::-webkit-scrollbar-thumb, html.sb-auto-hide::-webkit-scrollbar-thumb { background: ' + thumbBg + '; transition: background-color ' + fade + '; }');
+      lines.push('.sb-auto-hide.sb-hidden::-webkit-scrollbar-thumb, html.sb-hidden::-webkit-scrollbar-thumb { background: ' + hiddenBg + '; }');
+      if (s.hoverEnabled) lines.push('.sb-auto-hide::-webkit-scrollbar-thumb:hover { background: ' + hoverBg + '; }');
+      if (s.showOnHover) lines.push('.sb-auto-hide:hover::-webkit-scrollbar-thumb, html.sb-auto-hide:hover::-webkit-scrollbar-thumb { background: ' + thumbBg + ' !important; }');
+    }
     if (s.mobileThin && w < 8) {
       lines.push('');
       lines.push('@media (max-width: 680px) {');
-      lines.push('  ::-webkit-scrollbar { width: ' + Math.max(3, w - 1) + 'px; height: ' + Math.max(3, w - 1) + 'px; }');
+      lines.push('  ::-webkit-scrollbar { width: ' + Math.max(1, w - 1) + 'px; height: ' + Math.max(1, w - 1) + 'px; }');
       lines.push('}');
     }
     lines.push('');
@@ -340,10 +365,17 @@
     $('trackOpacityValue').textContent = state.trackOpacity + '%';
     $('thumbOpacityValue').textContent = state.thumbOpacity + '%';
     $('transitionMsValue').textContent = state.transitionMs + 'ms';
+    $('hideDelayValue').textContent = state.hideDelay + 'ms';
+    $('fadeDurationValue').textContent = state.fadeDuration + 'ms';
+    $('hiddenOpacityValue').textContent = state.hiddenOpacity + '%';
     $('ffThumbValue').textContent = state.ffThumb;
     $('ffTrackValue').textContent = state.ffTrack;
     Array.prototype.forEach.call($('presetBar').children, function (btn) {
       btn.classList.toggle('is-active', btn.dataset.preset === activePreset);
+    });
+    hideTargets().forEach(function (el) {
+      if (state.autoHide) { el.classList.add('sb-auto-hide'); el.classList.add('sb-hidden'); }
+      else { el.classList.remove('sb-hidden'); }
     });
   }
   function markCustom() {
@@ -385,7 +417,10 @@
       var cur = DEFAULTS[id];
       if (typeof cur === 'number') {
         var n = Number(raw);
-        if (!isNaN(n)) { next[id] = clamp(n, id === 'transitionMs' ? 0 : 0, id === 'transitionMs' ? 600 : 999); changed = true; }
+        if (!isNaN(n)) {
+          var max = id === 'transitionMs' ? 600 : id === 'hideDelay' ? 3000 : id === 'fadeDuration' ? 2000 : 999;
+          next[id] = clamp(n, 0, max); changed = true;
+        }
       } else if (typeof cur === 'boolean') {
         if (raw === '1' || raw === 'true') { next[id] = true; changed = true; }
         if (raw === '0' || raw === 'false') { next[id] = false; changed = true; }
@@ -438,6 +473,22 @@
     boxHtml += '<p><span class="muted">' + String(j).padStart(2, '0') + '</span>  rpi agent --session current --stream-json --model gpt-5.4  // line ' + j + '</p>';
   }
   $('innerBox').innerHTML = boxHtml;
+
+  // 自动隐藏：滚动时显示滑块，停止并延迟后渐隐
+  var hideTimer = null;
+  function hideTargets() { return [ document.documentElement, $('mainScrollSample'), $('innerBox') ]; }
+  function flashScrollbar() {
+    hideTargets().forEach(function (el) { el.classList.remove('sb-hidden'); });
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () {
+      if (!state.autoHide) return;
+      hideTargets().forEach(function (el) { el.classList.add('sb-hidden'); });
+    }, Number(state.hideDelay) + Number(state.fadeDuration) + 60);
+  }
+  ['mainScrollSample', 'innerBox'].forEach(function (id) {
+    $(id).addEventListener('scroll', flashScrollbar, { passive: true });
+  });
+  window.addEventListener('scroll', flashScrollbar, { passive: true });
 
   // 参数绑定
   CONTROL_IDS.forEach(function (id) {
