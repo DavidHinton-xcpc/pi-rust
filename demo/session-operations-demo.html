@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>rpi-web · 会话操作改版演示（克隆 / 多选）</title>
+<style>
+  :root{
+    --phone-w:420px;
+    --phone-h:900px;
+    --ink:#1f2328;
+    --muted:#8b9098;
+    --line:#e6e7e4;
+    --paper:#fff;
+    --drawer:#f7f7f5;
+    --accent:#111318;
+    --danger:#d93a34;
+    --ui:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    margin:0;background:#0d0d0f;color:var(--ink);font-family:var(--ui);
+    display:grid;place-items:center;overflow:hidden;
+  }
+  .phone{
+    position:relative;width:min(100vw,var(--phone-w));height:min(100vh,var(--phone-h));
+    background:#fff;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.5);
+  }
+  @media (max-width:480px){.phone{width:100vw;height:100vh;box-shadow:none}}
+
+  /* ---------- browser chrome ---------- */
+  .statusbar{
+    position:absolute;top:0;left:0;right:0;height:42px;padding:0 18px;
+    display:flex;align-items:center;justify-content:space-between;
+    font-size:15px;font-weight:600;color:#111;background:#fff;z-index:5;
+  }
+  .status-icons{display:flex;align-items:center;gap:7px}
+  .status-icons svg{width:17px;height:17px}
+  .battery{width:24px;height:12px;border:1.6px solid #111;border-radius:3px;position:relative}
+  .battery:after{content:"";position:absolute;right:-4px;top:3px;width:2px;height:4px;background:#111;border-radius:0 2px 2px 0}
+  .battery i{display:block;height:100%;width:60%;background:#111;border-radius:1px}
+
+  .addressbar{
+    position:absolute;top:44px;left:10px;right:10px;height:54px;z-index:5;
+    border:2px solid #111;border-radius:30px;background:#fff;
+    display:flex;align-items:center;gap:10px;padding:0 16px;
+  }
+  .addressbar .warn{width:20px;height:20px;color:#e5392f;flex:0 0 auto}
+  .addressbar .url{flex:1;text-align:center;font-size:17px;letter-spacing:.2px}
+  .addressbar .refresh{width:22px;height:22px;color:#111;background:none;border:0;padding:0;cursor:pointer}
+
+  /* ---------- app ---------- */
+  .app{position:absolute;top:104px;left:0;right:0;bottom:52px;overflow:hidden;background:#fff}
+
+  .chat-pane{position:absolute;inset:0;display:flex;flex-direction:column;background:#fff}
+  .chat-head{height:58px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line)}
+  .iconbtn{width:34px;height:34px;display:grid;place-items:center;border:0;background:none;color:#333;cursor:pointer;border-radius:8px}
+  .iconbtn:hover{background:#f2f2f0}
+  .branch{
+    display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border:1px solid var(--line);
+    border-radius:999px;font-size:13px;color:#555;background:#fafafa
+  }
+  .chat-body{flex:1;padding:18px 16px;overflow:hidden;color:#444;font-size:14px;line-height:1.65}
+  .bubble{max-width:86%;padding:11px 13px;border-radius:12px;background:#f4f4f2;margin-bottom:12px}
+  .bubble.user{background:#e9eef5;margin-left:auto}
+  .composer{margin:12px;border:1px solid var(--line);border-radius:16px;padding:10px 10px 10px 14px;display:flex;align-items:center;gap:8px;background:#fff}
+  .composer .fake-input{flex:1;color:#9a9ea4;font-size:14px}
+  .send{width:36px;height:36px;border-radius:50%;background:#111;color:#fff;border:0;display:grid;place-items:center;cursor:pointer}
+
+  .scrim{position:absolute;inset:0;background:rgba(0,0,0,.30);z-index:10;transition:opacity .2s}
+  .scrim.hidden{opacity:0;pointer-events:none}
+
+  /* ---------- drawer ---------- */
+  .drawer{
+    position:absolute;top:0;bottom:0;left:0;width:86%;max-width:380px;z-index:20;
+    background:var(--drawer);box-shadow:8px 0 28px rgba(0,0,0,.14);
+    display:flex;flex-direction:column;transition:transform .24s ease;
+  }
+  .drawer.closed{transform:translateX(-102%)}
+  .drawer-scroll{flex:1;overflow-y:auto;padding-bottom:96px;scrollbar-width:none}
+  .drawer-scroll::-webkit-scrollbar{display:none}
+
+  .drawer-head{display:flex;align-items:center;gap:9px;padding:18px 16px 12px}
+  .brand-mark{width:26px;height:26px;color:#3c4148;flex:0 0 auto}
+  .brand{font-size:20px;font-weight:700;letter-spacing:-.4px}
+  .pill{padding:3px 9px;border:1px solid #dcdedb;border-radius:999px;font-size:11px;color:#6f747c;background:#fff;white-space:nowrap}
+  .drawer-head .close{margin-left:auto;width:26px;height:26px;color:#777}
+
+  .navrow{
+    min-height:50px;display:flex;align-items:center;gap:12px;padding:0 18px;
+    color:#31353a;font-size:15px;cursor:pointer;user-select:none;
+  }
+  .navrow:hover{background:#eeeef0}
+  .navrow .icon{width:19px;height:19px;color:#5d626a;flex:0 0 auto}
+  .navrow .label{flex:1;min-width:0}
+
+  .section{margin-top:6px}
+  .section-title{
+    height:46px;display:flex;align-items:center;gap:10px;padding:0 18px;
+    color:#5f646c;font-size:14px;
+  }
+  .section-title .icon{width:18px;height:18px}
+  .section-title .caret{margin-left:auto;width:16px;height:16px;color:#777}
+  .section-tools{display:flex;gap:18px;margin-left:auto;color:#6c7178}
+  .section-tools button{border:0;background:none;padding:4px;color:inherit;cursor:pointer;display:grid;place-items:center}
+
+  .session-row{
+    position:relative;min-height:54px;display:flex;align-items:center;gap:9px;
+    padding:8px 14px 8px 18px;cursor:pointer;user-select:none;
+  }
+  .session-row:hover{background:#eeeef0}
+  .session-row.selected{background:#e9ecef}
+  .session-row.active .title{color:#111}
+  .dot{width:8px;height:8px;border-radius:50%;background:#25a35a;flex:0 0 auto;box-shadow:0 0 0 2px rgba(37,163,90,.12)}
+  .dot.ghost{background:transparent;box-shadow:none}
+  .session-text{flex:1;min-width:0;display:flex;align-items:center;gap:6px}
+  .title{font-size:14.5px;color:#34383d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .badge{font-size:11px;color:#8a8f96;border:1px solid #d9dbd8;border-radius:5px;padding:1px 5px;background:#fff;white-space:nowrap}
+  .tagchip{font-size:10px;color:#5a6472;background:#e5e9ee;border-radius:4px;padding:1px 5px;white-space:nowrap}
+  .time{font-size:12px;color:#9a9ea4;white-space:nowrap;flex:0 0 auto}
+  .more{width:28px;height:28px;border:0;background:none;color:#7b8087;display:grid;place-items:center;border-radius:7px;cursor:pointer;flex:0 0 auto}
+  .more:hover{background:#dedfdd}
+  .icon{width:18px;height:18px;display:block}
+
+  .settings-row{margin-top:auto;border-top:1px solid #e9e9e6;background:var(--drawer)}
+  .settings-row .navrow{min-height:54px}
+
+  /* ---------- context menu ---------- */
+  .menu{
+    position:absolute;z-index:40;width:218px;display:none;padding:6px;
+    background:#fff;border-radius:14px;box-shadow:0 14px 42px rgba(0,0,0,.20),0 2px 8px rgba(0,0,0,.06);
+  }
+  .menu-item{
+    width:100%;height:44px;border:0;background:none;border-radius:9px;
+    display:flex;align-items:center;gap:12px;padding:0 12px;
+    font-family:inherit;font-size:14.5px;color:#2d3136;cursor:pointer;text-align:left;
+  }
+  .menu-item:hover{background:#f2f3f1}
+  .menu-item .icon{width:19px;height:19px;color:#5f646b}
+  .menu-item.danger{color:var(--danger)}
+  .menu-item.danger .icon{color:var(--danger)}
+  .menu-sep{height:1px;background:#eee; margin:5px 8px}
+
+  /* ---------- selection mode ---------- */
+  .select-head{
+    position:absolute;top:0;left:0;right:0;height:64px;z-index:26;
+    display:none;align-items:center;gap:8px;padding:0 12px 0 18px;
+    background:var(--drawer);border-bottom:1px solid #e5e6e3;
+  }
+  .drawer.selecting .select-head{display:flex}
+  .select-head .count{font-size:14px;font-weight:600;flex:1}
+  .textbtn{border:0;background:none;color:#2f6fd0;font-size:13.5px;padding:8px;cursor:pointer}
+  .textbtn.ghost{color:#6f747c}
+
+  .checkbox{
+    width:20px;height:20px;border:1.6px solid #92979e;border-radius:5px;background:#fff;
+    display:grid;place-items:center;flex:0 0 auto;color:#fff;
+  }
+  .checkbox .icon{width:14px;height:14px;opacity:0}
+  .checkbox.checked{background:var(--accent);border-color:var(--accent)}
+  .checkbox.checked .icon{opacity:1}
+
+  .batchbar{
+    position:absolute;left:12px;right:12px;bottom:12px;z-index:35;display:none;
+    background:#fff;border:1px solid #e4e5e2;border-radius:16px;
+    box-shadow:0 10px 32px rgba(0,0,0,.14);padding:8px 4px;
+    grid-template-columns:repeat(3,1fr);
+  }
+  .batchbar.show{display:grid}
+  .batch{
+    border:0;background:none;font-family:inherit;color:#333;
+    display:flex;flex-direction:column;align-items:center;gap:4px;
+    font-size:12px;padding:8px 4px;cursor:pointer;border-radius:10px;
+  }
+  .batch:hover:not(:disabled){background:#f4f4f2}
+  .batch:disabled{opacity:.35;cursor:not-allowed}
+  .batch .icon{width:20px;height:20px}
+  .batch.danger{color:var(--danger)}
+
+  /* ---------- toast / modal ---------- */
+  .toast{
+    position:absolute;left:50%;bottom:76px;transform:translate(-50%,8px);
+    z-index:60;background:rgba(28,30,34,.92);color:#fff;font-size:13px;
+    padding:10px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:.2s;
+    max-width:86%;text-align:center;
+  }
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  .modal-backdrop{
+    position:absolute;inset:0;z-index:70;display:none;place-items:center;
+    background:rgba(0,0,0,.42);padding:20px;
+  }
+  .modal-backdrop.show{display:grid}
+  .modal-card{
+    width:100%;max-width:330px;background:#fff;border-radius:16px;padding:20px;
+    box-shadow:0 20px 60px rgba(0,0,0,.25);
+  }
+  .modal-card h3{margin:0 0 10px;font-size:17px;font-weight:600}
+  .modal-card p{margin:0 0 16px;font-size:14px;color:#666;line-height:1.6}
+  .modal-card input{
+    width:100%;height:40px;border:1px solid #d8dad7;border-radius:9px;padding:0 11px;
+    font-family:inherit;font-size:14px;outline:none;margin-bottom:16px;
+  }
+  .modal-card input:focus{border-color:#333}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px}
+  .modal-actions button{
+    border:1px solid #d8dad7;background:#fff;color:#333;border-radius:9px;
+    height:36px;padding:0 16px;font-family:inherit;font-size:14px;cursor:pointer;
+  }
+  .modal-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .modal-actions .danger{background:var(--danger);border-color:var(--danger);color:#fff}
+
+  /* ---------- browser nav ---------- */
+  .navbar{
+    position:absolute;left:0;right:0;bottom:0;height:52px;z-index:6;
+    display:flex;align-items:center;justify-content:space-around;
+    border-top:1px solid #ececec;background:#fff;padding-bottom:4px;
+  }
+  .navbar button{border:0;background:none;width:44px;height:44px;display:grid;place-items:center;color:#4a4f56;cursor:pointer}
+  .navbar .tabs{font-size:13px;font-weight:600;border:2px solid #4a4f56;border-radius:7px;width:26px;height:26px}
+
+  svg{display:block}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="s" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></g>
+  </defs>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3.2 2.7 19.4h18.6L12 3.2Z" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M12 9v5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><circle cx="12" cy="17" r="1" fill="currentColor"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6.1" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><path d="M20 4v7h-7" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2.8v2.4M12 18.8v2.4M4.5 7.4l2.1 1.2M17.4 15.4l2.1 1.2M4.5 16.6l2.1-1.2M17.4 8.6l2.1-1.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2.5 2"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4l11-11-4-4L4 16v4Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m13.5 6.5 4 4" stroke="currentColor" stroke-width="1.8"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m15.5 15.5 4.2 4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 7.2V12l3.2 2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+  <symbol id="i-caret" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="4.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5.5 9v9.5h13V9M9.5 13h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="9" cy="7" r="2" fill="#f7f7f5" stroke="currentColor" stroke-width="1.7"/><circle cx="15" cy="12" r="2" fill="#f7f7f5" stroke="currentColor" stroke-width="1.7"/><circle cx="8" cy="17" r="2" fill="#f7f7f5" stroke="currentColor" stroke-width="1.7"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.5 8.5v-2a2 2 0 0 0-2-2H6.5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-multi" viewBox="0 0 24 24"><rect x="3.5" y="4" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="3.5" y="13" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m14 7.5 2 2 4-4M14 16.5l2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M4 12.5 12.5 4H20v7.5L11.5 20 4 12.5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="16" cy="8" r="1.4" fill="currentColor"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M9 3h6l-1 6 3.5 3.5H6.5L10 9 9 3Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 12.5V21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 7h15M9 7V4.5h6V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" fill="currentColor"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/><circle cx="19" cy="12" r="1.6" fill="currentColor"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5m0 0-6 6m6-6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-forward" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m4 11 8-7 8 7v9h-6v-6h-4v6H4v-9Z" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><circle cx="6" cy="12" r="1.7" fill="currentColor"/><circle cx="12" cy="12" r="1.7" fill="currentColor"/><circle cx="18" cy="12" r="1.7" fill="currentColor"/></symbol>
+  <symbol id="i-signal" viewBox="0 0 24 24"><path d="M4 19h2v-4H4v4Zm5 0h2V9H9v10Zm5 0h2V5h-2v14Zm5 0h2V2h-2v17Z" fill="currentColor"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M3 9.5a14 14 0 0 1 18 0M6.5 13a9 9 0 0 1 11 0M10 16.5a4 4 0 0 1 4 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="20" r="1" fill="currentColor"/></symbol>
+</svg>
+
+<div class="phone">
+  <div class="statusbar">
+    <span>12:55</span>
+    <div class="status-icons">
+      <svg><use href="#i-signal"></use></svg>
+      <svg><use href="#i-wifi"></use></svg>
+      <span style="font-size:10px;font-weight:700">5A</span>
+      <div class="battery"><i></i></div>
+      <span style="font-size:12px;font-weight:700">60</span>
+      <svg viewBox="0 0 24 24" style="width:13px;height:13px"><path d="M13 2 5 14h6l-1 8 8-13h-6l1-7Z" fill="currentColor"/></svg>
+    </div>
+  </div>
+
+  <div class="addressbar">
+    <svg class="warn"><use href="#i-warn"></use></svg>
+    <span class="url">43.143.62.58</span>
+    <button class="refresh" id="refreshBtn" aria-label="刷新"><svg class="icon" style="width:22px;height:22px"><use href="#i-refresh"></use></svg></button>
+  </div>
+
+  <div class="app" id="app">
+    <div class="chat-pane">
+      <div class="chat-head">
+        <button class="iconbtn" id="openDrawerBtn" aria-label="打开会话列表"><svg class="icon"><use href="#i-menu"></use></svg></button>
+        <span class="branch"><svg class="icon" style="width:14px;height:14px"><use href="#i-pin"></use></svg>main</span>
+        <span style="margin-left:auto;font-size:12px;color:#999">会话详情（背景示意）</span>
+      </div>
+      <div class="chat-body">
+        <div class="bubble">当前 rpi-web 在左侧菜单内，对会话的操作入口放在每条会话右侧的「···」里。</div>
+        <div class="bubble user">把「分叉」改叫「克隆」，并加一个「多选」做批量操作。</div>
+        <div class="bubble">好。克隆用双矩形图标；多选进入勾选模式后，底部出现批量置顶 / 归档 / 永久删除操作条。</div>
+      </div>
+      <div class="composer">
+        <div class="fake-input">输入消息…</div>
+        <button class="send" aria-label="发送"><svg class="icon"><use href="#i-up"></use></svg></button>
+      </div>
+    </div>
+
+    <div class="scrim" id="scrim"></div>
+
+    <aside class="drawer" id="drawer">
+      <div class="select-head" id="selectHead">
+        <span class="count" id="selectCount">已选择 0 项</span>
+        <button class="textbtn" id="selectAllBtn">全选</button>
+        <button class="textbtn ghost" id="exitSelectBtn">退出</button>
+      </div>
+
+      <div class="drawer-scroll" id="drawerScroll">
+        <div class="drawer-head">
+          <svg class="brand-mark"><use href="#i-gear"></use></svg>
+          <span class="brand">rpi</span>
+          <span class="pill">v0.1.88-preview</span>
+          <span class="pill">宿主 0.26.1</span>
+          <button class="iconbtn close" id="closeDrawerBtn" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button>
+        </div>
+
+        <div class="navrow" id="newSessionBtn"><svg class="icon"><use href="#i-edit"></use></svg><span class="label">新建会话</span></div>
+        <div class="navrow" id="searchBtn"><svg class="icon"><use href="#i-search"></use></svg><span class="label">搜索会话</span></div>
+
+        <section class="section">
+          <div class="section-title"><svg class="icon"><use href="#i-clock"></use></svg>最近会话<svg class="icon caret"><use href="#i-caret"></use></svg></div>
+          <div id="recentList"></div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">
+            <svg class="icon"><use href="#i-archive"></use></svg>项目
+            <div class="section-tools">
+              <button id="projectArchiveBtn" aria-label="项目归档"><svg class="icon"><use href="#i-archive"></use></svg></button>
+              <button id="projectAddBtn" aria-label="新建项目"><svg class="icon"><use href="#i-plus"></use></svg></button>
+            </div>
+          </div>
+          <div id="projectList"></div>
+        </section>
+
+        <div class="settings-row"><div class="navrow" id="settingsBtn"><svg class="icon"><use href="#i-settings"></use></svg><span class="label">设置</span></div></div>
+      </div>
+    </aside>
+
+    <div class="menu" id="menu" role="menu"></div>
+
+    <div class="batchbar" id="batchbar">
+      <button class="batch" id="batchPin"><svg class="icon"><use href="#i-pin"></use></svg><span>置顶</span></button>
+      <button class="batch" id="batchArchive"><svg class="icon"><use href="#i-archive"></use></svg><span>归档</span></button>
+      <button class="batch danger" id="batchDelete"><svg class="icon"><use href="#i-trash"></use></svg><span>永久删除</span></button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="modal-backdrop" id="modalBackdrop"></div>
+
+  <div class="navbar">
+    <button aria-label="后退"><svg class="icon" style="width:22px;height:22px"><use href="#i-back"></use></svg></button>
+    <button aria-label="前进" style="opacity:.45"><svg class="icon" style="width:22px;height:22px"><use href="#i-forward"></use></svg></button>
+    <button aria-label="主页"><svg class="icon" style="width:24px;height:24px"><use href="#i-home"></use></svg></button>
+    <button aria-label="标签页"><span class="tabs">3</span></button>
+    <button aria-label="更多"><svg class="icon" style="width:22px;height:22px"><use href="#i-grid"></use></svg></button>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  const $ = (id)=>document.getElementById(id);
+  const app=$("app"), drawer=$("drawer"), scrim=$("scrim"), menu=$("menu");
+  const recentList=$("recentList"), projectList=$("projectList");
+  const batchbar=$("batchbar"), toastEl=$("toast"), modal=$("modalBackdrop");
+
+  const svg=(name,cls)=>`<svg class="icon ${cls||''}"><use href="#i-${name}"></use></svg>`;
+  const esc=(s)=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const uid=()=>Math.random().toString(36).slice(2,9);
+
+  let sessions=[
+    {id:"r1",group:"recent",title:"当前rpi-web在左侧菜单内，对会话…",time:"14 小时",active:true,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"r2",group:"recent",title:"新会话",time:"1 分钟",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"r3",group:"recent",title:"当前rpi-web的fork和clone功能疑似…",time:"13 小时",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"r4",group:"recent",title:"我注意到当前云机rpi-web更新不会…",time:"14 小时",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"r5",group:"recent",title:"新会话",time:"14 小时",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"p1",group:"project",title:"新会话",time:"1 分钟",active:false,pinned:false,archived:false,draft:true,tags:[]},
+    {id:"p2",group:"project",title:"当前rpi-web的左侧菜单结构",time:"13 小时",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"p3",group:"project",title:"我注意到当前云机rpi-web更新不会…",time:"14 小时",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"p4",group:"project",title:"审核rpi-web有关会话管理的实现",time:"12 小时",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"p5",group:"project",title:"新会话",time:"14 小时",active:false,pinned:false,archived:false,draft:false,tags:[]},
+    {id:"p6",group:"project",title:"批量操作交互方案",time:"15 小时",active:false,pinned:false,archived:false,draft:false,tags:[]}
+  ];
+
+  let openMenuId=null;
+  let selectMode=false;
+  let selected=new Set();
+  let toastTimer=null;
+
+  function visibleSessions(group){
+    return sessions.filter(s=>s.group===group && !s.archived)
+      .sort((a,b)=>(b.pinned?1:0)-(a.pinned?1:0));
+  }
+  function allVisibleIds(){return sessions.filter(s=>!s.archived).map(s=>s.id)}
+  function find(id){return sessions.find(s=>s.id===id)}
+
+  function rowHtml(s){
+    const checked=selected.has(s.id);
+    const lead=selectMode
+      ? `<span class="checkbox ${checked?'checked':''}">${svg('check')}</span>`
+      : `<span class="dot ${s.active?'':'ghost'}"></span>`;
+    const more=selectMode?"":`<button class="more" data-more="${s.id}" aria-label="更多操作">${svg('more')}</button>`;
+    const tag=s.tags&&s.tags.length?`<span class="tagchip">${esc(s.tags[0])}</span>`:"";
+    const draft=s.draft?`<span class="badge">草稿</span>`:"";
+    const pinned=s.pinned?`<span class="tagchip">置顶</span>`:"";
+    return `<div class="session-row ${s.active?'active':''} ${checked?'selected':''}" data-row="${s.id}" role="button" tabindex="0">
+      ${lead}
+      <span class="session-text"><span class="title">${esc(s.title)}</span>${tag}${pinned}</span>
+      ${draft}<span class="time">${esc(s.time)}</span>${more}
+    </div>`;
+  }
+
+  function render(){
+    recentList.innerHTML=visibleSessions("recent").map(rowHtml).join("");
+    projectList.innerHTML=visibleSessions("project").map(rowHtml).join("");
+    drawer.classList.toggle("selecting",selectMode);
+    batchbar.classList.toggle("show",selectMode);
+    const total=allVisibleIds().length;
+    $("selectCount").textContent=`已选择 ${selected.size} / ${total} 项`;
+    ["batchPin","batchArchive","batchDelete"].forEach(id=>$(id).disabled=selected.size===0);
+  }
+
+  function showToast(text){
+    toastEl.textContent=text;toastEl.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer=setTimeout(()=>toastEl.classList.remove("show"),1900);
+  }
+
+  function closeMenu(){menu.style.display="none";openMenuId=null}
+  function openMenu(id,btn){
+    const s=find(id);if(!s)return;
+    openMenuId=id;
+    const pinLabel=s.pinned?"取消置顶":"置顶";
+    menu.innerHTML=`
+      <button class="menu-item" data-act="clone" data-id="${id}">${svg('copy')}<span>克隆</span></button>
+      <button class="menu-item" data-act="multi" data-id="${id}">${svg('multi')}<span>多选</span></button>
+      <button class="menu-item" data-act="rename" data-id="${id}">${svg('edit')}<span>重命名</span></button>
+      <button class="menu-item" data-act="tag" data-id="${id}">${svg('tag')}<span>编辑标签</span></button>
+      <button class="menu-item" data-act="pin" data-id="${id}">${svg('pin')}<span>${pinLabel}</span></button>
+      <button class="menu-item" data-act="archive" data-id="${id}">${svg('archive')}<span>归档</span></button>
+      <div class="menu-sep"></div>
+      <button class="menu-item danger" data-act="delete" data-id="${id}">${svg('trash')}<span>永久删除</span></button>`;
+    menu.style.display="block";
+    const ar=app.getBoundingClientRect(), br=btn.getBoundingClientRect();
+    const mw=menu.offsetWidth, mh=menu.offsetHeight;
+    let left=br.right-ar.left-mw+4;
+    let top=br.bottom-ar.top+6;
+    left=Math.max(8,Math.min(left,ar.width-mw-8));
+    top=Math.max(8,Math.min(top,ar.height-mh-8));
+    menu.style.left=left+"px";menu.style.top=top+"px";
+  }
+
+  function openModal(html,onMount){
+    modal.innerHTML=`<div class="modal-card">${html}</div>`;
+    modal.classList.add("show");
+    onMount&&onMount(modal.querySelector(".modal-card"));
+    const cancel=modal.querySelector("[data-cancel]");
+    cancel&&cancel.addEventListener("click",closeModal);
+    modal.addEventListener("click",function backdrop(e){if(e.target===modal){closeModal();modal.removeEventListener("click",backdrop)}});
+  }
+  function closeModal(){modal.classList.remove("show");modal.innerHTML=""}
+
+  function promptModal(title,value,placeholder,onSave){
+    openModal(`<h3>${esc(title)}</h3><input id="modalInput" value="${esc(value)}" placeholder="${esc(placeholder)}">
+      <div class="modal-actions"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div>`,card=>{
+      const input=card.querySelector("#modalInput");input.focus();input.select();
+      card.querySelector("[data-ok]").addEventListener("click",()=>{const v=input.value.trim();if(v)onSave(v);closeModal()});
+      input.addEventListener("keydown",e=>{if(e.key==="Enter")card.querySelector("[data-ok]").click()});
+    });
+  }
+  function confirmModal(title,message,okText,onOk,danger){
+    openModal(`<h3>${esc(title)}</h3><p>${esc(message)}</p>
+      <div class="modal-actions"><button data-cancel>取消</button><button class="${danger?'danger':'primary'}" data-ok>${esc(okText)}</button></div>`,card=>{
+      card.querySelector("[data-ok]").addEventListener("click",()=>{onOk();closeModal()});
+    });
+  }
+
+  function enterSelect(){
+    selectMode=true;selected.clear();closeMenu();render();showToast("已进入多选模式");
+  }
+  function exitSelect(){selectMode=false;selected.clear();closeMenu();render()}
+  function toggleSelected(id){selected.has(id)?selected.delete(id):selected.add(id);render()}
+
+  function handleAction(act,id){
+    const s=find(id);closeMenu();
+    if(!s&&act!=="multi")return;
+    switch(act){
+      case "clone":{
+        const copy={...s,id:uid(),title:s.title.replace(/（副本）$/,"")+"（副本）",time:"刚刚",active:false,pinned:false,draft:false,tags:[...s.tags]};
+        const idx=sessions.indexOf(s);sessions.splice(idx,0,copy);
+        render();showToast("已克隆会话");
+        break;
+      }
+      case "multi":enterSelect();break;
+      case "rename":
+        promptModal("重命名会话",s.title,"输入新标题",v=>{s.title=v;render();showToast("已重命名")});
+        break;
+      case "tag":
+        promptModal("编辑标签",(s.tags||[]).join("、"),"用逗号分隔多个标签",v=>{
+          s.tags=v.split(/[,，、]/).map(x=>x.trim()).filter(Boolean).slice(0,2);
+          render();showToast("已更新标签");
+        });
+        break;
+      case "pin":
+        s.pinned=!s.pinned;render();showToast(s.pinned?"已置顶":"已取消置顶");
+        break;
+      case "archive":
+        s.archived=true;render();showToast("已归档会话");
+        break;
+      case "delete":
+        confirmModal("永久删除会话",`确定永久删除「${s.title}」吗？此操作不可撤销。`,"永久删除",()=>{
+          sessions=sessions.filter(x=>x.id!==id);render();showToast("已永久删除");
+        },true);
+        break;
+    }
+  }
+
+  // event delegation
+  document.addEventListener("click",e=>{
+    const moreBtn=e.target.closest("[data-more]");
+    if(moreBtn){e.stopPropagation();openMenuId===moreBtn.dataset.more?closeMenu():openMenu(moreBtn.dataset.more,moreBtn);return}
+    const item=e.target.closest("[data-act]");
+    if(item){e.stopPropagation();handleAction(item.dataset.act,item.dataset.id);return}
+    const row=e.target.closest("[data-row]");
+    if(row){
+      const id=row.dataset.row;
+      if(selectMode){toggleSelected(id)}else{
+        sessions.forEach(s=>s.active=s.id===id);render();showToast("已打开会话");
+      }
+      return;
+    }
+    if(!e.target.closest("#menu"))closeMenu();
+  });
+
+  // drawer / misc controls
+  function closeDrawer(){drawer.classList.add("closed");scrim.classList.add("hidden");closeMenu()}
+  function openDrawer(){drawer.classList.remove("closed");scrim.classList.remove("hidden")}
+  $("closeDrawerBtn").addEventListener("click",e=>{e.stopPropagation();closeDrawer()});
+  $("openDrawerBtn").addEventListener("click",e=>{e.stopPropagation();openDrawer()});
+  scrim.addEventListener("click",closeDrawer);
+  $("drawerScroll").addEventListener("scroll",closeMenu);
+
+  $("newSessionBtn").addEventListener("click",()=>{
+    sessions.unshift({id:uid(),group:"recent",title:"新会话",time:"刚刚",active:false,pinned:false,archived:false,draft:false,tags:[]});
+    render();showToast("已新建会话");
+  });
+  $("searchBtn").addEventListener("click",()=>showToast("搜索会话（演示）"));
+  $("projectArchiveBtn").addEventListener("click",()=>showToast("项目归档（演示）"));
+  $("projectAddBtn").addEventListener("click",()=>showToast("新建项目（演示）"));
+  $("settingsBtn").addEventListener("click",()=>showToast("设置（演示）"));
+  $("refreshBtn").addEventListener("click",()=>showToast("页面已刷新（演示）"));
+
+  $("selectAllBtn").addEventListener("click",()=>{selected=new Set(allVisibleIds());render()});
+  $("exitSelectBtn").addEventListener("click",exitSelect);
+  $("batchPin").addEventListener("click",()=>{
+    if(!selected.size)return;
+    sessions.forEach(s=>{if(selected.has(s.id))s.pinned=true});
+    const n=selected.size;exitSelect();showToast(`已置顶 ${n} 个会话`);
+  });
+  $("batchArchive").addEventListener("click",()=>{
+    if(!selected.size)return;
+    const n=selected.size;sessions.forEach(s=>{if(selected.has(s.id))s.archived=true});
+    exitSelect();showToast(`已归档 ${n} 个会话`);
+  });
+  $("batchDelete").addEventListener("click",()=>{
+    if(!selected.size)return;
+    const n=selected.size,ids=new Set(selected);
+    confirmModal("永久删除会话",`确定永久删除选中的 ${n} 个会话吗？此操作不可撤销。`,"永久删除",()=>{
+      sessions=sessions.filter(s=>!ids.has(s.id));exitSelect();showToast(`已永久删除 ${n} 个会话`);
+    },true);
+  });
+
+  // initial render, then reproduce the screenshot's open menu
+  render();
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    const btn=document.querySelector('[data-more="p1"]');
+    if(btn)openMenu("p1",btn);
+  }));
+})();
+</script>
+</body>
+</html>
