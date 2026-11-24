@@ -376,5 +376,21 @@
   bl.addEventListener('click', function () {{ setTheme(true); }});
 }})();
 </script>
+<script>
+(function () {
+  if (location.pathname.replace(/\/+$/, '') !== '' &&
+      location.pathname.replace(/\/+$/, '') !== '/index.html' &&
+      location.pathname.replace(/\/+$/, '') !== '/pi-rust' &&
+      location.pathname.replace(/\/+$/, '') !== '/pi-rust/') return;
+  var link = document.createElement('a');
+  link.href = 'scrollbar-lab.html';
+  link.textContent = '滚动条样式实验室 →';
+  link.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:9999;padding:11px 15px;border:1px solid rgba(236,107,56,.55);border-radius:2px;background:rgba(11,11,14,.92);color:#ec6b38;font:12px/1.2 system-ui,sans-serif;text-decoration:none;box-shadow:0 8px 24px rgba(0,0,0,.3)';
+  link.addEventListener('mouseenter', function () { link.style.background = '#ec6b38'; link.style.color = '#0b0b0e'; });
+  link.addEventListener('mouseleave', function () { link.style.background = 'rgba(11,11,14,.92)'; link.style.color = '#ec6b38'; });
+  document.body.appendChild(link);
+})();
+</script>
+
 </body>
 </html>

@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>滚动条样式实验室 · rpi-web</title>
+<meta name="description" content="交互式调整滚动条宽度、颜色、圆角、悬停效果与平滑滚动，并复制可直接用于 rpi-web 的 CSS。" />
+<style>
+  :root {
+    color-scheme: light;
+    --ink: #101113;
+    --paper: #f4f1e9;
+    --paper-deep: #e9e5da;
+    --muted: #6f706d;
+    --line: rgba(16, 17, 19, .14);
+    --orange: #ec6b38;
+    --orange-deep: #a84422;
+    --white: #fffdf8;
+    --mono: 'DM Mono', 'SFMono-Regular', Consolas, monospace;
+    --sans: 'Manrope', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+  button, input, select { font: inherit; }
+  a { color: var(--orange-deep); }
+
+  /* 实验室页面本身的滚动条也由右侧调节参数驱动 */
+  html {
+    scrollbar-width: thin;
+    scrollbar-color: #c9cdd3 transparent;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #c9cdd3; border-radius: 999px; border: 0 solid transparent; }
+  ::-webkit-scrollbar-thumb:hover { background: #a8adb5; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+
+  .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px clamp(22px, 5vw, 76px); border-bottom: 1px solid var(--line); background: rgba(244,241,233,.94); backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 20; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 800; letter-spacing: -.06em; }
+  .brand-mark { display: inline-flex; align-items: flex-end; gap: 3px; height: 21px; }.brand-mark span { width: 5px; border-radius: 1px; display: block; background: var(--ink); }.brand-mark span:nth-child(1) { height: 12px; opacity: .55; }.brand-mark span:nth-child(2) { height: 18px; background: var(--orange); }.brand-mark span:nth-child(3) { height: 8px; opacity: .45; }
+  .topbar-links { display: flex; align-items: center; gap: 18px; font: 11px var(--mono); }
+  .topbar-links a:hover { color: var(--orange); }
+
+  .layout { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 30px; max-width: 1500px; margin: 0 auto; padding: 34px clamp(22px, 5vw, 76px) 90px; }
+  .panel { background: var(--white); border: 1px solid rgba(16,17,19,.08); box-shadow: 10px 14px 30px rgba(16,17,19,.06); }
+  .controls { position: sticky; top: 94px; align-self: start; max-height: calc(100vh - 118px); overflow: auto; padding: 24px; }
+  .controls h1 { margin: 0 0 8px; font-size: 27px; line-height: 1.15; letter-spacing: -.06em; }
+  .controls .lede { margin: 0 0 22px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+  .group { padding: 18px 0; border-top: 1px solid var(--line); }
+  .group:first-of-type { border-top: 0; padding-top: 0; }
+  .group h2 { margin: 0 0 15px; font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--orange-deep); }
+  .field { display: grid; grid-template-columns: 82px minmax(0, 1fr); align-items: center; gap: 10px; margin-bottom: 12px; }
+  .field > label, .field > span { color: var(--muted); font-size: 11px; }
+  .field .value { color: var(--ink); font: 10px var(--mono); text-align: right; }
+  .field input[type="range"] { width: 100%; accent-color: var(--orange); }
+  .field input[type="color"] { width: 100%; height: 32px; padding: 2px; border: 1px solid var(--line); background: var(--white); cursor: pointer; }
+  .field select, .field input[type="text"] { width: 100%; min-width: 0; height: 32px; padding: 0 9px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font: 11px var(--mono); }
+  .check-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 28px; color: var(--muted); font-size: 11px; }
+  .check-row input { width: 16px; height: 16px; accent-color: var(--orange); cursor: pointer; }
+  .button-row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 18px; }
+  .button-row button, .ghost-button { min-height: 38px; padding: 0 12px; border: 1px solid var(--ink); background: var(--ink); color: var(--white); cursor: pointer; font: 10px var(--mono); transition: background .2s, color .2s, border-color .2s; }
+  .button-row button:hover, .ghost-button:hover { background: var(--orange); border-color: var(--orange); }
+  .button-row .secondary { background: transparent; color: var(--ink); border-color: var(--line); }
+  .button-row .secondary:hover { color: var(--white); }
+
+  .preview { min-width: 0; }
+  .preview-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
+  .preview-head h2 { margin: 0; font-size: 30px; line-height: 1.1; letter-spacing: -.06em; }
+  .preview-head p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+  .preset-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+  .preset { padding: 8px 12px; border: 1px solid var(--line); background: var(--white); color: var(--ink); cursor: pointer; font: 10px var(--mono); transition: border-color .2s, background .2s, color .2s; }
+  .preset:hover { border-color: var(--orange); color: var(--orange-deep); }
+  .preset.is-active { background: var(--ink); border-color: var(--ink); color: var(--white); }
+
+  .preview-card { padding: 26px; }
+  .preview-card + .preview-card { margin-top: 22px; }
+  .card-label { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; font: 10px var(--mono); color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+  .card-label strong { color: var(--ink); font-weight: 500; }
+  .scroll-area { height: 430px; padding: 22px 26px; border: 1px solid var(--line); background: var(--paper); overflow: auto; scrollbar-gutter: stable; }
+  .scroll-area h3 { margin: 0 0 12px; font-size: 25px; letter-spacing: -.05em; }
+  .scroll-area p { margin: 0 0 15px; color: #464844; font-size: 13px; line-height: 1.85; }
+  .rows { margin-top: 22px; border-top: 1px solid var(--line); }
+  .row { display: grid; grid-template-columns: 52px 1fr; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+  .row b { color: var(--orange); font: 11px var(--mono); }
+  .row span { font-size: 12px; line-height: 1.7; }
+  .anchor-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+  .anchor-links a { padding: 8px 11px; border: 1px solid var(--line); background: var(--white); font: 10px var(--mono); text-decoration: none; }
+  .anchor-links a:hover { border-color: var(--orange); }
+  .anchor-target { padding: 24px; margin-top: 18px; border: 1px dashed var(--line); background: rgba(236,107,56,.05); }
+  .anchor-target h4 { margin: 0 0 8px; font-size: 18px; }
+  .anchor-target p { margin: 0; color: var(--muted); font-size: 12px; }
+
+  .inner-box { height: 240px; padding: 18px 22px; overflow: auto; border: 1px solid var(--line); background: var(--ink); color: #d7dcd0; font: 11px/1.9 var(--mono); scrollbar-gutter: stable; }
+  .inner-box p { margin: 0 0 12px; color: inherit; font: inherit; }
+  .inner-box .muted { color: #858b84; }
+
+  .output { position: relative; }
+  .output pre { max-height: 320px; overflow: auto; margin: 0; padding: 20px; background: var(--ink); color: #d7dcd0; font: 11px/1.7 var(--mono); white-space: pre; tab-size: 2; }
+  .copy-css { position: absolute; top: 12px; right: 12px; padding: 7px 11px; border: 1px solid #5c625d; background: #262927; color: #d7dcd0; cursor: pointer; font: 10px var(--mono); }
+  .copy-css:hover { border-color: var(--orange); color: var(--orange); }
+  .toast { position: fixed; z-index: 30; right: 22px; bottom: 22px; padding: 12px 16px; background: var(--ink); color: var(--white); box-shadow: 0 8px 25px rgba(16,17,19,.2); font: 10px var(--mono); opacity: 0; transform: translateY(10px); pointer-events: none; transition: opacity .2s, transform .2s; }
+  .toast.is-visible { opacity: 1; transform: translateY(0); }
+  .note { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+  .note code { font-family: var(--mono); color: var(--orange-deep); }
+
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    .controls { position: static; max-height: none; }
+  }
+  @media (max-width: 560px) {
+    .topbar { padding: 15px 18px; }
+    .layout { padding: 24px 16px 70px; }
+    .preview-card { padding: 16px; }
+    .field { grid-template-columns: 72px minmax(0, 1fr); }
+    .preview-head h2 { font-size: 24px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .preset, .button-row button, .ghost-button, .toast { transition: none; }
+  }
+</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>rpi<span style="color:var(--orange)">.</span></div>
+    <nav class="topbar-links" aria-label="页面导航">
+      <a href="index.html">← 返回官网</a>
+      <a href="#preview">预览</a>
+      <a href="#css-output">CSS</a>
+    </nav>
+  </header>
+
+  <main class="layout">
+    <aside class="panel controls" aria-label="滚动条参数设置">
+      <h1>滚动条实验室</h1>
+      <p class="lede">调整参数并观察右侧实时预览。满意后复制 CSS 用到 rpi-web，或复制带参数的链接分享配置。</p>
+
+      <section class="group">
+        <h2>预设</h2>
+        <div class="preset-bar" id="presetBar" role="group" aria-label="预设样式"></div>
+      </section>
+
+      <section class="group">
+        <h2>尺寸与形状</h2>
+        <div class="field"><label for="width">宽度</label><input id="width" type="range" min="4" max="24" step="1" /><span class="value" id="widthValue"></span></div>
+        <div class="field"><label for="radius">圆角</label><input id="radius" type="range" min="0" max="999" step="1" /><span class="value" id="radiusValue"></span></div>
+        <div class="field"><label for="thumbInset">内缩</label><input id="thumbInset" type="range" min="0" max="6" step="1" /><span class="value" id="thumbInsetValue"></span></div>
+        <div class="field"><label for="trackInset">轨道留白</label><input id="trackInset" type="range" min="0" max="6" step="1" /><span class="value" id="trackInsetValue"></span></div>
+      </section>
+
+      <section class="group">
+        <h2>颜色</h2>
+        <div class="field"><label for="trackColor">轨道</label><input id="trackColor" type="color" /><span class="value" id="trackColorValue"></span></div>
+        <div class="field"><label for="thumbColor">滑块</label><input id="thumbColor" type="color" /><span class="value" id="thumbColorValue"></span></div>
+        <div class="field"><label for="hoverColor">悬停滑块</label><input id="hoverColor" type="color" /><span class="value" id="hoverColorValue"></span></div>
+        <div class="field"><label for="activeColor">按下滑块</label><input id="activeColor" type="color" /><span class="value" id="activeColorValue"></span></div>
+        <div class="field"><label for="trackOpacity">轨道透明</label><input id="trackOpacity" type="range" min="0" max="100" step="5" /><span class="value" id="trackOpacityValue"></span></div>
+        <div class="field"><label for="thumbOpacity">滑块透明</label><input id="thumbOpacity" type="range" min="20" max="100" step="5" /><span class="value" id="thumbOpacityValue"></span></div>
+      </section>
+
+      <section class="group">
+        <h2>交互与动画</h2>
+        <div class="field"><label for="transitionMs">过渡时长</label><input id="transitionMs" type="range" min="0" max="600" step="25" /><span class="value" id="transitionMsValue"></span></div>
+        <div class="field"><label for="easing">缓动</label><select id="easing">
+          <option value="ease">ease</option>
+          <option value="ease-in">ease-in</option>
+          <option value="ease-out">ease-out</option>
+          <option value="ease-in-out">ease-in-out</option>
+          <option value="linear">linear</option>
+          <option value="cubic-bezier(0.2, 0.8, 0.2, 1)">cubic-bezier(.2,.8,.2,1)</option>
+        </select></div>
+        <div class="field"><label for="scrollBehavior">平滑滚动</label><select id="scrollBehavior">
+          <option value="smooth">smooth</option>
+          <option value="auto">auto</option>
+        </select></div>
+        <div class="check-row"><span>滑块悬停变色</span><input id="hoverEnabled" type="checkbox" /></div>
+        <div class="check-row"><span>滑块按下变色</span><input id="activeEnabled" type="checkbox" /></div>
+        <div class="check-row"><span>宽度小于 8px 时移动端收窄</span><input id="mobileThin" type="checkbox" /></div>
+      </section>
+
+      <section class="group">
+        <h2>Firefox 回退</h2>
+        <div class="field"><label for="ffWidth">宽度</label><select id="ffWidth">
+          <option value="auto">auto</option>
+          <option value="thin">thin</option>
+        </select></div>
+        <div class="field"><label for="ffThumb">滑块色</label><input id="ffThumb" type="color" /><span class="value" id="ffThumbValue"></span></div>
+        <div class="field"><label for="ffTrack">轨道色</label><input id="ffTrack" type="color" /><span class="value" id="ffTrackValue"></span></div>
+      </section>
+
+      <div class="button-row">
+        <button id="copyLink" type="button">复制分享链接</button>
+        <button id="reset" class="secondary" type="button">恢复默认</button>
+      </div>
+    </aside>
+
+    <section class="preview" id="preview">
+      <div class="preview-head">
+        <div>
+          <h2>实时预览</h2>
+          <p>滚动主页面、内部黑框，或点击下方链接查看滚动行为。</p>
+        </div>
+      </div>
+
+      <div class="panel preview-card">
+        <div class="card-label"><strong>主页面滚动条</strong><span>整页滚动 · 当前参数</span></div>
+        <div class="scroll-area" id="mainScrollSample">
+          <h3>把玩这些参数</h3>
+          <p>当前页面的滚动条也由左侧参数实时驱动。滚动这个区域或整个页面，观察轨道、滑块、圆角、透明度和过渡动画的组合效果。</p>
+          <div class="rows" id="rows"></div>
+          <div class="anchor-links">
+            <a href="#anchor-a">跳转 A</a><a href="#anchor-b">跳转 B</a><a href="#anchor-c">跳转 C</a>
+          </div>
+          <div class="anchor-target" id="anchor-a"><h4>锚点 A</h4><p>点击上方链接后，观察平滑滚动是否生效（可在左侧切换 smooth / auto）。</p></div>
+          <div class="anchor-target" id="anchor-b"><h4>锚点 B</h4><p>平滑滚动更适合长页面内跳转；若偏好系统即时响应，请切换为 auto。</p></div>
+          <div class="anchor-target" id="anchor-c"><h4>锚点 C</h4><p>把参数调好后，去下方复制 CSS 集成到 rpi-web 的全局样式中。</p></div>
+        </div>
+      </div>
+
+      <div class="panel preview-card">
+        <div class="card-label"><strong>内部滚动容器</strong><span>模拟代码面板 / 终端窗口</span></div>
+        <div class="inner-box" id="innerBox"></div>
+      </div>
+
+      <div class="panel preview-card output" id="css-output">
+        <div class="card-label"><strong>可复制 CSS</strong><span>滚动查看完整规则</span></div>
+        <button class="copy-css" id="copyCss" type="button">复制 CSS</button>
+        <pre><code id="cssCode"></code></pre>
+        <p class="note">集成提示：将 <code>html { scroll-behavior: … }</code> 放到全局，其余规则按需放入 rpi-web 的 <code>website/styles.css</code>；Firefox 使用 <code>scrollbar-width</code> / <code>scrollbar-color</code> 回退。</p>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var PRESETS = {
+    classic: { label: '经典灰', values: { width: 10, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#c9cdd3', hoverColor: '#a8adb5', activeColor: '#8d939c', trackOpacity: 40, thumbOpacity: 100, transitionMs: 150, easing: 'ease', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, ffWidth: 'thin', ffThumb: '#c9cdd3', ffTrack: '#ffffff' } },
+    orange: { label: 'rpi 橙', values: { width: 12, radius: 999, thumbInset: 2, trackInset: 1, trackColor: '#f4f1e9', thumbColor: '#ec6b38', hoverColor: '#a84422', activeColor: '#7d3219', trackOpacity: 60, thumbOpacity: 100, transitionMs: 200, easing: 'ease-out', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, ffWidth: 'thin', ffThumb: '#ec6b38', ffTrack: '#f4f1e9' } },
+    minimal: { label: '极细线', values: { width: 5, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#6f706d', hoverColor: '#101113', activeColor: '#101113', trackOpacity: 0, thumbOpacity: 85, transitionMs: 100, easing: 'linear', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: false, mobileThin: false, ffWidth: 'thin', ffThumb: '#6f706d', ffTrack: '#ffffff' } },
+    soft: { label: '柔和胶囊', values: { width: 14, radius: 999, thumbInset: 3, trackInset: 2, trackColor: '#e9e5da', thumbColor: '#ec6b38', hoverColor: '#f08a5d', activeColor: '#a84422', trackOpacity: 100, thumbOpacity: 95, transitionMs: 250, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: true, mobileThin: true, ffWidth: 'auto', ffThumb: '#d99b7c', ffTrack: '#e9e5da' } },
+    terminal: { label: '终端暗色', values: { width: 9, radius: 0, thumbInset: 0, trackInset: 0, trackColor: '#171819', thumbColor: '#4c534f', hoverColor: '#7eb59d', activeColor: '#ec6b38', trackOpacity: 100, thumbOpacity: 100, transitionMs: 120, easing: 'ease-in-out', scrollBehavior: 'auto', hoverEnabled: true, activeEnabled: true, mobileThin: false, ffWidth: 'thin', ffThumb: '#4c534f', ffTrack: '#171819' } },
+    none: { label: '几乎隐藏', values: { width: 4, radius: 999, thumbInset: 0, trackInset: 0, trackColor: '#ffffff', thumbColor: '#b9b9b5', hoverColor: '#6f706d', activeColor: '#6f706d', trackOpacity: 0, thumbOpacity: 45, transitionMs: 200, easing: 'ease', scrollBehavior: 'smooth', hoverEnabled: true, activeEnabled: false, mobileThin: false, ffWidth: 'thin', ffThumb: '#b9b9b5', ffTrack: '#ffffff' } }
+  };
+  var CONTROL_IDS = ['width','radius','thumbInset','trackInset','trackColor','thumbColor','hoverColor','activeColor','trackOpacity','thumbOpacity','transitionMs','easing','scrollBehavior','hoverEnabled','activeEnabled','mobileThin','ffWidth','ffThumb','ffTrack'];
+  var DEFAULTS = Object.assign({}, PRESETS.classic.values);
+  var state = Object.assign({}, DEFAULTS);
+  var activePreset = 'classic';
+  var styleTag = document.createElement('style');
+  styleTag.id = 'live-scrollbar-style';
+  document.head.appendChild(styleTag);
+
+  function $(id) { return document.getElementById(id); }
+  function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
+  function hexToRgb(hex) {
+    var h = String(hex).replace('#', '');
+    if (h.length === 3) h = h.split('').map(function (c) { return c + c; }).join('');
+    var num = parseInt(h, 16);
+    if (isNaN(num)) return { r: 201, g: 205, b: 211 };
+    return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255 };
+  }
+  function rgba(hex, alpha) {
+    var c = hexToRgb(hex);
+    return 'rgba(' + c.r + ', ' + c.g + ', ' + c.b + ', ' + alpha + ')';
+  }
+  function safeEasing(value) {
+    return /^[a-z-]+(\([^)]*\))?$/.test(value) ? value : 'ease';
+  }
+  function buildCss(s) {
+    var w = Number(s.width);
+    var alphaTrack = Number(s.trackOpacity) / 100;
+    var alphaThumb = Number(s.thumbOpacity) / 100;
+    var trackBg = alphaTrack === 0 ? 'transparent' : (alphaTrack === 1 ? s.trackColor : rgba(s.trackColor, alphaTrack));
+    var thumbBg = alphaThumb === 1 ? s.thumbColor : rgba(s.thumbColor, alphaThumb);
+    var hoverBg = alphaThumb === 1 ? s.hoverColor : rgba(s.hoverColor, alphaThumb);
+    var activeBg = alphaThumb === 1 ? s.activeColor : rgba(s.activeColor, alphaThumb);
+    var trans = Number(s.transitionMs) + 'ms ' + safeEasing(s.easing);
+    var thumbBorder = Number(s.thumbInset) + 'px solid transparent';
+    var trackBorder = Number(s.trackInset) + 'px solid transparent';
+    var lines = [];
+    lines.push('/* rpi-web 滚动条 · 由 scrollbar-lab 生成 */');
+    lines.push('html {');
+    lines.push('  scroll-behavior: ' + (s.scrollBehavior === 'smooth' ? 'smooth' : 'auto') + ';');
+    lines.push('  scrollbar-width: ' + (s.ffWidth === 'thin' ? 'thin' : 'auto') + ';');
+    lines.push('  scrollbar-color: ' + s.ffThumb + ' ' + s.ffTrack + ';');
+    lines.push('}');
+    lines.push('');
+    lines.push('::-webkit-scrollbar { width: ' + w + 'px; height: ' + w + 'px; }');
+    lines.push('::-webkit-scrollbar-track { background: ' + trackBg + '; border: ' + trackBorder + '; }');
+    lines.push('::-webkit-scrollbar-thumb {');
+    lines.push('  background: ' + thumbBg + ';');
+    lines.push('  border-radius: ' + (Number(s.radius) >= 999 ? '999px' : Number(s.radius) + 'px') + ';');
+    lines.push('  border: ' + thumbBorder + ';');
+    lines.push('  background-clip: padding-box;');
+    lines.push('  transition: background-color ' + trans + ';');
+    lines.push('}');
+    if (s.hoverEnabled) lines.push('::-webkit-scrollbar-thumb:hover { background: ' + hoverBg + '; }');
+    if (s.activeEnabled) lines.push('::-webkit-scrollbar-thumb:active { background: ' + activeBg + '; }');
+    lines.push('::-webkit-scrollbar-corner { background: transparent; }');
+    if (s.mobileThin && w < 8) {
+      lines.push('');
+      lines.push('@media (max-width: 680px) {');
+      lines.push('  ::-webkit-scrollbar { width: ' + Math.max(3, w - 1) + 'px; height: ' + Math.max(3, w - 1) + 'px; }');
+      lines.push('}');
+    }
+    lines.push('');
+    lines.push('@media (prefers-reduced-motion: reduce) {');
+    lines.push('  html { scroll-behavior: auto; }');
+    lines.push('  ::-webkit-scrollbar-thumb { transition: none; }');
+    lines.push('}');
+    return lines.join('\n');
+  }
+  function apply() {
+    styleTag.textContent = buildCss(state);
+    $('cssCode').textContent = buildCss(state);
+    $('cssCode').parentNode.scrollTop = 0;
+    document.documentElement.style.scrollBehavior = state.scrollBehavior === 'smooth' ? 'smooth' : 'auto';
+    CONTROL_IDS.forEach(function (id) {
+      var el = $(id);
+      var val = state[id];
+      if (el.type === 'checkbox') el.checked = !!val;
+      else el.value = val;
+    });
+    $('widthValue').textContent = state.width + 'px';
+    $('radiusValue').textContent = Number(state.radius) >= 999 ? '全圆' : state.radius + 'px';
+    $('thumbInsetValue').textContent = state.thumbInset + 'px';
+    $('trackInsetValue').textContent = state.trackInset + 'px';
+    $('trackColorValue').textContent = state.trackColor;
+    $('thumbColorValue').textContent = state.thumbColor;
+    $('hoverColorValue').textContent = state.hoverColor;
+    $('activeColorValue').textContent = state.activeColor;
+    $('trackOpacityValue').textContent = state.trackOpacity + '%';
+    $('thumbOpacityValue').textContent = state.thumbOpacity + '%';
+    $('transitionMsValue').textContent = state.transitionMs + 'ms';
+    $('ffThumbValue').textContent = state.ffThumb;
+    $('ffTrackValue').textContent = state.ffTrack;
+    Array.prototype.forEach.call($('presetBar').children, function (btn) {
+      btn.classList.toggle('is-active', btn.dataset.preset === activePreset);
+    });
+  }
+  function markCustom() {
+    if (activePreset) { activePreset = ''; apply(); }
+  }
+  function showToast(msg) {
+    var toast = $('toast');
+    toast.textContent = msg;
+    toast.classList.add('is-visible');
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(function () { toast.classList.remove('is-visible'); }, 1600);
+  }
+  function copyText(text, okMsg) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { showToast(okMsg); }).catch(function () { fallbackCopy(text, okMsg); });
+    } else {
+      fallbackCopy(text, okMsg);
+    }
+  }
+  function fallbackCopy(text, okMsg) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); showToast(okMsg); } catch (e) { showToast('复制失败，请手动选择文本'); }
+    document.body.removeChild(ta);
+  }
+  function readUrlState() {
+    var params = new URLSearchParams(location.search);
+    if (!params.size) return;
+    var next = Object.assign({}, DEFAULTS);
+    var changed = false;
+    CONTROL_IDS.forEach(function (id) {
+      if (!params.has(id)) return;
+      var raw = params.get(id);
+      var cur = DEFAULTS[id];
+      if (typeof cur === 'number') {
+        var n = Number(raw);
+        if (!isNaN(n)) { next[id] = clamp(n, id === 'transitionMs' ? 0 : 0, id === 'transitionMs' ? 600 : 999); changed = true; }
+      } else if (typeof cur === 'boolean') {
+        if (raw === '1' || raw === 'true') { next[id] = true; changed = true; }
+        if (raw === '0' || raw === 'false') { next[id] = false; changed = true; }
+      } else if (id === 'easing') {
+        if (/^[a-z-]+(\([^)]*\))?$/.test(raw)) { next[id] = raw; changed = true; }
+      } else if (id === 'scrollBehavior') {
+        if (raw === 'smooth' || raw === 'auto') { next[id] = raw; changed = true; }
+      } else if (id === 'ffWidth') {
+        if (raw === 'thin' || raw === 'auto') { next[id] = raw; changed = true; }
+      } else if (/^#[0-9a-fA-F]{6}$/.test(raw)) {
+        next[id] = raw; changed = true;
+      }
+    });
+    if (changed) { state = next; activePreset = ''; }
+  }
+  function shareUrl() {
+    var url = new URL(location.href);
+    url.hash = '';
+    url.search = '';
+    CONTROL_IDS.forEach(function (id) {
+      var v = state[id];
+      if (v !== DEFAULTS[id]) url.searchParams.set(id, String(v));
+    });
+    return url.toString();
+  }
+
+  // 构建预设按钮
+  Object.keys(PRESETS).forEach(function (key) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'preset';
+    btn.dataset.preset = key;
+    btn.textContent = PRESETS[key].label;
+    btn.addEventListener('click', function () {
+      state = Object.assign({}, DEFAULTS, PRESETS[key].values);
+      activePreset = key;
+      apply();
+    });
+    $('presetBar').appendChild(btn);
+  });
+
+  // 填充示例内容
+  var rowHtml = '';
+  for (var i = 1; i <= 22; i++) {
+    rowHtml += '<div class="row"><b>' + String(i).padStart(2, '0') + '</b><span>滚动条参数差异会让同一内容呈现完全不同的气质：第 ' + i + ' 行用于撑开可滚动区域。</span></div>';
+  }
+  $('rows').innerHTML = rowHtml;
+  var boxHtml = '';
+  for (var j = 1; j <= 18; j++) {
+    boxHtml += '<p><span class="muted">' + String(j).padStart(2, '0') + '</span>  rpi agent --session current --stream-json --model gpt-5.4  // line ' + j + '</p>';
+  }
+  $('innerBox').innerHTML = boxHtml;
+
+  // 参数绑定
+  CONTROL_IDS.forEach(function (id) {
+    var el = $(id);
+    var evt = el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input';
+    el.addEventListener(evt, function () {
+      if (el.type === 'checkbox') state[id] = el.checked;
+      else if (el.type === 'range') state[id] = Number(el.value);
+      else state[id] = el.value;
+      markCustom();
+      apply();
+    });
+  });
+  $('copyCss').addEventListener('click', function () { copyText(buildCss(state), 'CSS 已复制'); });
+  $('copyLink').addEventListener('click', function () { copyText(shareUrl(), '分享链接已复制'); });
+  $('reset').addEventListener('click', function () { state = Object.assign({}, DEFAULTS); activePreset = 'classic'; apply(); });
+
+  readUrlState();
+  apply();
+})();
+</script>
+</body>
+</html>
