@@ -24,10 +24,10 @@
     display:grid;place-items:center;overflow:hidden;
   }
   .phone{
-    position:relative;width:min(100vw,var(--phone-w));height:min(100vh,var(--phone-h));
-    background:#fff;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.5);
+    position:relative;width:min(calc(100vw - 32px),var(--phone-w));height:min(calc(100vh - 32px),var(--phone-h));
+    background:#fff;overflow:hidden;border-radius:24px;box-shadow:0 24px 80px rgba(0,0,0,.5);
   }
-  @media (max-width:480px){.phone{width:100vw;height:100vh;box-shadow:none}}
+  @media (max-width:480px){.phone{width:100vw;height:100vh;border-radius:0;box-shadow:none}}
 
   /* ---------- browser chrome ---------- */
   .statusbar{
