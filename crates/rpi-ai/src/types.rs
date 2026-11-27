@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A newtype wrapping a JSON Schema value. Tools carry their parameters schema here
 /// (produced by `schemars::JsonSchema` derive, stored as a `serde_json::Value` so it
@@ -136,7 +137,9 @@ pub struct ImageContent {
     // persisted image blocks round-trip through JSONL.
     #[serde(default, rename = "type")]
     pub kind: ImageContentType,
-    pub data: String,
+    /// Base64. Shared, because messages are cloned between the session, the
+    /// agent loop and the providers, and one image outweighs all their text.
+    pub data: Arc<str>,
     pub mime_type: String,
 }
 
@@ -176,6 +179,27 @@ pub struct ToolCall {
     /// OpenAI Responses namespace for dynamic/namespaced tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// Recorded result of a call that already ran upstream (for example, a
+    /// remote agent's tool execution streamed back to the host). When present,
+    /// the host must never execute the call: the recording becomes its tool
+    /// result, or an error result if the recording is invalid. Its presence is
+    /// the signal, so an explicit `null` counts as a (malformed) recording.
+    /// Absent on ordinary calls. The agent loop's `recorded_tool_result` decodes
+    /// the accepted shape.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_json"
+    )]
+    pub recorded: Option<serde_json::Value>,
+}
+
+/// Deserialize a field that is present as-is, so an explicit JSON `null` becomes
+/// `Some(Value::Null)` rather than being mistaken for an absent field.
+pub(crate) fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -253,6 +277,7 @@ impl Content {
             arguments,
             thought_signature: None,
             namespace: None,
+            recorded: None,
         })
     }
 
@@ -520,6 +545,12 @@ pub struct ThinkingBudgets {
     pub medium: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high: Option<u64>,
+    /// Used only for models whose `thinkingLevelMap` offers `xhigh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhigh: Option<u64>,
+    /// Used only for models whose `thinkingLevelMap` offers `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
 }
 
 // ----------------------------------------------------------------------------

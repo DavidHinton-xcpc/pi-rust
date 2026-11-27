@@ -47,6 +47,66 @@ The macro emits the `rpi_plugin_register` symbol. The version lives *inside* the
 `PluginApi` struct (`abi_version`, `struct_size`) rather than in the symbol name,
 so the entrypoint signature does not change when the struct grows.
 
+## Tool prompt metadata
+
+Like pi, a tool's provider-facing schema and its system-prompt contributions
+are independent. After registering a tool, optionally register `promptSnippet`
+and `promptGuidelines` through the appended `PluginApi::register_tool_prompt` slot:
+
+```rust,ignore
+if let Some(register_prompt) = api.register_tool_prompt {
+    let status = register_prompt(
+        StbStringRef::from_str("my_tool"),
+        StbStringRef::from_str(r#"{"promptSnippet":"Brief tool summary","promptGuidelines":["Use my_tool for its specific purpose"]}"#),
+    );
+    if status != 0 { return status; }
+}
+```
+
+The tool must already exist in the registering plugin's local registry. The host
+copies the borrowed arguments immediately. Status codes are `0` (success), `1`
+(unknown tool), `2` (invalid metadata object), and `-1` (outside registration).
+Missing fields default to no contribution; an empty object clears the metadata.
+Snippets and rules are trimmed and empty entries ignored. Only active tools
+contribute; rules are deduplicated in active-tool order, even across tools and
+core rules. Rules do not require a snippet. Metadata follows the winning tool
+through name collisions, snapshots and reload; an extension replacing a built-in
+does not inherit the built-in's prompt metadata.
+
+A tool without a snippet is not repeated in the prompt's text list, but its
+schema still makes it callable. Older plugins remain compatible: neither
+`StableToolSchema` nor the ABI version changes. On older hosts the optional slot
+is `None`; skip metadata registration, **not** tool registration. The CLI does not
+invent rules for external tools (including `todo`); extensions must opt in.
+
+## Editor draft and completion
+
+Pi exposes `ui.getEditorText()` and `ui.addAutocompleteProvider()`; rpi mirrors
+both, plus pi's `RegisteredCommand.getArgumentCompletions`.
+
+- `RuntimeActionId::GetEditorText` (`32`): `{}` → `{"text": "...", "cursor": N}`
+  where `cursor` is a byte offset. Never an error — a host without an editor
+  (RPC, print, headless) returns an empty draft, so degrade instead of branching
+  on a failure. The TUI republishes the draft every tick, including cursor-only
+  moves. `EventTag::EditorChange` still carries no text by design.
+- `PluginApi::register_autocomplete_provider` (helper:
+  `register_autocomplete_provider`): the handler receives
+  `{"text","cursor","line","linePrefix"}` and returns
+  `{"items":[{"text","label"?,"description"?,"insertSpace"?,"isDirectory"?}]}`.
+  Return `0` with candidates, or `1` (or an empty list) for "no opinion" — the
+  host then asks the next plugin and finally falls back to the built-in
+  file/slash providers. Plugin providers run *before* the built-ins. `out` is
+  plugin-owned and reclaimed with the `plugin_free_string` registered alongside.
+- `PluginApi::register_command_completions` (helper:
+  `register_command_completions`): attach `getArgumentCompletions` to a command
+  this plugin already registered. The handler receives
+  `{"argumentPrefix":"con"}`; status is `0`, `1` (unknown command) or `-1`
+  (outside registration / older host).
+
+Both slots are appended to the vtable without changing the ABI version, so an
+older host leaves them `None`: skip the registration, never abort the plugin's
+own registration over it.
+
 ## Safe plugin helpers
 
 `handles::ToolHandles<T>` keeps tool state inside the plugin and returns opaque
@@ -92,6 +152,41 @@ underlying function; the macro cannot prove an arbitrary result's ownership.
 `callbacks::take_step_result_with` uses a specified producer's deallocator when
 receiving a result from another plugin. These are ABI boundaries: the host must still honor
 buffer validity and producer allocation ownership.
+
+`take_step!` is that copy-and-reclaim without a caller-side `unsafe` block: it
+asserts the union-arm and ownership contract once, inside the SDK, and returns
+the pointer-free `callbacks::Step`. `take_step_with!` does the same with an
+explicit producer deallocator for a result from another plugin instance. Keep
+`take_step_result!` only for a call site that has to spell the ownership
+argument out itself.
+
+`call_action!` is the outbound counterpart: it calls a runtime action and returns
+`(status_code, body)`, doing the allocate/call/read/free dance inside the SDK:
+
+```rust
+let (rc, body) = rpi_plugin_sdk::call_action!(&api, RuntimeActionId::Abort, "{}");
+// rc 0 = the host answered; parse `body` yourself.
+```
+
+`stb_text!` copies an ABI string (`StbString` or `StbStringRef`) without freeing
+it — for an owned string the plugin is about to hand back, a `StableToolSchema`
+field, or a borrowed input valid for the current call. `stb_take!` reads *and*
+reclaims an owned string with its producer's deallocator in one step:
+
+```rust
+let name = rpi_plugin_sdk::stb_text!(schema.name);           // read only
+let params = rpi_plugin_sdk::stb_take!(params, free);        // read + reclaim
+```
+
+Together with `string_handler!`, `execute_handler!` and `event_handler!` these
+cover the tool, command, event, renderer and runtime-action shapes, so that code
+compiles under `#![deny(unsafe_code)]` — `crates/rpi-plugin-sdk/tests/safe_macros.rs`
+exercises it under the lint. Three cases still need an explicit `unsafe` block:
+
+- a hand-rolled trampoline;
+- a `ProviderRequestFn` / `ProviderStreamRequestFn`, which reads the request and
+  writes `out` directly (see `examples/plugin-stub/src/lib.rs`);
+- a tool handle that heap-allocates per-call state (`Box::into_raw` / `from_raw`).
 
 Raw string readers `StbString::to_string_lossy` and `json::from_stable` require
 an explicit `unsafe` call: their public ABI pointer/length fields cannot prove
@@ -145,6 +240,12 @@ multiple providers, keep one `export_plugin!` entrypoint and use
 `provider::register` and `provider::drive` for each provider instead.
 The bridge forwards streaming events, honors host cancellation and owns a
 per-request runtime, so no worker survives plugin unloading.
+`provider::host_capabilities()` returns the request's `capabilities` object
+(`null` on older hosts) on the request thread while the bridge is driving it, so
+a factory can pass it to its provider. On any other thread, including tasks
+spawned under `drive_with_context`, it is `null`; read it in the factory. A provider may set `ToolCall::recorded` only when
+`recordedToolCalls` is at least `1`; on a host without it, the bridge turns a
+final message carrying a recorded call into an error.
 
 The `provider` feature enables `json` and the AI, Tokio and HTTP dependencies.
 It is **off by default**; tool-only plugins retain the lightweight ABI SDK,
@@ -219,6 +320,44 @@ rules the SDK enforces:
 These are not stylistic preferences — violating any of them is undefined
 behaviour at the boundary.
 
+### Query custom entries with runtime actions
+
+`RuntimeActionId::GetSessionBranch` uses the same canonical query as RPC
+`get_session_branch`, without the RPC `type`/`id` envelope. For example, pass
+this JSON to the runtime-action SDK call:
+
+```rust
+let args = serde_json::json!({
+    "customTypes": ["durable-state", "other-custom-type"],
+    "afterSeq": 42,
+    "limit": 20,
+    "order": "newestFirst"
+});
+let action = rpi_plugin_sdk::RuntimeActionId::GetSessionBranch;
+// Submit `action` and `args` through the runtime_action slot.
+```
+
+`customTypes` is required and non-empty; each identifier must be non-blank.
+Identifiers match the exact stored string, preserving case and whitespace.
+The other three fields are optional;
+order defaults to `oldestFirst`. `afterSeq` is exclusive in the selected order:
+`seq > afterSeq` for `oldestFirst`, `seq < afterSeq` for `newestFirst`.
+Entries must be on the selected branch and match a requested custom
+type; ordering and limit apply globally across those types. The result is
+`{"entries":[...],"count":N,"filtered":true}`.
+
+Empty `{}`, unknown keys, and retired `customType`, `custom_type`, `custom_types`,
+or `after_seq` query keys fail explicitly, including mixed old/new requests.
+This does **not** change `AppendEntry`'s singular `customType` write argument.
+
+This query contract is a breaking change from the older unfiltered action.
+Upgrade hosts and consumers together. Consumers requiring filtered semantics
+must check for **`filtered == true`** and reject a successful response without
+that marker: older hosts can ignore the arguments and return the whole branch.
+Action ID 20 and the binary ABI/layout are unchanged, so a successful plugin
+load or ABI/size check alone does not prove support for this query contract.
+Do not silently fall back to `{}` or replay an unfiltered response.
+
 ## Compatibility
 
 The host loader only resolves `rpi_plugin_register`, exported with
@@ -249,7 +388,7 @@ Rebuild extensions when the SDK contract they require changes.
   templates, safety rules, testing and release checklist.
 - Host-side loader: [`rpi-extensions`](https://crates.io/crates/rpi-extensions).
 - Ready-to-install extensions:
-  [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package).
+  [`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension).
 
 ## License
 

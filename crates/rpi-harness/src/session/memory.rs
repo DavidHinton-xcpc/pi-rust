@@ -31,10 +31,10 @@ use async_trait::async_trait;
 use crate::error::{SessionError, SessionResult};
 use crate::session::state::{ApplyOutcome, SessionState};
 use crate::session::types::{
-    provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
-    LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
-    SessionCreateOptions, SessionMetadata, SessionMutation, SessionRepo, SessionStats,
-    SessionStorage,
+    provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, HistoryCheckpoint,
+    HistoryIdentity, HistoryReplacement, IdGenerator, LanePointer, LaneRecord, LogItem, LogOptions,
+    OperationStartedRecord, ProvisionedEntry, RecordQuery, SessionCreateOptions, SessionMetadata,
+    SessionMutation, SessionRepo, SessionStats, SessionStorage,
 };
 
 /// A simple shared id-generator producing stringified u64 counters — the
@@ -102,7 +102,8 @@ impl Clock for FakeClock {
 
 /// Mutable inner state shared across clones of an [`InMemorySessionStorage`].
 struct Inner {
-    state: Mutex<SessionState>,
+    history: Mutex<HistoryState>,
+    progress: Mutex<super::progress::ProgressState>,
     clock: Arc<dyn Clock>,
     /// Reserved for future auto-id generation (callers currently supply entry/
     /// record ids). Kept so the constructor signature matches the JSONL repo's
@@ -111,18 +112,27 @@ struct Inner {
     ids: Arc<dyn IdGenerator>,
 }
 
+/// Reducer state and replacement generation share one lock so a future
+/// whole-history replacement cannot publish one without the other.
+struct HistoryState {
+    state: SessionState,
+    generation: u64,
+    checkpoint_published: bool,
+    receipt_archive: Option<crate::durable::experimental_ledger::archive::ReceiptArchive>,
+}
+
 impl Inner {
     fn with_state<R>(
         &self,
         f: impl FnOnce(&mut SessionState) -> SessionResult<R>,
     ) -> SessionResult<R> {
-        let mut state = self.state.lock().expect("state not poisoned");
-        f(&mut state)
+        let mut history = self.history.lock().expect("history not poisoned");
+        f(&mut history.state)
     }
 
     fn read_state<R>(&self, f: impl FnOnce(&SessionState) -> R) -> R {
-        let state = self.state.lock().expect("state not poisoned");
-        f(&state)
+        let history = self.history.lock().expect("history not poisoned");
+        f(&history.state)
     }
 }
 
@@ -146,7 +156,13 @@ impl InMemorySessionStorage {
         Self {
             metadata,
             inner: Arc::new(Inner {
-                state: Mutex::new(SessionState::new()),
+                history: Mutex::new(HistoryState {
+                    state: SessionState::new(),
+                    generation: 0,
+                    checkpoint_published: false,
+                    receipt_archive: None,
+                }),
+                progress: Mutex::new(Default::default()),
                 clock,
                 ids,
             }),
@@ -160,7 +176,11 @@ impl InMemorySessionStorage {
     }
 
     pub fn replace_state(&self, state: SessionState) {
-        *self.inner.state.lock().expect("state not poisoned") = state;
+        self.inner
+            .history
+            .lock()
+            .expect("history not poisoned")
+            .state = state;
     }
 
     /// Restore an in-memory storage from a previously persisted reducer state.
@@ -173,11 +193,75 @@ impl InMemorySessionStorage {
         Self {
             metadata,
             inner: Arc::new(Inner {
-                state: Mutex::new(state),
+                history: Mutex::new(HistoryState {
+                    state,
+                    generation: 0,
+                    checkpoint_published: false,
+                    receipt_archive: None,
+                }),
+                progress: Mutex::new(Default::default()),
                 clock,
                 ids,
             }),
         }
+    }
+
+    fn append_entry_checked(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: Option<u64>,
+    ) -> SessionResult<Entry> {
+        self.inner.with_state(|state| {
+            if let Some(expected) = expected {
+                state.check_revision(expected)?;
+            }
+            let parent_id = state.require_lane(lane)?;
+            state.validate_unused_id(&entry.id)?;
+            let seq = state.next_sequence();
+            let timestamp = self.inner.clock.now_ms();
+            let full = provisioned_into_entry(entry, seq, parent_id, timestamp);
+            match state.apply_mutation(SessionMutation::Entry {
+                seq,
+                timestamp,
+                lane: Some(lane.to_string()),
+                entry: full,
+            })? {
+                ApplyOutcome::Entry(stamped) => Ok(stamped),
+                _ => Err(SessionError::storage("append_entry did not persist")),
+            }
+        })
+    }
+
+    fn append_record_checked(
+        &self,
+        record: LaneRecord,
+        expected: Option<u64>,
+    ) -> SessionResult<LaneRecord> {
+        let lane = record.lane().to_string();
+        let is_operation_started = matches!(record, LaneRecord::OperationStarted(_));
+        self.inner.with_state(|state| {
+            if let Some(expected) = expected {
+                state.check_revision(expected)?;
+            }
+            state.require_lane(&lane)?;
+            state.validate_unused_id(record.id())?;
+            if is_operation_started {
+                if let Some(current) = state.find_open_operations(&lane, Some(1))?.first() {
+                    return Err(SessionError::storage(format!(
+                        "Lane {} already has an open operation {}",
+                        lane, current.base.id
+                    )));
+                }
+            }
+            let seq = state.next_sequence();
+            let timestamp = self.inner.clock.now_ms();
+            let stamped = stamp_record(record, seq, lane, timestamp);
+            match state.apply_mutation(SessionMutation::Record { record: stamped })? {
+                ApplyOutcome::Record(stamped) => Ok(stamped),
+                _ => Err(SessionError::storage("append_record did not persist")),
+            }
+        })
     }
 
     /// Fork from a source storage — mirrors TS `fork`. Applies the source
@@ -205,6 +289,39 @@ impl InMemorySessionStorage {
 
 #[async_trait]
 impl SessionStorage for InMemorySessionStorage {
+    async fn prune_completed_progress(&self) -> SessionResult<usize> {
+        let completed = self
+            .inner
+            .with_state(|state| Ok(state.completed_progress_runs()))?;
+        Ok(self
+            .inner
+            .progress
+            .lock()
+            .unwrap()
+            .prune_completed(&completed))
+    }
+
+    async fn append_progress(
+        &self,
+        records: Vec<super::types::AssistantFrameRecord>,
+    ) -> SessionResult<Vec<super::types::AssistantFrameRecord>> {
+        self.inner.with_state(|state| {
+            for record in &records {
+                state.require_lane(&record.base.lane)?;
+            }
+            Ok(())
+        })?;
+        let mut progress = self.inner.progress.lock().unwrap();
+        let records = progress.prepare(records, || self.inner.clock.now_ms())?;
+        progress.apply(&records);
+        Ok(records)
+    }
+    async fn read_progress(
+        &self,
+        run_id: &str,
+    ) -> SessionResult<Vec<super::types::AssistantFrameRecord>> {
+        Ok(self.inner.progress.lock().unwrap().read(run_id))
+    }
     fn metadata(&self) -> SessionMetadata {
         self.metadata.clone()
     }
@@ -215,6 +332,13 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         Ok(self.inner.read_state(|state| state.get_lanes()))
+    }
+
+    async fn lane_branch(
+        &self,
+        lane: &str,
+    ) -> SessionResult<crate::session::types::SessionLaneBranch> {
+        self.inner.read_state(|state| state.lane_branch(lane))
     }
 
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
@@ -245,53 +369,181 @@ impl SessionStorage for InMemorySessionStorage {
         })
     }
 
-    async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+    async fn append_queue_cancellations(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
         self.inner.with_state(|state| {
-            let parent_id = state.require_lane(lane)?;
-            state.validate_unused_id(&entry.id)?;
-            let seq = state.next_sequence();
-            let timestamp = self.inner.clock.now_ms();
-            let full = provisioned_into_entry(entry, seq, parent_id.clone(), timestamp);
-            match state.apply_mutation(SessionMutation::Entry {
-                seq,
-                timestamp,
-                lane: Some(lane.to_string()),
-                entry: full,
-            })? {
-                ApplyOutcome::Entry(stamped) => Ok(stamped),
-                _ => Err(SessionError::storage("append_entry did not persist")),
+            state.validate_queue_cancellations(&records)?;
+            let mut committed = Vec::with_capacity(records.len());
+            for record in records {
+                let lane = record.lane().to_owned();
+                let record = stamp_record(
+                    record,
+                    state.next_sequence(),
+                    lane,
+                    self.inner.clock.now_ms(),
+                );
+                if let ApplyOutcome::Record(record) =
+                    state.apply_mutation(SessionMutation::Record { record })?
+                {
+                    committed.push(record);
+                }
             }
+            Ok(committed)
         })
+    }
+
+    async fn history_revision(&self) -> SessionResult<u64> {
+        Ok(self.inner.read_state(SessionState::sequence))
+    }
+
+    async fn history_generation(&self) -> SessionResult<u64> {
+        Ok(self
+            .inner
+            .history
+            .lock()
+            .expect("history not poisoned")
+            .generation)
+    }
+
+    async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+        let history = self.inner.history.lock().expect("history not poisoned");
+        Ok(HistoryIdentity {
+            revision: history.state.sequence(),
+            generation: history.generation,
+        })
+    }
+
+    async fn replace_history_if_revision_and_generation(
+        &self,
+        expected_revision: u64,
+        expected_generation: u64,
+        replacement: HistoryReplacement,
+    ) -> SessionResult<HistoryIdentity> {
+        let mut history = self.inner.history.lock().expect("history not poisoned");
+        let actual_revision = history.state.sequence();
+        if actual_revision != expected_revision || history.generation != expected_generation {
+            return Err(SessionError::storage(format!(
+                "history replacement identity conflict: expected revision {expected_revision}, generation {expected_generation}; actual revision {actual_revision}, generation {}",
+                history.generation
+            )));
+        }
+        let generation = history
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
+        let revision = replacement.state.sequence();
+        history.state = replacement.state;
+        history.generation = generation;
+        history.checkpoint_published = false;
+        history.receipt_archive = None;
+        Ok(HistoryIdentity {
+            revision,
+            generation,
+        })
+    }
+
+    async fn history_checkpoint(&self) -> SessionResult<Option<HistoryCheckpoint>> {
+        let history = self.inner.history.lock().expect("history not poisoned");
+        if !history.checkpoint_published {
+            return Ok(None);
+        }
+        let checkpoint = HistoryCheckpoint::new(
+            HistoryIdentity {
+                revision: history.state.sequence(),
+                generation: history.generation,
+            },
+            history.state.clone(),
+        )?;
+        let checkpoint = match &history.receipt_archive {
+            Some(archive) => checkpoint.with_receipt_archive(archive.clone())?,
+            None => checkpoint,
+        };
+        Ok(Some(checkpoint))
+    }
+
+    async fn replace_history_with_checkpoint_if_revision_and_generation(
+        &self,
+        expected_revision: u64,
+        expected_generation: u64,
+        checkpoint: HistoryCheckpoint,
+    ) -> SessionResult<HistoryIdentity> {
+        checkpoint.validate()?;
+        if checkpoint.history_identity
+            != (HistoryIdentity {
+                revision: expected_revision,
+                generation: expected_generation,
+            })
+        {
+            return Err(SessionError::storage(
+                "history checkpoint identity does not match replacement CAS",
+            ));
+        }
+        let mut history = self.inner.history.lock().expect("history not poisoned");
+        if history.state.sequence() != expected_revision
+            || history.generation != expected_generation
+        {
+            return Err(SessionError::storage(format!(
+                "history checkpoint identity conflict: expected revision {expected_revision}, generation {expected_generation}; actual revision {}, generation {}",
+                history.state.sequence(), history.generation
+            )));
+        }
+        let generation = history
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
+        history.state = checkpoint.state;
+        history.generation = generation;
+        history.checkpoint_published = true;
+        history.receipt_archive = checkpoint.receipt_archive;
+        Ok(HistoryIdentity {
+            revision: expected_revision,
+            generation,
+        })
+    }
+
+    async fn append_entry_if_revision(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: u64,
+    ) -> SessionResult<Entry> {
+        self.append_entry_checked(entry, lane, Some(expected))
+    }
+
+    async fn append_record_if_revision(
+        &self,
+        record: LaneRecord,
+        expected: u64,
+    ) -> SessionResult<LaneRecord> {
+        self.append_record_checked(record, Some(expected))
+    }
+
+    async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+        self.append_entry_checked(entry, lane, None)
     }
 
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
-        let lane = record.lane().to_string();
-        let is_operation_started = matches!(record, LaneRecord::OperationStarted(_));
-        self.inner.with_state(|state| {
-            state.require_lane(&lane)?;
-            state.validate_unused_id(record.id())?;
-            // At-most-one open op per lane (storage-level precondition, mirrors
-            // TS `InMemorySessionStorage.appendRecord`). The reducer still
-            // flags two-open as corruption for recovery slices.
-            if is_operation_started {
-                let open = state.find_open_operations(&lane, Some(1))?;
-                if let Some(current) = open.first() {
-                    return Err(SessionError::storage(format!(
-                        "Lane {} already has an open operation {}",
-                        lane, current.base.id
-                    )));
-                }
-            }
-            let seq = state.next_sequence();
-            let timestamp = self.inner.clock.now_ms();
-            let stamped = stamp_record(record, seq, lane.clone(), timestamp);
-            match state.apply_mutation(SessionMutation::Record { record: stamped })? {
-                ApplyOutcome::Record(stamped) => Ok(stamped),
-                _ => Err(SessionError::storage("append_record did not persist")),
-            }
-        })
+        self.append_record_checked(record, None)
     }
 
+    async fn message_summaries(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> SessionResult<crate::session::types::MessageSummaryPage> {
+        self.inner
+            .read_state(|state| state.message_summaries(lane, query))
+    }
+    async fn message_window(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> SessionResult<crate::session::types::MessageWindowPage> {
+        self.inner
+            .read_state(|state| state.message_window(lane, query))
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         Ok(self.inner.read_state(|state| state.get_entry(id).cloned()))
     }
@@ -321,6 +573,13 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         self.inner.read_state(|state| state.find_records(query))
+    }
+
+    async fn record_page(
+        &self,
+        query: &crate::session::types::RecordPageQuery,
+    ) -> SessionResult<crate::session::types::RecordPage> {
+        self.inner.read_state(|state| state.record_page(query))
     }
 
     async fn find_open_operations(
@@ -541,7 +800,8 @@ impl SessionRepo for InMemorySessionRepo {
 mod tests {
     use super::*;
     use crate::session::types::{
-        EntryOrder, OperationIntent, OperationStartedRecord, ProvisionedKind, RecordBase,
+        AssistantFrameOp, AssistantFrameRecord, EntryOrder, OperationIntent,
+        OperationStartedRecord, ProvisionedKind, RecordBase,
     };
 
     fn counter_ids() -> Arc<dyn IdGenerator> {
@@ -621,6 +881,200 @@ mod tests {
                 .len(),
             expected.messages.len()
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_replacement_preserves_progress_streams() {
+        let storage = fresh_storage();
+        let written = storage
+            .append_progress(vec![AssistantFrameRecord {
+                base: rec_base("progress", 0, "main"),
+                run_id: "run-1".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"text":"pending"})),
+            }])
+            .await
+            .unwrap();
+        let identity = storage.history_identity().await.unwrap();
+        storage
+            .replace_history_if_revision_and_generation(
+                identity.revision,
+                identity.generation,
+                HistoryReplacement {
+                    state: SessionState::new(),
+                    canonical_mutations: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.read_progress("run-1").await.unwrap(), written);
+    }
+
+    #[tokio::test]
+    async fn in_memory_checkpoint_replacement_preserves_state_and_progress() {
+        let storage = fresh_storage();
+        storage
+            .append_entry(
+                ProvisionedEntry {
+                    id: "checkpoint-entry".into(),
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("checkpoint"),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        let written = storage
+            .append_progress(vec![AssistantFrameRecord {
+                base: rec_base("checkpoint-progress", 0, "main"),
+                run_id: "checkpoint-run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"text":"pending"})),
+            }])
+            .await
+            .unwrap();
+        let state = storage.inner.read_state(Clone::clone);
+        let checkpoint = state
+            .history_checkpoint(HistoryIdentity {
+                revision: 1,
+                generation: 0,
+            })
+            .unwrap()
+            .with_receipt_archive(
+                crate::durable::experimental_ledger::archive::ReceiptArchive::empty(),
+            )
+            .unwrap();
+        let published = storage
+            .replace_history_with_checkpoint_if_revision_and_generation(1, 0, checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            published,
+            HistoryIdentity {
+                revision: 1,
+                generation: 1
+            }
+        );
+        assert!(storage
+            .get_entry("checkpoint-entry")
+            .await
+            .unwrap()
+            .is_some());
+        let persisted = storage.history_checkpoint().await.unwrap().unwrap();
+        assert!(persisted.receipt_archive.is_some());
+        assert_eq!(
+            storage.read_progress("checkpoint-run").await.unwrap(),
+            written
+        );
+        let persisted = storage.history_checkpoint().await.unwrap().unwrap();
+        assert_eq!(persisted.history_identity, published);
+        assert!(persisted.receipt_archive.is_some());
+
+        let stale = state
+            .history_checkpoint(HistoryIdentity {
+                revision: 1,
+                generation: 0,
+            })
+            .unwrap()
+            .with_receipt_archive(
+                crate::durable::experimental_ledger::archive::ReceiptArchive::empty(),
+            )
+            .unwrap();
+        assert!(storage
+            .replace_history_with_checkpoint_if_revision_and_generation(1, 0, stale)
+            .await
+            .is_err());
+        assert_eq!(storage.history_identity().await.unwrap(), published);
+    }
+
+    #[tokio::test]
+    async fn in_memory_checkpoint_with_archive_round_trips() {
+        let storage = fresh_storage();
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 0,
+            })
+            .unwrap()
+            .with_receipt_archive(
+                crate::durable::experimental_ledger::archive::ReceiptArchive::empty(),
+            )
+            .unwrap();
+        let published = storage
+            .replace_history_with_checkpoint_if_revision_and_generation(0, 0, checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            published,
+            HistoryIdentity {
+                revision: 0,
+                generation: 1,
+            }
+        );
+        let persisted = storage.history_checkpoint().await.unwrap().unwrap();
+        assert_eq!(persisted.history_identity, published);
+        assert!(persisted.receipt_archive.is_some());
+    }
+
+    #[tokio::test]
+    async fn in_memory_replacement_advances_generation_without_rewriting_sequence_authority() {
+        let storage = fresh_storage();
+        storage
+            .append_entry(
+                ProvisionedEntry {
+                    id: "e1".into(),
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("before replacement"),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+
+        let identity = storage
+            .replace_history_if_revision_and_generation(
+                1,
+                0,
+                HistoryReplacement {
+                    state: SessionState::new(),
+                    canonical_mutations: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity.revision, 0);
+        assert_eq!(identity.generation, 1);
+        assert_eq!(
+            storage.history_identity().await.unwrap(),
+            HistoryIdentity {
+                revision: 0,
+                generation: 1
+            }
+        );
+        assert_eq!(storage.history_revision().await.unwrap(), 0);
+        assert_eq!(storage.history_generation().await.unwrap(), 1);
+        assert!(storage.get_entry("e1").await.unwrap().is_none());
+
+        let stale = storage
+            .replace_history_if_revision_and_generation(
+                1,
+                0,
+                HistoryReplacement {
+                    state: SessionState::new(),
+                    canonical_mutations: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("identity conflict"));
+        assert_eq!(storage.history_generation().await.unwrap(), 1);
+        assert_eq!(storage.history_revision().await.unwrap(), 0);
     }
 
     #[tokio::test]

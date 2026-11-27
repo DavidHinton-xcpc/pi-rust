@@ -35,8 +35,12 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 
 // Opaque, non-reused IDs, never addresses. A copied PluginApi may outlive its
 // registration (e.g. a failed reload); resolving it must not dereference freed memory.
-static BRIDGES: OnceLock<Mutex<HashMap<usize, Weak<ActionBridge>>>> = OnceLock::new();
-fn bridges() -> &'static Mutex<HashMap<usize, Weak<ActionBridge>>> {
+struct RegistryEntry {
+    bridge: Weak<ActionBridge>,
+    active: Weak<AtomicBool>,
+}
+static BRIDGES: OnceLock<Mutex<HashMap<usize, RegistryEntry>>> = OnceLock::new();
+fn bridges() -> &'static Mutex<HashMap<usize, RegistryEntry>> {
     BRIDGES.get_or_init(Mutex::default)
 }
 thread_local! {
@@ -54,6 +58,17 @@ impl Drop for InvocationGuard {
 
 use rpi_plugin_sdk::{RuntimeActionId, StbString, StbStringRef};
 use tokio::runtime::Handle;
+
+/// Prefix a plugin uses to mark a `requestId` as **not the TUI's to consume**.
+///
+/// Why it exists: the interactive TUI and plugins share one [`UiDialogMailbox`].
+/// Without this convention a plugin's question (a remote UI's permission gate,
+/// say) gets taken by the TUI and drawn in the terminal — while the user is
+/// looking at a remote client, which sees nothing.
+///
+/// Paired with [`UiDialogMailbox::take_pending_filtered`] (the TUI passes
+/// `|r| !is_reserved(&r.request_id)`).
+pub const PLUGIN_RESERVED_PREFIX: &str = "pidingo:";
 
 /// A pending host UI request emitted by a plugin runtime action.
 ///
@@ -77,6 +92,16 @@ struct UiDialogEntry {
 
 struct UiDialogState {
     attached: bool,
+    /// Monotonic local attachment generation used to retire stale UI bridges
+    /// without allowing them to detach a newer bridge.
+    attachment_generation: u64,
+    /// An external UI (a relay) has taken over dialog delivery.
+    ///
+    /// While set, the local TUI must not take requests: both consumers draw
+    /// from the same `pending` queue, so whoever runs first wins and the other
+    /// never sees the question. With a remote client attached, the question has
+    /// to reach *that* client — the terminal is not where the user is looking.
+    external_takeover: bool,
     pending: VecDeque<String>,
     active: HashMap<String, UiDialogEntry>,
     cancelled_tool_calls: std::collections::HashSet<String>,
@@ -101,6 +126,8 @@ impl UiDialogMailbox {
         Self {
             state: Arc::new(Mutex::new(UiDialogState {
                 attached: false,
+                attachment_generation: 0,
+                external_takeover: false,
                 pending: VecDeque::new(),
                 active: HashMap::new(),
                 cancelled_tool_calls: std::collections::HashSet::new(),
@@ -108,19 +135,95 @@ impl UiDialogMailbox {
         }
     }
 
-    /// Mark an interactive consumer as available. Re-attaching is idempotent.
+    /// Mark an interactive consumer as available. Re-attaching starts a new
+    /// local generation so stale bridge shutdown cannot retire its successor.
     pub fn attach(&self) {
+        let _ = self.try_attach_with_generation();
+    }
+
+    /// Attach and return the local generation owned by this consumer.
+    ///
+    /// Generation exhaustion is a fail-closed condition: do not reuse the
+    /// final generation, because a stale bridge could then retire a newer
+    /// consumer with the same identity.
+    pub fn try_attach_with_generation(&self) -> Option<u64> {
+        // Attachment is an admission boundary. A poisoned mailbox cannot
+        // safely publish either the generation or the attached bit, so refuse
+        // rather than panic or partially admit an interactive consumer.
+        let mut state = self.state.lock().ok()?;
+        let generation = state.attachment_generation.checked_add(1)?;
+        state.attachment_generation = generation;
+        state.attached = true;
+        Some(generation)
+    }
+
+    /// Return the current local attachment generation, if the mailbox state
+    /// can be read safely.
+    pub fn attachment_generation(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()
+            .map(|state| state.attachment_generation)
+    }
+
+    /// Hand dialog delivery to an external UI (or take it back).
+    ///
+    /// The TUI and a relay both call "take"; without an owner, whichever polls
+    /// first wins and the other never sees the request — a third-party
+    /// extension's question can end up drawn in a terminal nobody is watching.
+    /// A caller that owns the user's attention (a remote client) sets this, and
+    /// the local TUI then skips taking entirely.
+    ///
+    /// Idempotent, and independent of [`Self::attach`]: the TUI stays "attached"
+    /// while a remote client is in charge, it just does not consume.
+    pub fn set_external_takeover(&self, takeover: bool) {
         self.state
             .lock()
             .expect("ui dialog mailbox poisoned")
-            .attached = true;
+            .external_takeover = takeover;
+    }
+
+    /// Whether an external UI currently owns dialog delivery.
+    pub fn external_takeover(&self) -> bool {
+        self.state
+            .lock()
+            .expect("ui dialog mailbox poisoned")
+            .external_takeover
     }
 
     /// Detach the consumer and cancel every outstanding request. This prevents
     /// a TUI restart/reload from leaving plugin polls blocked forever.
     pub fn detach(&self) {
-        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        // Compatibility retirement has no success channel. If the mailbox
+        // state is poisoned, refuse without claiming that ownership changed.
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        Self::detach_locked(&mut state);
+    }
+
+    /// Detach only if this consumer still owns the current local generation.
+    /// A stale bridge is a no-op and cannot cancel a newer TUI's dialogs.
+    pub fn detach_if_generation(&self, generation: u64) -> bool {
+        // Retirement is also an ownership boundary. A poisoned mailbox cannot
+        // prove that this generation is current, so report no detachment
+        // instead of panicking or claiming that a live owner was retired.
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.attachment_generation != generation {
+            return false;
+        }
+        Self::detach_locked(&mut state);
+        true
+    }
+
+    fn detach_locked(state: &mut UiDialogState) {
         state.attached = false;
+        // Release ownership with the consumer. A stale takeover flag would make
+        // the TUI refuse every later dialog, so losing the relay client would
+        // leave the user unable to answer anything.
+        state.external_takeover = false;
         state.pending.clear();
         for entry in state.active.values_mut() {
             entry.cancelled = true;
@@ -128,26 +231,150 @@ impl UiDialogMailbox {
         }
     }
 
+    /// Give dialog delivery back to the local TUI.
+    ///
+    /// Requests already taken by the relay but never answered are put back in
+    /// the queue so the TUI draws them. They are not answered or cancelled
+    /// here: fabricating a reply for a question nobody read would be worse than
+    /// asking it again.
+    ///
+    /// Returns the number of requests handed back.
+    pub fn release_takeover(&self) -> usize {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        state.external_takeover = false;
+        let mut requeued: Vec<String> = state
+            .active
+            .iter()
+            .filter(|(_, entry)| !entry.cancelled && entry.answer.is_none())
+            .map(|(request_id, _)| request_id.clone())
+            .filter(|request_id| !state.pending.contains(request_id))
+            .collect();
+        if requeued.is_empty() {
+            return 0;
+        }
+        let count = requeued.len();
+        // Stable order so a restored queue does not reshuffle the prompts.
+        requeued.sort();
+        for request_id in requeued.into_iter().rev() {
+            state.pending.push_front(request_id);
+        }
+        count
+    }
+
     pub fn is_attached(&self) -> bool {
-        self.state
-            .lock()
-            .expect("ui dialog mailbox poisoned")
-            .attached
+        self.state.lock().ok().is_some_and(|state| state.attached)
     }
 
     /// Remove and return the next request for presentation by the TUI.
     /// Cancelled/answered requests are skipped; duplicate `open` calls never
     /// enqueue the same request id twice.
     pub fn take_pending(&self) -> Option<UiDialogRequest> {
+        self.take_pending_filtered(|_| true)
+    }
+
+    /// Take a request for the local TUI, but only while no external UI owns
+    /// delivery.
+    ///
+    /// The takeover check and the dequeue must be one critical section. Checking
+    /// `external_takeover()` and then calling [`Self::take_pending_filtered`]
+    /// acquires the lock twice, and a relay can claim ownership in between: the
+    /// TUI would then dequeue a question meant for the remote client, so nobody
+    /// the user is watching ever sees it.
+    pub fn take_pending_unless_external<F>(&self, keep: F) -> Option<UiDialogRequest>
+    where
+        F: Fn(&UiDialogRequest) -> bool,
+    {
         let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
-        while let Some(request_id) = state.pending.pop_front() {
-            if let Some(entry) = state.active.get(&request_id) {
-                if !entry.cancelled && entry.answer.is_none() {
-                    return Some(entry.request.clone());
-                }
+        if state.external_takeover {
+            return None;
+        }
+        Self::take_pending_locked(&mut state, keep)
+    }
+
+    /// Like [`take_pending`], but only takes a request `keep` accepts; the rest
+    /// **stay queued** for whoever they belong to.
+    ///
+    /// The TUI and plugins race on the same mailbox. When a plugin marks a
+    /// request as belonging to a host consumer (a remote UI's gate), the TUI
+    /// must not swallow it: the user would never see the question in the remote
+    /// client, while a duplicate pops up in the terminal.
+    ///
+    /// ## Reserved-prefix convention
+    ///
+    /// A `requestId` starting with [`PLUGIN_RESERVED_PREFIX`] is never taken by
+    /// the TUI. `take_pending()` takes everything (it passes `|_| true`), so
+    /// skipping reserved entries has to be explicit:
+    /// `take_pending_filtered(|r| !self.is_reserved(&r.request_id))`.
+    pub fn take_pending_filtered<F>(&self, keep: F) -> Option<UiDialogRequest>
+    where
+        F: Fn(&UiDialogRequest) -> bool,
+    {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        Self::take_pending_locked(&mut state, keep)
+    }
+
+    fn take_pending_locked<F>(
+        state: &mut std::sync::MutexGuard<'_, UiDialogState>,
+        keep: F,
+    ) -> Option<UiDialogRequest>
+    where
+        F: Fn(&UiDialogRequest) -> bool,
+    {
+        let mut scanned = 0usize;
+        let total = state.pending.len();
+        while scanned < total {
+            scanned += 1;
+            let Some(request_id) = state.pending.pop_front() else {
+                break;
+            };
+            let Some(entry) = state.active.get(&request_id) else {
+                continue;
+            };
+            if entry.cancelled || entry.answer.is_some() {
+                continue;
             }
+            let request = entry.request.clone();
+            if keep(&request) {
+                return Some(request);
+            }
+            // Not mine — put it back for whoever should handle it.
+            state.pending.push_back(request_id);
         }
         None
+    }
+
+    /// Take **every request no plugin reserved** (the `RelayUiDialog` `take`).
+    ///
+    /// For "a remote UI takes over": while an external client is attached, a
+    /// third-party extension's question should be forwarded there instead of
+    /// popping up in the terminal. Reserved entries stay behind.
+    ///
+    /// Taken requests leave `pending` but stay in `active`, so a later
+    /// `respond` / `cancel` with the same `requestId` still resolves them.
+    pub fn take_all_unreserved(&self) -> Vec<UiDialogRequest> {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        let mut out: Vec<UiDialogRequest> = Vec::new();
+        // One pass does both: drain everything, then push back what stays.
+        let drained = std::mem::take(&mut state.pending);
+        for request_id in drained {
+            let Some(entry) = state.active.get(&request_id) else {
+                continue;
+            };
+            if entry.cancelled || entry.answer.is_some() {
+                continue;
+            }
+            if request_id.starts_with(PLUGIN_RESERVED_PREFIX) {
+                state.pending.push_back(request_id);
+            } else {
+                out.push(entry.request.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether `request_id` is reserved by a plugin (the TUI must not consume it).
+    pub fn is_reserved(&self, request_id: &str) -> bool {
+        request_id.starts_with(PLUGIN_RESERVED_PREFIX)
     }
 
     pub fn pending_len(&self) -> usize {
@@ -272,9 +499,37 @@ impl UiDialogMailbox {
         Ok(result)
     }
 
+    /// Reclaim a terminal request that nobody will `poll` again.
+    ///
+    /// `cancel()` deliberately keeps the terminal entry visible so the owning
+    /// plugin can observe `cancelled` on its next `poll`, and `poll()` removes
+    /// it at that point. But a plugin that abandons a question (timeout, tool
+    /// cancellation, process abort) never polls again, leaving the entry in
+    /// `active` for the lifetime of the host. Callers that know no further
+    /// poll is coming use this to release it. Pending requests are never
+    /// removed: deleting one would silently strand the UI that is still
+    /// waiting for an answer.
+    /// Returns `true` when a terminal entry was actually removed.
+    pub fn forget(&self, request_id: &str) -> Result<bool, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let Some(entry) = state.active.get(request_id) else {
+            return Ok(false);
+        };
+        if !entry.cancelled && entry.answer.is_none() {
+            return Err(format!("UI request `{request_id}` is still pending"));
+        }
+        state.active.remove(request_id);
+        state.pending.retain(|id| id != request_id);
+        Ok(true)
+    }
+
     /// Parse and execute the JSON action envelope used by runtime action 17.
-    /// Supported operations are `open`, `poll`, `cancel`; `response` is also
-    /// accepted as a convenience for hosts that proxy answers through JSON.
+    /// Supported operations are `open`, `poll`, `cancel`, `forget`; `response`
+    /// is also accepted as a convenience for hosts that proxy answers through
+    /// JSON.
     pub fn handle(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let op = args
             .get("op")
@@ -344,6 +599,11 @@ impl UiDialogMailbox {
                 self.cancel(&id)?;
                 Ok(serde_json::json!({"status":"cancelled","requestId":id}))
             }
+            "forget" => {
+                let id = request_id()?;
+                let removed = self.forget(&id)?;
+                Ok(serde_json::json!({"status":"forgotten","requestId":id,"removed":removed}))
+            }
             "response" | "respond" => {
                 let id = request_id()?;
                 let answer = args
@@ -379,6 +639,14 @@ pub type SideQuestionSink =
 /// are routed directly by the plugin bridge.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
+    /// Action 30: an authenticated host-owned executing invocation, never registry JSON.
+    async fn tool_program(
+        &self,
+        capability: Arc<rpi_agent::tool_program::ToolProgram>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        capability.handle(args).await
+    }
     /// Revoke side questions when their plugin bridge is retired.
     fn cancel_side_questions(&self, _owner: u64) {}
     /// Host-internal TUI snapshots; never exposed as a cross-owner plugin action.
@@ -410,6 +678,38 @@ pub trait RuntimeActionHost: Send + Sync {
     fn replace_model_catalog(&self, _models: Vec<rpi_ai::Model>) {}
     /// Invalidate child handles owned by an unloading/reloaded plugin.
     fn cancel_child_agents(&self, _owner: u64) {}
+    /// Supervisory roster of host-held child agents (newest first). Host-only
+    /// surface for a UI panel: the default is empty so hosts that never
+    /// launched children (or older hosts) report "no children" instead of
+    /// failing the call.
+    ///
+    /// **Not a plugin action.** This method is deliberately absent from
+    /// [`RuntimeActionId`] and from [`dispatch`]: it returns `taskPreview` /
+    /// `error` for children the caller may not own, so it must never be wired
+    /// into `run_action`. See [`RuntimeActionHost::stop_child_agent`].
+    fn child_agent_roster(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Stop one host-held child by id (host-only, **not** owner-scoped). Unknown
+    /// id = `Err`; the default refuses so an unsupporting host is visible.
+    ///
+    /// **Not a plugin action.** Plugin-initiated cancellation is
+    /// owner-checked (`cancel_child_agents(owner)`); this entry point trusts
+    /// its caller to be the host. It must never be reachable from
+    /// `runtime_action`, which is the plugin ABI. If a future action needs it,
+    /// add an owner parameter first and expose *that* instead.
+    fn stop_child_agent(&self, _child_id: &str) -> Result<serde_json::Value, String> {
+        Err("child agent control is not supported by this host; upgrade rpi".into())
+    }
+    /// Host-only, parent-session-scoped bounded child observations/control.
+    /// Never exposed through a plugin runtime action or plugin owner handle.
+    fn query_child_agents(
+        &self,
+        _parent_session_id: &str,
+        _query: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("child agent observations are not supported by this host".into())
+    }
     /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
     /// Defaults append while idle and steer while running; explicit `true`
     /// starts an idle run, `false` only updates context, and `nextTurn` waits
@@ -421,7 +721,12 @@ pub trait RuntimeActionHost: Send + Sync {
     /// `AppendEntry` — append without starting a run. `customType`/`data`
     /// persists extension data only. A `message` is durably queued during an
     /// operation and committed after its current turn; the returned `entryId`
-    /// is reserved and may not yet resolve to a transcript entry.
+    /// is reserved and may not yet resolve to a transcript entry. Optional
+    /// `expected: {sessionId, leafId, customType, entryId}` performs a conditional
+    /// write against that exact branch snapshot; a successful reply must confirm
+    /// `scoped: true`. Scoped messages additionally require `outboxKey` and must
+    /// be custom messages: acceptance is idempotent on the current branch and
+    /// pending context stays with its source state entry.
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SetSessionName` — set the session's display name.
     async fn set_session_name(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
@@ -459,6 +764,19 @@ pub trait RuntimeActionHost: Send + Sync {
     /// B5d — until then this returns an "unsupported" error string).
     async fn reload(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
 
+    /// `ReloadModels` — re-read the model/provider catalog from disk **without**
+    /// reloading extensions.
+    ///
+    /// The cheap counterpart of [`Self::reload`]: it swaps the model catalog
+    /// and the provider runtime bindings, but leaves the extension registry,
+    /// the emitter and the event snapshot untouched — so an in-flight run keeps
+    /// receiving plugin events.
+    ///
+    /// Defaults to "not supported" so hosts that never wired it keep working.
+    async fn reload_models(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("reload_models is not supported by this host".to_string())
+    }
+
     /// `GetCliFlag` — read a parsed extension CLI flag. Args are
     /// `{"name":"flag"}` and the result is `{"value": <bool|string|null>}`.
     async fn get_cli_flag(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -470,6 +788,74 @@ pub trait RuntimeActionHost: Send + Sync {
     /// accidentally report a fabricated user answer.
     async fn ui_dialog(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("ask_user requires an interactive UI".to_string())
+    }
+
+    /// Enumerate the registered slash commands.
+    ///
+    /// Args: `{}`. Result: `{"commands":[{name, description, source}]}` where
+    /// `source` is `builtin` / `extension` / `prompt`. A host with no registry
+    /// returns an empty list (genuinely "none registered"), not an error: the
+    /// remote UI should degrade to "no completion available".
+    ///
+    /// Added because the plugin ABI had no way to enumerate commands, so a
+    /// remote client could not offer slash-command completion at all — it saw
+    /// an empty list and could not tell that apart from "no host attached".
+    async fn list_commands(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({ "commands": [] }))
+    }
+
+    /// Publish a freshly loaded extension registry to the host.
+    ///
+    /// Called after extension discovery **and after a successful `/reload`**, so
+    /// `ListCommands` keeps answering with the current command set. Hosts that
+    /// do not cache a registry (RPC mode reads the snapshot directly) keep the
+    /// default no-op.
+    ///
+    /// Why it is on the trait instead of a downcast: `/reload` only has the
+    /// `Arc<dyn RuntimeActionHost>` from the old bridge, so there is no concrete
+    /// type to downcast to. A default no-op keeps every other host source-compatible.
+    fn publish_registry(&self, _snapshot: std::sync::Arc<crate::registry::RegistrySnapshot>) {}
+
+    /// Publish the registry, or `None` when a reload found no plugins at all.
+    ///
+    /// Distinct from [`Self::publish_registry`] because "no extensions" is a
+    /// real state: a nonempty -> empty reload must replace the cached snapshot
+    /// rather than leave removed commands advertised.
+    fn publish_registry_opt(
+        &self,
+        snapshot: Option<std::sync::Arc<crate::registry::RegistrySnapshot>>,
+    ) {
+        if let Some(snapshot) = snapshot {
+            self.publish_registry(snapshot);
+        }
+    }
+
+    /// Abort the current run on the main lane.
+    ///
+    /// Args: `{}`. Result: `{"aborted": bool, "runId": "…"?, "steer": [...],
+    /// "followUp": [...]}`. Reclaimed queue entries are `{"text","images"}`.
+    ///
+    /// The default implementation reports "nothing to cancel": a host with no
+    /// run loop has nothing to abort, and a stop button must stay idempotent.
+    async fn abort(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "aborted": false,
+            "steer": [],
+            "followUp": [],
+        }))
+    }
+
+    /// Finish the current turn, then stop — the gentle counterpart of
+    /// [`Self::abort`].
+    ///
+    /// Args: `{}`; result: `{"requested": true}`. The flag is one-shot and
+    /// cleared when the next run starts, so setting it while idle is harmless.
+    ///
+    /// The default implementation reports "requested" without acting: a host
+    /// with no run loop has nothing to stop at a turn boundary, and returning an
+    /// error would make a plugin treat a benign call as a failure.
+    fn stop_round(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({ "requested": true }))
     }
 
     /// Safe, effective runtime metadata; never serialize credential bindings.
@@ -489,7 +875,15 @@ pub trait RuntimeActionHost: Send + Sync {
         Err("ChildAgent is not supported by this host".into())
     }
 
-    /// `GetSessionBranch` — current main branch entries, oldest-first.
+    /// `GetSessionBranch` — query custom entries on the current main branch.
+    /// Required: non-empty `customTypes` string array. Optional: `afterSeq`
+    /// (exclusive), `limit` (positive), `order` (`oldestFirst` default or
+    /// `newestFirst`). Unknown/legacy keys and unfiltered `{}` are rejected.
+    /// Sorting/limit apply globally across the requested types; identifiers
+    /// match exactly. Consumers must require `filtered == true` in the reply
+    /// rather than accepting an older host's unfiltered successful response.
+    /// This host also returns pinned `sessionId`, `leafId`, and `scopedAppend:
+    /// true` for callers performing conditional state writes or outbox delivery.
     async fn get_session_branch(
         &self,
         _args: serde_json::Value,
@@ -528,6 +922,7 @@ pub struct ActionBridge {
     /// Some(child) only for a live host-created tool invocation.
     invocation: Option<(bool, String, tokio_util::sync::CancellationToken)>,
     execution_context: Option<serde_json::Value>,
+    tool_program: Option<Arc<rpi_agent::tool_program::ToolProgram>>,
     stdio: crate::StdioLifecycle,
     plugin_identity: Option<(u64, String)>,
     component_owners: Arc<std::sync::Mutex<Vec<u64>>>,
@@ -561,7 +956,7 @@ impl ActionBridge {
         let mut registry = bridges().lock().unwrap_or_else(|e| e.into_inner());
         if let Some((&id, _)) = registry
             .iter()
-            .find(|(_, weak)| weak.as_ptr() == Arc::as_ptr(self))
+            .find(|(_, entry)| entry.bridge.as_ptr() == Arc::as_ptr(self))
         {
             return id as *mut c_void;
         }
@@ -573,7 +968,13 @@ impl ActionBridge {
                 Err(current) => id = current,
             }
         }
-        registry.insert(id, Arc::downgrade(self));
+        registry.insert(
+            id,
+            RegistryEntry {
+                bridge: Arc::downgrade(self),
+                active: Arc::downgrade(&self.active),
+            },
+        );
         id as *mut c_void
     }
     pub(crate) fn resolve_handle(id: usize) -> Option<Arc<Self>> {
@@ -581,16 +982,21 @@ impl ActionBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&id)
-            .and_then(Weak::upgrade)
+            .and_then(|entry| entry.bridge.upgrade())
     }
     pub(crate) fn for_invocation(
         &self,
         child: bool,
         signal: tokio_util::sync::CancellationToken,
     ) -> Arc<Self> {
+        let tool_program = rpi_agent::tool_program::current();
+        if let Some(program) = &tool_program {
+            program.bind_signal(signal.clone());
+        }
         Arc::new(Self {
             invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
             execution_context: rpi_agent::tool_execution_scope::execution_context(),
+            tool_program,
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),
             component_owners: self.component_owners.clone(),
@@ -602,6 +1008,43 @@ impl ActionBridge {
             editor_text: self.editor_text.clone(),
             active: self.active.clone(),
         })
+    }
+    /// Native receipt selection uses the driver-captured invocation, never a
+    /// task-local lookup on a blocking worker or a registration/root binding.
+    pub(crate) fn resolve_result_reference(
+        &self,
+        id: &str,
+    ) -> Result<(rpi_agent::AgentToolResult, bool), String> {
+        if !self.is_active()
+            || !self
+                .invocation
+                .as_ref()
+                .is_some_and(|(_, _, signal)| !signal.is_cancelled())
+        {
+            return Err("result reference requires a live invocation bridge".into());
+        }
+        self.tool_program
+            .as_ref()
+            .ok_or("result reference requires an effective ToolProgram")?
+            .resolve_result_reference(id)
+    }
+    /// Content-only plans use the same captured live authority as full receipts.
+    pub(crate) fn resolve_content_parts(
+        &self,
+        parts: Vec<rpi_agent::tool_program::ToolProgramContentPart>,
+    ) -> Result<Vec<rpi_agent::TextContentOrImage>, String> {
+        if !self.is_active()
+            || !self
+                .invocation
+                .as_ref()
+                .is_some_and(|(_, _, signal)| !signal.is_cancelled())
+        {
+            return Err("content parts require a live invocation bridge".into());
+        }
+        self.tool_program
+            .as_ref()
+            .ok_or("content parts require an effective ToolProgram")?
+            .resolve_content_parts(parts)
     }
     pub(crate) fn invocation_key(&self) -> Option<&str> {
         self.invocation.as_ref().map(|(_, key, _)| key.as_str())
@@ -617,6 +1060,7 @@ impl ActionBridge {
     pub fn new(runtime: Handle, host: Arc<dyn RuntimeActionHost>) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -656,6 +1100,7 @@ impl ActionBridge {
     ) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -681,6 +1126,7 @@ impl ActionBridge {
     ) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -704,6 +1150,7 @@ impl ActionBridge {
             .push(owner);
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             component_owners: self.component_owners.clone(),
             stdio: self.stdio.clone(),
@@ -768,12 +1215,35 @@ impl ActionBridge {
             }
             owners.clone()
         };
+        // Cancel captured capabilities across FFI thread hops on reload/session retirement.
+        let live = self.bridges_for_owner();
+        for bridge in live {
+            if let Some(program) = &bridge.tool_program {
+                program.cancel_all();
+            }
+        }
         // Host cancellation may contend with a job publishing through its
         // sink. Never invoke it while holding the sink's lifecycle gate.
         for owner in owners {
             self.host.cancel_child_agents(owner);
             self.host.cancel_side_questions(owner);
         }
+    }
+
+    fn bridges_for_owner(&self) -> Vec<Arc<Self>> {
+        let active = Arc::downgrade(&self.active);
+        // Filter weak owner identity BEFORE upgrading: even a transient upgrade
+        // of another session's invocation delays its immediate handle retirement.
+        // The weak metadata keeps that allocation's identity from being reused.
+        // Collect every upgraded Arc out of the registry lock; dropping a last
+        // Arc here would deadlock when ActionBridge::drop locks the registry.
+        bridges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|entry| entry.active.ptr_eq(&active))
+            .filter_map(|entry| entry.bridge.upgrade())
+            .collect()
     }
 
     /// Whether this bridge is still the live session's bridge.
@@ -851,6 +1321,74 @@ impl ReloadMailbox {
     }
 }
 
+/// A request/reply mailbox for `runtime_action(ReloadModels)`.
+///
+/// Unlike [`ReloadMailbox`] (fire-and-forget: the plugin does not care whether
+/// the reload succeeded), this one **waits for the result**: the caller wants
+/// to know how many models the refreshed catalog holds, and whether the
+/// re-read failed at all.
+///
+/// The TUI owns the receiver and performs the actual work (it owns the
+/// harness); the plugin-facing side only enqueues a request and awaits the
+/// reply.
+pub struct ReloadModelsMailbox {
+    tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReloadModelsRequest>>>>,
+}
+
+impl Default for ReloadModelsMailbox {
+    fn default() -> Self {
+        Self {
+            tx: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+/// One pending `ReloadModels` request plus the channel to answer on.
+pub struct ReloadModelsRequest {
+    /// Answer channel: `Ok(model_count)` or `Err(reason)`.
+    pub reply: tokio::sync::oneshot::Sender<Result<usize, String>>,
+}
+
+impl Clone for ReloadModelsMailbox {
+    fn clone(&self) -> Self {
+        Self {
+            tx: Arc::clone(&self.tx),
+        }
+    }
+}
+
+impl ReloadModelsMailbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the TUI's request sender. Replaces any prior sender.
+    pub fn install(&self, tx: tokio::sync::mpsc::UnboundedSender<ReloadModelsRequest>) {
+        *self.tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Enqueue a request and await the TUI's answer.
+    ///
+    /// `Err` when no TUI is installed (the host surfaces "not available") or
+    /// when the TUI went away before answering.
+    pub async fn request(&self) -> Result<usize, String> {
+        let (reply, wait) = tokio::sync::oneshot::channel();
+        let tx = self.tx.lock().unwrap().clone();
+        let Some(tx) = tx else {
+            return Err("reload_models is not available (no TUI attached)".to_string());
+        };
+        tx.send(ReloadModelsRequest { reply })
+            .map_err(|_| "reload_models request dropped (TUI gone)".to_string())?;
+        wait.await
+            .map_err(|_| "reload_models request dropped (TUI gone)".to_string())?
+    }
+
+    /// Drop the installed sender (TUI shutdown). Idempotent.
+    pub fn clear(&self) {
+        *self.tx.lock().unwrap() = None;
+    }
+}
+
 /// Build the reload callback the bridge carries, backed by a [`ReloadMailbox`].
 /// When a plugin calls `runtime_action(Reload)`, the bridge's spawn site awaits
 /// this callback, which signals the TUI (if installed) and returns; the plugin
@@ -878,6 +1416,49 @@ pub fn reload_callback_from_mailbox(
 /// callback, the spawn site intercepts `Reload` and awaits the callback
 /// instead (a CLI concern, not a harness op) — this helper is the plain
 /// host-only path.
+/// The mailbox-only `RelayUiDialog` action.
+///
+/// Split out so the trampoline can run it on a plain thread instead of a Tokio
+/// worker (see the `RelayUiDialog` arm at the spawn site).
+fn dispatch_relay_ui_dialog(
+    ui_dialog: &UiDialogMailbox,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let op = args
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("take");
+    match op {
+        "take" => {
+            // Taking implies ownership: the caller is the UI that will present
+            // these questions, so the local TUI must stand down rather than
+            // compete for the same queue.
+            ui_dialog.set_external_takeover(true);
+            let requests: Vec<serde_json::Value> = ui_dialog
+                .take_all_unreserved()
+                .into_iter()
+                .map(|request| {
+                    serde_json::json!({
+                        "requestId": request.request_id,
+                        "toolCallId": request.tool_call_id,
+                        "ui": request.ui,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "requests": requests }))
+        }
+        // Give delivery back to the local TUI and re-queue anything the relay
+        // took but never answered.
+        "release" => {
+            let requeued = ui_dialog.release_takeover();
+            Ok(serde_json::json!({ "requeued": requeued }))
+        }
+        // Same request ids, same semantics as `UiDialog`.
+        "respond" | "cancel" | "forget" => ui_dialog.handle(args),
+        other => Err(format!("RelayUiDialog does not support op `{other}`")),
+    }
+}
+
 async fn dispatch(
     host: &Arc<dyn RuntimeActionHost>,
     ui_dialog: &UiDialogMailbox,
@@ -903,6 +1484,7 @@ async fn dispatch(
         RuntimeActionId::NavigateTree => host.navigate_tree(args).await,
         RuntimeActionId::SwitchSession => host.switch_session(args).await,
         RuntimeActionId::Reload => host.reload(args).await,
+        RuntimeActionId::ReloadModels => host.reload_models(args).await,
         RuntimeActionId::GetCliFlag => host.get_cli_flag(args).await,
         RuntimeActionId::UiDialog => ui_dialog.handle(args),
         // UI-only action: handled by the bridge (no harness call), exactly like
@@ -912,10 +1494,21 @@ async fn dispatch(
         // Editor-only action: served by the bridge (no harness call), exactly
         // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
         RuntimeActionId::SetEditorText => editor_text.handle(args),
+        // Read side of the same mailbox: the TUI publishes the draft each
+        // tick, so this needs no harness call either.
+        RuntimeActionId::GetEditorText => editor_text.handle_get(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
+        RuntimeActionId::ToolProgram => Err("ToolProgram requires a live invocation bridge".into()),
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
+        RuntimeActionId::ListCommands => host.list_commands(args).await,
+        RuntimeActionId::Abort => host.abort(args).await,
+        // Hand the mailbox to an external UI. Only correct while one is
+        // attached — with no client, the caller should let the TUI draw the
+        // dialog instead (otherwise nobody sees the question).
+        RuntimeActionId::RelayUiDialog => dispatch_relay_ui_dialog(ui_dialog, args),
+        RuntimeActionId::StopRound => host.stop_round(args),
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
         }
@@ -954,8 +1547,8 @@ pub extern "C" fn trampoline_runtime_action(
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_action(
             action_id,
-            // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SideQuestion),
+            // Highest id this ABI defines.
+            rpi_plugin_sdk::RuntimeActionId::MAX,
             args_json,
             out,
             user_data,
@@ -1123,6 +1716,45 @@ fn run_action(
                 let _ = tx.send(host.side_question(owner, args, sink).await);
             });
         }
+    } else if action == RuntimeActionId::GetActiveTools && bridge.tool_program.is_some() {
+        let tools = bridge
+            .tool_program
+            .as_ref()
+            .expect("checked")
+            .active_tool_names();
+        let _ = tx.send(Ok(serde_json::json!({"tools":tools})));
+    } else if action == RuntimeActionId::SetActiveTools && bridge.execution_context.is_some() {
+        let _ = tx.send(Err(
+            "cannot replace active tools from a narrowed execution".into()
+        ));
+    } else if action == RuntimeActionId::ToolProgram {
+        let cleanup = matches!(
+            args.get("op").and_then(serde_json::Value::as_str),
+            Some("poll" | "cancel" | "dispose" | "release_result")
+        );
+        let authenticated = bridge.invocation.as_ref().is_some_and(|(_, key, signal)| {
+            (cleanup || !signal.is_cancelled())
+                && (invocation_thread
+                    || runtime_key.as_ref().and_then(serde_json::Value::as_str)
+                        == Some(key.as_str()))
+        });
+        if let Some(capability) = bridge.tool_program.clone().filter(|_| authenticated) {
+            let signal = bridge.invocation.as_ref().expect("authenticated").2.clone();
+            bridge.runtime.spawn(async move {
+                if signal.is_cancelled() {
+                    capability.cancel_all();
+                    if !cleanup {
+                        let _ = tx.send(Err("parent invocation is no longer active".into()));
+                        return;
+                    }
+                }
+                let _ = tx.send(host.tool_program(capability, args).await);
+            });
+        } else {
+            let _ = tx.send(Err(
+                "ToolProgram requires an authenticated executing invocation".into(),
+            ));
+        }
     } else if action == RuntimeActionId::ChildAgent {
         // A registration handle cannot assert that it is a parent invocation.
         // All child-originated invocations fail closed, regardless of tool name.
@@ -1174,6 +1806,15 @@ fn run_action(
         // Tokio worker for the same single-thread-runtime reason.
         std::thread::spawn(move || {
             let _ = tx.send(editor_text.handle(args));
+        });
+    } else if action == RuntimeActionId::RelayUiDialog {
+        // Mailbox-only, like `UiDialog`/`SetStatus`/`SetEditorText`: it never
+        // touches the harness. Routing it through the generic runtime spawn
+        // would park the blocking `rx.recv()` on a Tokio worker that the
+        // mailbox-only op itself needs to complete — on a current-thread bridge
+        // that deadlocks the only thread able to finish it.
+        std::thread::spawn(move || {
+            let _ = tx.send(dispatch_relay_ui_dialog(&ui_dialog, args));
         });
     } else if action == RuntimeActionId::UiDialog {
         // UiDialog is intentionally synchronous at the plugin ABI boundary:
@@ -1277,6 +1918,35 @@ fn run_action(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// Host-only child-agent control must stay unreachable from the plugin ABI.
+    ///
+    /// `run_action` only dispatches ids that [`RuntimeActionId::try_from`]
+    /// accepts, and `dispatch` matches exhaustively on that enum, so the enum is
+    /// the isolation primitive: no variant means no path from a plugin to
+    /// `child_agent_roster` / `stop_child_agent` (which are deliberately not
+    /// owner-scoped). Adding an action id is then a visible, test-breaking
+    /// change that forces whoever does it to re-check that boundary.
+    #[test]
+    fn host_child_agent_control_has_no_plugin_action_id() {
+        assert!(
+            RuntimeActionId::try_from(31).is_ok(),
+            "ReloadModels must remain a valid runtime action id"
+        );
+        // Re-verified when `GetEditorText = 32` was appended: it reads the
+        // editor draft through the status/editor mailbox, so it never reaches
+        // `child_agent_roster` / `stop_child_agent`, whose un-owner-scoped
+        // control must stay unreachable from the plugin ABI.
+        assert!(
+            RuntimeActionId::try_from(32).is_ok(),
+            "GetEditorText must remain a valid runtime action id"
+        );
+        assert!(
+            RuntimeActionId::try_from(33).is_err(),
+            "a new RuntimeActionId was added: re-verify that host-only child-agent control \
+             (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn stdio_claim_is_exclusive_and_only_its_scoped_context_can_finish() {
@@ -1818,6 +2488,91 @@ mod tests {
     }
 
     #[test]
+    fn ui_dialog_attachment_generation_exhaustion_fails_closed() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox
+            .state
+            .lock()
+            .expect("ui dialog mailbox poisoned")
+            .attachment_generation = u64::MAX;
+
+        assert_eq!(mailbox.try_attach_with_generation(), None);
+        assert_eq!(mailbox.attachment_generation(), Some(u64::MAX));
+        assert!(!mailbox.is_attached());
+
+        // The compatibility attach API also refuses to reuse the terminal
+        // generation rather than silently reopening the mailbox.
+        mailbox.attach();
+        assert!(!mailbox.is_attached());
+    }
+
+    #[test]
+    fn ui_dialog_attachment_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog mailbox state");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(mailbox.try_attach_with_generation(), None);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The compatibility API must also refuse rather than panic.
+            mailbox.attach();
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn ui_dialog_observation_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog observation state");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(mailbox.attachment_generation(), None);
+        assert!(!mailbox.is_attached());
+    }
+
+    #[test]
+    fn ui_dialog_detach_generation_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog retirement state");
+        })
+        .join()
+        .is_err());
+
+        assert!(!mailbox.detach_if_generation(1));
+    }
+
+    #[test]
+    fn ui_dialog_compat_detach_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog compatibility retirement state");
+        })
+        .join()
+        .is_err());
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mailbox.detach();
+        }))
+        .is_ok());
+        assert_eq!(mailbox.try_attach_with_generation(), None);
+    }
+
+    #[test]
     fn ui_dialog_open_poll_answer_round_trip() {
         let mailbox = UiDialogMailbox::new();
         mailbox.attach();
@@ -1841,6 +2596,47 @@ mod tests {
         assert_eq!(answered["answer"], "7890");
         // Polling consumes the terminal entry.
         assert!(mailbox.poll("r1").is_err());
+    }
+
+    #[test]
+    fn ui_dialog_forget_reclaims_terminal_entries_without_stranding_pending_ones() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+
+        // A live request cannot be forgotten: the UI is still waiting for an
+        // answer and deleting it would strand the question.
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+        assert_eq!(
+            mailbox.forget("r1"),
+            Err("UI request `r1` is still pending".to_string())
+        );
+        assert_eq!(mailbox.poll("r1").unwrap()["status"], "pending");
+
+        // A cancelled request that the plugin will never poll again is
+        // reclaimed explicitly, so `active` does not grow for the host's life.
+        mailbox.cancel("r1").unwrap();
+        assert_eq!(mailbox.forget("r1"), Ok(true));
+        assert_eq!(mailbox.forget("r1"), Ok(false)); // idempotent
+        assert!(mailbox.poll("r1").is_err());
+
+        // The same works for an answered request, and through the JSON
+        // `forget` op used across the ABI boundary.
+        mailbox.handle(open_args("r2", "c2")).unwrap();
+        mailbox
+            .respond("r2", serde_json::json!({"values": ["Linux"]}))
+            .unwrap();
+        let forgotten = mailbox
+            .handle(serde_json::json!({"op": "forget", "requestId": "r2"}))
+            .unwrap();
+        assert_eq!(forgotten["status"], "forgotten");
+        assert_eq!(forgotten["removed"], true);
+        assert!(mailbox.poll("r2").is_err());
+
+        // Unknown ids are a no-op, and a forgotten id can be opened again
+        // without replaying the old terminal state.
+        assert_eq!(mailbox.forget("missing"), Ok(false));
+        let reopened = mailbox.handle(open_args("r1", "c1")).unwrap();
+        assert_eq!(reopened["status"], "pending");
     }
 
     #[test]
@@ -1919,6 +2715,50 @@ mod tests {
         assert!(mailbox.take_pending().is_none());
     }
 
+    /// `ListCommands` must route through the trampoline to the host method, and
+    /// the default implementation must answer with an **empty list** rather than
+    /// an error — a client has to be able to tell "no commands registered" apart
+    /// from "this host does not support the action".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_commands_routes_to_the_host_and_defaults_to_empty() {
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let user_data = bridge.user_data();
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            u32::from(RuntimeActionId::ListCommands),
+            StbStringRef::from_str("{}"),
+            &mut out,
+            user_data,
+        );
+        assert_eq!(
+            rc, 0,
+            "ListCommands must not fail on a host with no registry"
+        );
+        let payload: serde_json::Value = serde_json::from_str(
+            &unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            }
+            .to_string_lossy(),
+        )
+        .expect("JSON");
+        assert_eq!(
+            payload
+                .get("commands")
+                .and_then(|c| c.as_array())
+                .map(Vec::len),
+            Some(0),
+            "an empty registry is an empty list, not an error: {payload}"
+        );
+    }
+
     /// The v2 trampoline must route action 17 into the session mailbox rather
     /// than rejecting it as unknown, and a detached mailbox must surface the
     /// explicit "requires an interactive UI" error (headless contract).
@@ -1958,10 +2798,17 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 26 is one past the highest defined action.
+        // Derive "one past the highest" from the enum so adding an action does
+        // not silently turn this into a real dispatch.
+        let one_past_last = rpi_plugin_sdk::RuntimeActionId::MAX + 1;
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(26, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(
+                one_past_last,
+                StbStringRef::from_str("{}"),
+                &mut out,
+                user_data
+            ),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.
@@ -2003,6 +2850,20 @@ mod tests {
         assert_eq!(mailbox.panels().len(), 1);
         root.invalidate();
         assert!(mailbox.panels().is_empty());
+    }
+
+    /// Action 28 is mailbox-only, so it must not need a Tokio worker.
+    ///
+    /// The route must be off-executor: on a current-thread bridge a spawn-based
+    /// route parks the only thread able to finish the call. The timeout is the
+    /// regression.
+    #[test]
+    fn relay_ui_dialog_runs_off_the_executor() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        let out = dispatch_relay_ui_dialog(&mailbox, serde_json::json!({"op":"release"}))
+            .expect("release is a supported op");
+        assert_eq!(out["requeued"], serde_json::json!(0));
     }
 
     /// Action 18 (`SetStatus`) is bridge-local, like `UiDialog`: it writes the
@@ -2066,6 +2927,53 @@ mod tests {
             rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
         });
     }
+    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
+    ///
+    /// A branch that adds an action but leaves the ceiling behind compiles,
+    /// keeps every other test green, and quietly makes the newest action
+    /// un-dispatchable. The ceiling and the enum live in different crates, so
+    /// nothing but a test can notice the drift.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trampoline_ceiling_matches_the_highest_defined_action() {
+        let highest = RuntimeActionId::MAX;
+        assert_eq!(
+            highest,
+            RuntimeActionId::ALL
+                .iter()
+                .copied()
+                .map(u32::from)
+                .max()
+                .unwrap(),
+            "RuntimeActionId::MAX must be the maximum of RuntimeActionId::ALL"
+        );
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            highest,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            bridge.user_data(),
+        );
+        assert_ne!(
+            rc, 2,
+            "the highest defined action id ({highest}) must not be rejected as unknown — \
+             the trampoline ceiling is stale"
+        );
+        if rc == 0 {
+            // SAFETY: success means the trampoline wrote a live host allocation.
+            drop(unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            });
+        }
+    }
 }
 
 impl Drop for ActionBridge {
@@ -2073,7 +2981,7 @@ impl Drop for ActionBridge {
         bridges()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, weak| !std::ptr::eq(weak.as_ptr(), self));
+            .retain(|_, entry| !std::ptr::eq(entry.bridge.as_ptr(), self));
         if self.invocation.is_some() {
             return;
         }
@@ -2087,3 +2995,261 @@ impl Drop for ActionBridge {
 
 #[cfg(test)]
 mod runtime_tests;
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn request(id: &str) -> UiDialogRequest {
+        UiDialogRequest {
+            request_id: id.to_string(),
+            tool_call_id: Some(format!("tool-{id}")),
+            ui: serde_json::json!({"question": "ok?"}),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    /// A reserved request must be invisible to the TUI but visible to the plugin
+    /// that reserved it. Otherwise a remote UI's question pops up in the
+    /// terminal while the user who can answer it is watching the remote client.
+    #[test]
+    fn reserved_requests_are_invisible_to_the_tui() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        let reserved = format!("{PLUGIN_RESERVED_PREFIX}gate-1");
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": reserved,
+                "toolCallId": "t1",
+                "ui": {}
+            }))
+            .unwrap();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": "plain-1",
+                "toolCallId": "t2",
+                "ui": {}
+            }))
+            .unwrap();
+
+        // The TUI skips the reserved one and takes the plain one.
+        let taken = mailbox
+            .take_pending_filtered(|r| !mailbox.is_reserved(&r.request_id))
+            .expect("the unreserved request must reach the TUI");
+        assert_eq!(taken.request_id, "plain-1");
+
+        // The plugin still sees its own.
+        let own = mailbox
+            .take_pending_filtered(|r| mailbox.is_reserved(&r.request_id))
+            .expect("the plugin must still see its reserved request");
+        assert_eq!(own.request_id, reserved);
+    }
+
+    /// Losing the relay consumer must not leave the TUI locked out forever.
+    #[test]
+    fn release_or_detach_clears_takeover_and_requeues_unanswered() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "plain-r", "toolCallId": "t", "ui": {}
+            }))
+            .unwrap();
+
+        // Relay takes it, then gives up without answering.
+        mailbox.set_external_takeover(true);
+        assert_eq!(mailbox.take_all_unreserved().len(), 1);
+        assert_eq!(mailbox.release_takeover(), 1);
+        assert!(
+            !mailbox.external_takeover(),
+            "release must hand delivery back to the TUI"
+        );
+        // The question is visible again instead of being silently lost.
+        assert_eq!(
+            mailbox
+                .take_pending_filtered(|r| !mailbox.is_reserved(&r.request_id))
+                .map(|r| r.request_id),
+            Some("plain-r".to_string())
+        );
+
+        // Detach releases ownership too, so a reattached TUI can consume.
+        mailbox.set_external_takeover(true);
+        mailbox.detach();
+        assert!(!mailbox.external_takeover(), "detach must clear takeover");
+    }
+
+    /// Takeover and dequeue share one lock, so a relay cannot claim ownership
+    /// in the gap and lose the question.
+    #[test]
+    fn tui_take_is_atomic_against_takeover() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.set_external_takeover(true);
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "plain-a", "toolCallId": "t", "ui": {}
+            }))
+            .unwrap();
+        assert!(
+            mailbox.take_pending_unless_external(|_| true).is_none(),
+            "the TUI must stand down while a relay owns delivery"
+        );
+        // Still queued for the relay.
+        assert_eq!(mailbox.take_all_unreserved().len(), 1);
+    }
+
+    /// `RelayUiDialog {op:"take"}` hands over everything no plugin reserved and
+    /// leaves the reserved entries queued.
+    #[test]
+    fn relay_take_returns_unreserved_and_keeps_reserved() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": format!("{PLUGIN_RESERVED_PREFIX}keep"),
+                "toolCallId": "t1",
+                "ui": {}
+            }))
+            .unwrap();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": "relay-1",
+                "toolCallId": "t2",
+                "ui": {}
+            }))
+            .unwrap();
+
+        let taken = mailbox.take_all_unreserved();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].request_id, "relay-1");
+        // The reserved one is still there for its owner.
+        assert_eq!(mailbox.pending_len(), 1);
+    }
+
+    /// A taken request is still answerable — `take` moves it out of `pending`
+    /// but keeps it in `active`.
+    #[test]
+    fn a_relayed_request_can_still_be_answered() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": "relay-1",
+                "toolCallId": "t1",
+                "ui": {}
+            }))
+            .unwrap();
+        let taken = mailbox.take_all_unreserved();
+        assert_eq!(taken.len(), 1);
+
+        mailbox
+            .handle(serde_json::json!({
+                "op": "respond",
+                "requestId": "relay-1",
+                "answer": {"ok": true}
+            }))
+            .unwrap();
+        // Answered requests are not handed out again.
+        assert_eq!(
+            mailbox
+                .take_pending_filtered(|_| true)
+                .map(|r| r.request_id),
+            None,
+            "an answered request must not resurface"
+        );
+    }
+
+    /// `take_pending()` (the un-filtered form) still takes everything, so a
+    /// caller that wants the old behaviour keeps it.
+    #[test]
+    fn take_pending_still_takes_reserved_entries() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        let reserved = format!("{PLUGIN_RESERVED_PREFIX}x");
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": reserved,
+                "toolCallId": "t1",
+                "ui": {}
+            }))
+            .unwrap();
+        assert_eq!(
+            mailbox.take_pending().map(|r| r.request_id),
+            Some(format!("{PLUGIN_RESERVED_PREFIX}x"))
+        );
+    }
+
+    /// External takeover must make the TUI skip taking entirely.
+    ///
+    /// The two consumers draw from the same queue, so without an owner whichever
+    /// polls first wins. A remote client that has taken over must not race a
+    /// terminal nobody is watching.
+    #[test]
+    fn external_takeover_makes_the_tui_stand_down() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": "plain-1",
+                "toolCallId": "t1",
+                "ui": {}
+            }))
+            .unwrap();
+
+        assert!(!mailbox.external_takeover());
+        mailbox.set_external_takeover(true);
+        assert!(mailbox.external_takeover());
+
+        // The TUI's take path returns nothing while the external UI owns it…
+        let tui_take = |m: &UiDialogMailbox| {
+            if m.external_takeover() {
+                return None;
+            }
+            m.take_pending_filtered(|r| !m.is_reserved(&r.request_id))
+        };
+        assert!(
+            tui_take(&mailbox).is_none(),
+            "the TUI must not steal a request an external UI owns"
+        );
+        // …and the request is still there for the external consumer.
+        assert_eq!(mailbox.take_all_unreserved().len(), 1);
+    }
+
+    /// Handing ownership back lets the TUI resume.
+    #[test]
+    fn clearing_takeover_returns_dialogs_to_the_tui() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.set_external_takeover(true);
+        mailbox.set_external_takeover(false);
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": "plain-2",
+                "toolCallId": "t2",
+                "ui": {}
+            }))
+            .unwrap();
+        assert_eq!(
+            mailbox
+                .take_pending_filtered(|r| !mailbox.is_reserved(&r.request_id))
+                .map(|r| r.request_id),
+            Some("plain-2".to_string())
+        );
+    }
+
+    #[test]
+    fn request_helper_matches_the_prefix_rule() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        assert!(mailbox.is_reserved(&request(PLUGIN_RESERVED_PREFIX).request_id));
+        assert!(!mailbox.is_reserved(&request("plain").request_id));
+    }
+}

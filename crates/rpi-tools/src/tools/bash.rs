@@ -35,14 +35,43 @@ use crate::truncate::{format_size, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_
 /// Throttle window for bash `on_update` flushes. Mirrors `BASH_UPDATE_THROTTLE_MS`.
 const BASH_UPDATE_THROTTLE_MS: u64 = 2_000;
 
-/// Input for the bash tool. Mirrors TS `BashToolInput`. `timeout` is in seconds.
+/// Default Bash deadline when neither the caller nor the host specifies one.
+pub const DEFAULT_BASH_TIMEOUT_SECONDS: f64 = 120.0;
+
+/// Input for the bash tool. Mirrors TS `BashToolInput` plus a host-side
+/// extension: `description` (optional) lets the model state the command's
+/// intent in 5–10 words. Collapsed tool rows show it instead of the raw
+/// command (ZCode's Bash row reads `input.description` the same way).
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct BashInput {
     /// Bash command to execute.
     pub command: String,
-    /// Timeout in seconds (optional, no default timeout).
+    /// Brief description of what this command does (5–10 words), shown to the
+    /// user in the collapsed tool row. Optional; the host falls back to the
+    /// command text when omitted.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Timeout in seconds (optional; uses the host default, otherwise 120 seconds).
     #[serde(default)]
     pub timeout: Option<f64>,
+}
+
+/// How a bash tool call ended. A non-zero exit is a *command result*, not a
+/// tool malfunction: probes such as `grep` (no match) and `git config --get`
+/// (missing key) legitimately return 1. Fork issue #14 §4 PR-B asks for this
+/// distinction without changing `isError` yet, so the classification lives in
+/// `details.failure_kind` and the agent loop keeps its existing error path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashFailureKind {
+    /// The command ran to completion but returned a non-zero exit code.
+    CommandFailed,
+    /// The user/tool cancelled the command.
+    Cancelled,
+    /// The command exceeded its timeout.
+    Timeout,
+    /// The shell or transport itself failed (spawn, I/O, etc.).
+    ToolFailed,
 }
 
 /// Structured details for the bash tool. Mirrors TS `BashToolDetails`.
@@ -52,6 +81,13 @@ pub struct BashToolDetails {
     pub truncation: Option<TruncationResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<String>,
+    /// Raw exit code when the shell reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Why the call ended; absent on success. `CommandFailed` means "read the
+    /// output before retrying", not "the tool is broken".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<BashFailureKind>,
 }
 
 /// Mutable execution description passed to the optional prepare hook.
@@ -74,9 +110,8 @@ pub struct BashToolOptions {
     /// Prepended to the command (separated by `\n`) before execution.
     pub command_prefix: Option<String>,
     /// Fallback timeout in seconds applied when the model doesn't pass one.
-    /// pi has no default, but a model that forgets `timeout` can hang the run
-    /// forever (reported as "卡住") — rpi injects this at the harness build
-    /// site. A model-supplied timeout still wins.
+    /// `None` uses `DEFAULT_BASH_TIMEOUT_SECONDS`, not an unlimited deadline.
+    /// A model-supplied timeout still wins.
     pub default_timeout: Option<f64>,
     /// Optional async hook that can adjust command, cwd, and environment.
     pub prepare: Option<BashPrepare>,
@@ -91,20 +126,25 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    fn schema() -> Tool {
-        let params = schemars::schema_for!(BashInput);
+    fn schema(default_timeout: f64) -> Tool {
+        let mut params = serde_json::to_value(schemars::schema_for!(BashInput)).unwrap_or_default();
+        params["properties"]["timeout"]["description"] =
+            format!("Timeout in seconds (optional, defaults to {default_timeout} seconds).").into();
         Tool {
             name: "bash".to_string(),
             description: format!(
                 "Execute a Bash command in the current working directory using Bash/POSIX syntax, even on Windows. PowerShell cmdlets (Get-ChildItem, Select-Object, Select-String) are not valid here; use ls, find, rg, and POSIX pipelines instead. Returns stdout and \
                  stderr. Output is truncated to last {DEFAULT_MAX_LINES} lines or {kb}KB \
                  (whichever is hit first). If truncated, full output is saved to a temp file. \
-                 Optionally provide a timeout in seconds.",
+                 Defaults to a {default_timeout}-second timeout; provide timeout in seconds to override it. \
+                 A non-zero exit code is a command result: probe commands such as grep (no match) or \
+                 git config --get (missing key) legitimately return 1. Read the output before deciding \
+                 whether to retry; details carries exit_code and failure_kind. \
+                 Always pass `description`: a concise 5-10 word summary of the command's purpose \
+                 (e.g. \"Run the test suite\"); hosts show it in the collapsed tool row.",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
-            parameters: rpi_ai::types::Schema::new(
-                serde_json::to_value(params).unwrap_or_default(),
-            ),
+            parameters: rpi_ai::types::Schema::new(params),
             constrained_sampling: Some(ConstrainedSamplingConfig::JsonSchema {
                 strict: ConstrainedStrictness::Prefer,
             }),
@@ -117,10 +157,15 @@ pub fn create_bash_tool(
     context: &ExecutionToolContext,
     options: Option<BashToolOptions>,
 ) -> Arc<dyn AgentTool> {
+    let options = options.unwrap_or_default();
     Arc::new(BashTool {
-        schema: BashTool::schema(),
+        schema: BashTool::schema(
+            options
+                .default_timeout
+                .unwrap_or(DEFAULT_BASH_TIMEOUT_SECONDS),
+        ),
         env: context.env().clone(),
-        options: options.unwrap_or_default(),
+        options,
     })
 }
 
@@ -142,7 +187,10 @@ impl AgentTool for BashTool {
     ) -> Result<AgentToolResult, AgentError> {
         let input: BashInput = serde_json::from_value(params)
             .map_err(|e| AgentError::Validation(format!("bash input invalid: {e}")))?;
-        validate_timeout(input.timeout)?;
+        let timeout = Some(resolve_timeout(
+            input.timeout,
+            self.options.default_timeout,
+        )?);
         let mut execution = BashExecution {
             command: match &self.options.command_prefix {
                 Some(p) => format!("{p}\n{}", input.command),
@@ -156,7 +204,6 @@ impl AgentTool for BashTool {
             prepare(&mut execution).await.map_err(AgentError::Tool)?;
         }
         let command = execution.command;
-        let timeout = input.timeout.or(self.options.default_timeout);
 
         // Initial empty update (mirrors TS `onUpdate?.({ content: [], details: undefined })`).
         emit_update(&on_update, String::new(), None, None);
@@ -254,11 +301,14 @@ impl AgentTool for BashTool {
         }
 
         // Build the terminal output text + details, applying truncation notices.
-        let (output_text, details) = build_bash_output(&capture);
-        let details_value = serde_json::to_value(details).unwrap_or(serde_json::Value::Null);
+        let (output_text, mut details) = build_bash_output(&capture);
+        details.exit_code = capture.exit_code;
 
-        // Resolution: cancelled → aborted; timeout → timeout; other exec error;
-        // non-zero exit → Tool error. All become Err(AgentError).
+        // A failed call still returns `isError=true` (unchanged), but carries
+        // structured `details` through `AgentError::StructuredTool` so a
+        // caller can tell "the command returned 1" from "the tool broke".
+        // Plain `AgentError::Tool` is only used where no AgentToolResult can be
+        // built (validation errors earlier in execute).
         let append_status = |status: String| -> String {
             if output_text.is_empty() {
                 status
@@ -266,8 +316,27 @@ impl AgentTool for BashTool {
                 format!("{output_text}\n\n{status}")
             }
         };
+        // A small helper (not an FnMut closure) so `details` is borrowed only
+        // for the duration of each call and `output_text` can be used normally.
+        fn structured_failure(
+            message: String,
+            kind: BashFailureKind,
+            details: &mut BashToolDetails,
+        ) -> AgentError {
+            details.failure_kind = Some(kind);
+            let details_value = serde_json::to_value(&*details).unwrap_or(serde_json::Value::Null);
+            AgentError::StructuredTool(Box::new(AgentToolResult {
+                content: vec![TextContentOrImage::text(message)],
+                details: details_value,
+                ..Default::default()
+            }))
+        }
         if capture.cancelled {
-            return Err(AgentError::Tool(append_status("Command aborted".into())));
+            return Err(structured_failure(
+                append_status("Command aborted".into()),
+                BashFailureKind::Cancelled,
+                &mut details,
+            ));
         }
         if let Some(ee) = &capture.execution_error {
             if ee.code == ExecutionErrorCode::Timeout {
@@ -277,17 +346,25 @@ impl AgentTool for BashTool {
                     Some(secs) => format!("after {secs}s"),
                     None => "".to_string(),
                 };
-                return Err(AgentError::Tool(append_status(format!(
-                    "Command timed out {limit}"
-                ))));
+                return Err(structured_failure(
+                    append_status(format!("Command timed out {limit}")),
+                    BashFailureKind::Timeout,
+                    &mut details,
+                ));
             }
-            return Err(AgentError::Tool(ee.to_string()));
+            return Err(structured_failure(
+                ee.to_string(),
+                BashFailureKind::ToolFailed,
+                &mut details,
+            ));
         }
         if let Some(code) = capture.exit_code {
             if code != 0 {
-                return Err(AgentError::Tool(append_status(format!(
-                    "Command exited with code {code}"
-                ))));
+                return Err(structured_failure(
+                    append_status(format!("Command exited with code {code}")),
+                    BashFailureKind::CommandFailed,
+                    &mut details,
+                ));
             }
         }
         let text = if output_text.is_empty() {
@@ -295,6 +372,7 @@ impl AgentTool for BashTool {
         } else {
             output_text
         };
+        let details_value = serde_json::to_value(&details).unwrap_or(serde_json::Value::Null);
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(text)],
             details: details_value,
@@ -342,6 +420,8 @@ fn emit_update(
             let details = BashToolDetails {
                 truncation,
                 full_output_path,
+                exit_code: None,
+                failure_kind: None,
             };
             serde_json::to_value(details).unwrap_or(serde_json::Value::Null)
         }
@@ -392,21 +472,25 @@ fn build_bash_output(capture: &ShellCaptureResult) -> (String, BashToolDetails) 
         BashToolDetails {
             truncation: Some(capture.truncation.clone()),
             full_output_path: path_str,
+            exit_code: None,
+            failure_kind: None,
         }
     } else {
         BashToolDetails {
             truncation: None,
             full_output_path: None,
+            exit_code: None,
+            failure_kind: None,
         }
     };
     (output_text, details)
 }
 
-/// Validate a timeout (seconds). Mirrors `validateTimeout`.
-fn validate_timeout(timeout: Option<f64>) -> Result<(), AgentError> {
-    let Some(secs) = timeout else {
-        return Ok(());
-    };
+/// Resolve and validate the effective deadline before preparing a command.
+fn resolve_timeout(timeout: Option<f64>, default_timeout: Option<f64>) -> Result<f64, AgentError> {
+    let secs = timeout
+        .or(default_timeout)
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECONDS);
     if !secs.is_finite() || secs <= 0.0 {
         return Err(AgentError::Tool(
             "Invalid timeout: must be a finite number of seconds".into(),
@@ -418,9 +502,41 @@ fn validate_timeout(timeout: Option<f64>) -> Result<(), AgentError> {
             "Invalid timeout: maximum is {max} seconds"
         )));
     }
-    Ok(())
+    Ok(secs)
 }
 
 fn exec_err_to_agent(e: ExecutionError) -> AgentError {
     AgentError::Tool(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_and_null_timeout_use_tool_default() {
+        for params in [
+            serde_json::json!({ "command": "noop" }),
+            serde_json::json!({ "command": "noop", "timeout": null }),
+        ] {
+            let input: BashInput = serde_json::from_value(params).unwrap();
+            assert_eq!(resolve_timeout(input.timeout, None).unwrap(), 120.0);
+        }
+    }
+
+    #[test]
+    fn explicit_timeout_overrides_host_default() {
+        assert_eq!(resolve_timeout(None, Some(30.0)).unwrap(), 30.0);
+        assert_eq!(resolve_timeout(Some(300.0), Some(30.0)).unwrap(), 300.0);
+        assert_eq!(resolve_timeout(Some(300.0), None).unwrap(), 300.0);
+    }
+
+    #[test]
+    fn effective_timeout_must_be_valid() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 2_147_484.0] {
+            assert!(resolve_timeout(Some(invalid), None).is_err());
+            assert!(resolve_timeout(None, Some(invalid)).is_err());
+            assert_eq!(resolve_timeout(Some(10.0), Some(invalid)).unwrap(), 10.0);
+        }
+    }
 }

@@ -148,6 +148,7 @@ pub fn assistant_tool_calls(
                 arguments: args,
                 thought_signature: None,
                 namespace: None,
+                recorded: None,
             })
         })
         .collect();
@@ -212,8 +213,10 @@ pub fn loop_config_with_converter(
         after_tool_results: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
+        pending_message_count: None,
         before_tool_call: None,
         after_tool_call: None,
+        provider_hooks: None,
         tool_execution: rpi_agent::ToolExecutionMode::Parallel,
         thinking_level: rpi_ai::types::ThinkingLevel::Off,
         api_key: None,
@@ -281,7 +284,7 @@ pub fn tool_result_message_ids(events: &[rpi_agent::AgentEvent]) -> Vec<String> 
     events
         .iter()
         .filter_map(|e| match e {
-            rpi_agent::AgentEvent::MessageEnd { message } => match message {
+            rpi_agent::AgentEvent::MessageEnd { message, .. } => match message {
                 rpi_agent::AgentMessage::ToolResult(t) => Some(t.tool_call_id.clone()),
                 _ => None,
             },

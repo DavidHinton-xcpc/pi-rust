@@ -22,6 +22,12 @@ use crate::registry::RegistrySnapshot;
 #[cfg(test)]
 mod lifetime_tests;
 
+#[cfg(test)]
+thread_local! {
+    static TRANSLATED_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FREED_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Map a native [`AgentEvent`] to its pi `on()` [`EventTag`], or `None` if the
 /// host event has no stable-event counterpart. This is the **fold** described
 /// in the crate docs: the ten stable lifecycle variants map onto matching tags;
@@ -33,6 +39,9 @@ pub fn event_tag_for(event: &AgentEvent) -> Option<EventTag> {
         AgentEvent::AgentEnd { .. } => Some(EventTag::AgentEnd),
         AgentEvent::RetryScheduled { .. } => None,
         AgentEvent::TurnStart => Some(EventTag::TurnStart),
+        // The lifecycle tag stays payload-free; the payload rides under its own
+        // tag so a host that predates the payload can never be made to read
+        // uninitialized union storage. See `EventTag::TurnEndPayload`.
         AgentEvent::TurnEnd { .. } => Some(EventTag::TurnEnd),
         AgentEvent::MessageStart { .. } => Some(EventTag::MessageStart),
         AgentEvent::MessageUpdate { .. } => Some(EventTag::MessageUpdate),
@@ -44,22 +53,77 @@ pub fn event_tag_for(event: &AgentEvent) -> Option<EventTag> {
 }
 
 /// Serialize an [`AgentMessage`](rpi_agent::message::AgentMessage) to an owning
-/// `StbString` for a message-payload event. The host produced this string, so
-/// the **handler** (plugin side) frees it via the host's `free_string`.
+/// `StbString` for a message-payload event. Handlers borrow its bytes;
+/// the dispatcher's cleanup guard frees it after fan-out.
 fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
     // AgentMessage is Serialize (#[serde(tag="kind")]); use serde_json round-trip.
     let text = serde_json::to_string(message).unwrap_or_else(|_| "null".to_string());
     StbString::from_string(text)
 }
 
+/// Normalize an assistant `StopReason` into the value a plugin branches on.
+///
+/// `stop`, `toolUse` and `length` are all *successful* terminations of a turn:
+/// the run is going to continue (or ended cleanly) either way. `aborted` is the
+/// user cancelling. Everything else is a failure.
+fn turn_outcome(stop_reason: rpi_ai::types::StopReason) -> &'static str {
+    use rpi_ai::types::StopReason;
+    match stop_reason {
+        StopReason::Stop | StopReason::ToolUse | StopReason::Length => "stop",
+        StopReason::Aborted => "aborted",
+        _ => "error",
+    }
+}
+
+/// Payload for `turn_end`.
+///
+/// Carries enough for a plugin to tell a normal stop from a failure or a user
+/// abort without inferring it from the last `message_end`, plus
+/// `pendingMessages` — the queue depth **after** this turn settled.
+fn turn_end_payload(message: &rpi_agent::message::AgentMessage, tool_results: usize) -> String {
+    let stop_reason = message
+        .as_assistant()
+        .map(|assistant| assistant.stop_reason);
+    let outcome = stop_reason.map(turn_outcome).unwrap_or("error");
+    serde_json::json!({
+        "outcome": outcome,
+        "stopReason": stop_reason.map(|reason| reason.as_str()),
+        "toolResultCount": tool_results,
+    })
+    .to_string()
+}
+
+/// Translate one agent event into **every** stable event it must produce.
+///
+/// Almost every event is one-to-one, but `turn_end` is not: existing subscribers
+/// registered for the lifecycle `turn_end` tag must keep receiving an event, and
+/// the payload needs a different tag so a host that predates the payload can
+/// never be made to read uninitialized union storage. Emitting both keeps
+/// legacy handlers working while the payload stays behind the new tag.
+/// Production dispatch additionally filters each subscription before allocating.
+#[cfg(test)]
+fn translate_all(event: &AgentEvent) -> Vec<StablePluginEvent> {
+    match event {
+        AgentEvent::TurnEnd { .. } => {
+            let mut out = vec![StablePluginEvent::empty(EventTag::TurnEnd)];
+            if let Some(payload) = translate(event) {
+                out.push(payload);
+            }
+            out
+        }
+        _ => translate(event).into_iter().collect(),
+    }
+}
+
 /// Build the stable event for an `AgentEvent`, or `None` if the event carries
-/// no payload that maps onto a stable variant (always maps today, but kept as
-/// `Option` for forward-compat with unmapped future variants). Ownership of any
-/// `StbString` in the returned event passes to the handler.
+/// no payload that maps onto a stable variant. The caller owns the returned
+/// strings; dispatch borrows them to callbacks and frees them exactly once.
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
+    #[cfg(test)]
+    TRANSLATED_EVENTS.with(|count| count.set(count.get() + 1));
     let tag = event_tag_for(event)?;
     match event {
-        AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message } => {
+        AgentEvent::MessageStart { message, .. } | AgentEvent::MessageEnd { message, .. } => {
             let stb = message_to_stb(message);
             Some(StablePluginEvent::message(tag, stb))
         }
@@ -111,11 +175,34 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
             ))
         }
 
+        // `turn_end` carries a payload so a plugin can tell a normal stop from
+        // a failure or a user abort without inferring it from the last
+        // `message_end`, and so a remote UI can show "N queued".
+        //
+        // `pendingMessages` is the queue depth **after** the turn settled. The
+        // drain hooks cannot answer this (they consume the queue), which is why
+        // the agent loop reports it through a read-only `pending_message_count`
+        // hook instead.
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+            pending_messages,
+        } => {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&turn_end_payload(message, tool_results.len()))
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            // Additive: consumers that only know the older (empty) shape ignore it.
+            payload["pendingMessages"] = serde_json::json!(pending_messages);
+            Some(StablePluginEvent::data(
+                EventTag::TurnEndPayload,
+                StbString::from_string(payload.to_string()),
+            ))
+        }
+
         // No-payload events.
-        AgentEvent::AgentStart
-        | AgentEvent::TurnStart
-        | AgentEvent::AgentEnd { .. }
-        | AgentEvent::TurnEnd { .. } => Some(StablePluginEvent::empty(tag)),
+        AgentEvent::AgentStart | AgentEvent::TurnStart | AgentEvent::AgentEnd { .. } => {
+            Some(StablePluginEvent::empty(tag))
+        }
 
         AgentEvent::RetryScheduled { .. } => None,
     }
@@ -264,27 +351,6 @@ fn agent_tool_result_to_json(result: &rpi_agent::types::AgentToolResult) -> Stri
     txt
 }
 
-/// Free every `StbString` owned by a dispatched [[`StablePluginEvent`]] via the
-/// host's `free_string`. Called after dispatch completes (the handler SHOULD
-/// have freed them, but the host keeps ownership-of-cleanup so a buggy plugin
-/// that retains/leaks can't double-free the host's allocation — the host never
-/// trusts the plugin to free, per the SDK's "receiver owns" contract: here the
-/// host is the producer → receiver is the plugin; if the plugin failed to free,
-/// the host's free is a leak fix, not a double-free, because `StbString` is
-/// `Copy` and the host's `host_free_string` reconstructs the `Box<[u8]>` and
-/// drops it — a second free of the same bytes would be UB, so this must run
-/// EXACTLY ONCE per event. The contract is: the plugin frees what it receives.
-/// To honor that, we do NOT free here; the plugin owns the free. This fn is
-/// therefore a no-op kept for documentation + future audit).
-///
-/// **In practice:** the plugin handler is contractually required to free every
-/// `StbString` it receives via the host `free_string`. The host does not
-/// double-free. If a plugin leaks, that is a plugin bug.
-#[allow(dead_code)]
-fn free_event_strings(_event: &StablePluginEvent) {
-    // intentionally empty — see doc comment.
-}
-
 // ===========================================================================
 // ExtensionEmitter — AgentEmitter impl fanning out to plugin handlers
 // ===========================================================================
@@ -302,17 +368,15 @@ fn free_event_strings(_event: &StablePluginEvent) {
 /// Dispatch is `catch_unwind`-wrapped: a panicking plugin handler is logged and
 /// skipped (abort-on-unwind policy would be too aggressive for event dispatch
 /// where one bad handler shouldn't kill the session; we log + continue, unlike
-/// tool-partial dispatch which aborts because it cannot unwind across FFI from
-/// a blocking thread). The distinction: `emit` runs on the async runtime thread
-/// where `catch_unwind` can recover cleanly; the tool partial cb runs inside
-/// `spawn_blocking` cross-FFI where recovery is unsafe.
+/// tool-partial dispatch which aborts because it cannot unwind across FFI).
+/// Awaited observers run on blocking workers: a synchronous plugin callback may
+/// wait for a host action that needs another tool future in the same batch.
 pub struct ExtensionEmitter {
     snapshot: Arc<RegistrySnapshot>,
     /// Keeps the loaded cdylibs mapped for as long as this emitter (installed
     /// into `AgentHarnessOptions.agent_emitter`) may dispatch to handler fn
     /// pointers that live inside them. Cloned from the load session; the
     /// libraries unload only when every holder (adapter + emitter) drops.
-    #[allow(dead_code)]
     keepalive: Arc<crate::PluginKeepalive>,
 }
 
@@ -330,6 +394,35 @@ impl ExtensionEmitter {
     /// is `catch_unwind`-wrapped; errors (nonzero return) are logged but do not
     /// abort the fan-out (one handler's failure doesn't block the others — mir-
     /// rors pi's per-handler try/catch).
+    fn dispatch_agent(&self, event: &AgentEvent) {
+        if !crate::registry::assert_active(self.snapshot.active_flag()) {
+            return;
+        }
+        let Some(tag) = event_tag_for(event) else {
+            return;
+        };
+        // TurnEnd has two independent subscriptions. Preserve the payload-free
+        // lifecycle event even when nobody subscribes to the new payload tag,
+        // and avoid allocating payload strings for empty/stale registries.
+        if matches!(event, AgentEvent::TurnEnd { .. }) {
+            if !self.snapshot.handlers_for(EventTag::TurnEnd).is_empty() {
+                self.dispatch(&StablePluginEvent::empty(EventTag::TurnEnd));
+            }
+            if self
+                .snapshot
+                .handlers_for(EventTag::TurnEndPayload)
+                .is_empty()
+            {
+                return;
+            }
+        } else if self.snapshot.handlers_for(tag).is_empty() {
+            return;
+        }
+        if let Some(stable) = translate(event) {
+            self.dispatch(&stable);
+        }
+    }
+
     fn dispatch(&self, event: &StablePluginEvent) {
         dispatch_to_handlers(&self.snapshot, event);
     }
@@ -340,15 +433,20 @@ impl ExtensionEmitter {
 /// dispatcher ([`crate::provider_hooks`]). Handlers MUST NOT free the event
 /// strings; the host frees exactly once after the fan-out.
 pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEvent) {
+    // Install cleanup before every early return, including stale snapshots.
+    struct Cleanup<'a>(&'a StablePluginEvent);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            free_dispatched_event(self.0);
+        }
+    }
+    let _cleanup = Cleanup(event);
     // Staleness guard: a stale registry (swapped-out session) does nothing.
     if !crate::registry::assert_active(snapshot.active_flag()) {
         return;
     }
     let handlers = snapshot.handlers_for(event.tag);
     if handlers.is_empty() {
-        // No subscribers — and critically, the event's StbStrings are owned
-        // by the host and must still be freed (no handler ran to free them).
-        free_dispatched_event(event);
         return;
     }
     for h in handlers {
@@ -412,8 +510,6 @@ pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEve
             }
         }
     }
-    // Host frees the event's strings exactly once after the fan-out.
-    free_dispatched_event(event);
 }
 
 /// Build + dispatch a generic `data` event (JSON payload) to the tag's
@@ -829,19 +925,64 @@ pub async fn dispatch_lifecycle_event(
 
 impl AgentEmitter for ExtensionEmitter {
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
-        // Translate + dispatch synchronously (the emitter's emit is awaited by
-        // the loop in event order; dispatch is non-blocking fn-pointer calls).
-        // If the event maps to no tag, do nothing.
-        if let Some(stable) = translate(&event) {
-            self.dispatch(&stable);
+        let subscribed = match event_tag_for(&event) {
+            Some(EventTag::TurnEnd) => {
+                !self.snapshot.handlers_for(EventTag::TurnEnd).is_empty()
+                    || !self
+                        .snapshot
+                        .handlers_for(EventTag::TurnEndPayload)
+                        .is_empty()
+            }
+            Some(tag) => !self.snapshot.handlers_for(tag).is_empty(),
+            None => false,
+        };
+        if !crate::registry::assert_active(self.snapshot.active_flag()) || !subscribed {
+            return Box::pin(async {});
         }
-        Box::pin(async {})
+        let snapshot = Arc::clone(&self.snapshot);
+        let keepalive = Arc::clone(&self.keepalive);
+        Box::pin(async move {
+            // Awaiting preserves event ordering while the parallel batch keeps
+            // polling its owned tool futures. block_in_place inside a callback
+            // only releases a Tokio worker; it cannot poll those sibling futures.
+            // The closure owns its libraries even if its caller is cancelled.
+            let background = rpi_agent::tool_execution_scope::track_background_tool();
+            let result = tokio::task::spawn_blocking(move || {
+                let _background = background;
+                let emitter = ExtensionEmitter {
+                    snapshot,
+                    keepalive,
+                };
+                #[cfg(test)]
+                let before = (
+                    TRANSLATED_EVENTS.with(|count| count.get()),
+                    FREED_EVENTS.with(|count| count.get()),
+                );
+                emitter.dispatch_agent(&event);
+                // Test-only accounting follows the awaited dispatch across the
+                // blocking boundary without making counters global to tests.
+                #[cfg(test)]
+                {
+                    (
+                        TRANSLATED_EVENTS.with(|count| count.get()) - before.0,
+                        FREED_EVENTS.with(|count| count.get()) - before.1,
+                    )
+                }
+            })
+            .await;
+            #[cfg(test)]
+            if let Ok((translated, freed)) = &result {
+                TRANSLATED_EVENTS.with(|count| count.set(count.get() + translated));
+                FREED_EVENTS.with(|count| count.set(count.get() + freed));
+            }
+            if let Err(error) = result {
+                tracing::error!(%error, "extension observer task failed");
+            }
+        })
     }
 
     fn try_emit(&self, event: AgentEvent) {
-        if let Some(stable) = translate(&event) {
-            self.dispatch(&stable);
-        }
+        self.dispatch_agent(&event);
     }
 }
 
@@ -878,12 +1019,32 @@ impl TeeEmitter {
 }
 
 impl AgentEmitter for TeeEmitter {
+    fn tool_program_observer(
+        &self,
+    ) -> Option<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>> {
+        let mut owner = None;
+        for emitter in &self.emitters {
+            if let Some(candidate) = emitter.tool_program_observer() {
+                if let Some(selected) = &owner {
+                    if !Arc::ptr_eq(selected, &candidate) {
+                        // Observation is single-owner, unlike ordinary event
+                        // fan-out. Never silently drop it or choose authority
+                        // by registration order. Refuse before child effects.
+                        return Some(Arc::new(AmbiguousToolProgramObservers));
+                    }
+                } else {
+                    owner = Some(candidate);
+                }
+            }
+        }
+        owner
+    }
+
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         // We can't hold `&self` across an await boundary into a 'static future
         // cheaply here without cloning the Arcs — so clone them and drive the
-        // fan-out inside a pinned async block. Each child's emit returns a
-        // no-op future (both BroadcastEmitter and ExtensionEmitter complete
-        // synchronously), so this is effectively a synchronous loop in practice.
+        // fan-out inside a pinned async block. Await each child so asynchronous
+        // extension observers retain the same order as the host broadcast.
         let emitters = self.emitters.clone();
         Box::pin(async move {
             for e in &emitters {
@@ -899,10 +1060,27 @@ impl AgentEmitter for TeeEmitter {
     }
 }
 
+struct AmbiguousToolProgramObservers;
+impl rpi_agent::tool_program_observation::ToolProgramObserver for AmbiguousToolProgramObservers {
+    fn begin<'a>(
+        &'a self,
+        _child: rpi_agent::tool_program_observation::ToolProgramChild,
+        _arguments: &'a serde_json::Value,
+        _signal: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<
+        'a,
+        Result<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObservation>, String>,
+    > {
+        Box::pin(async { Err("multiple distinct ToolProgram observers are not supported".into()) })
+    }
+}
+
 /// Free every owning `StbString` in a dispatched event exactly once via the
 /// host's `free_string`. Called by [`ExtensionEmitter::dispatch`] after the
 /// fan-out completes. Handlers MUST NOT free event strings (host owns cleanup).
 fn free_dispatched_event(event: &StablePluginEvent) {
+    #[cfg(test)]
+    FREED_EVENTS.with(|count| count.set(count.get() + 1));
     use rpi_plugin_sdk::EventTag as T;
     match event.tag {
         T::MessageStart | T::MessageUpdate | T::MessageEnd => {
@@ -944,8 +1122,9 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::AgentEnd
         | T::AgentSettled
         | T::TurnStart
+        // Lifecycle only: the `turn_end` payload rides under
+        // `TurnEndPayload`, so this tag owns no allocation.
         | T::TurnEnd
-        | T::ModelSelect
         | T::ThinkingLevelSelect
         | T::UserBash
         | T::BeforeTuiStart
@@ -959,8 +1138,13 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         T::BeforeProviderRequest
         | T::BeforeProviderHeaders
         | T::AfterProviderResponse
+        | T::ModelSelect
         | T::Input
-        | T::EditorChange => {
+        | T::EditorChange
+        // `turn_end` carries `{outcome, stopReason, toolResultCount,
+        // pendingMessages}` as an owning `data` allocation under its own tag.
+        // Leaving it in the no-payload arm leaked one allocation per event.
+        | T::TurnEndPayload => {
             // SAFETY: these tags are only ever constructed as data payloads.
             unsafe { host_free_string(event.payload.data.data) };
         }
@@ -991,6 +1175,135 @@ mod tests {
     // before the test returns — no handler outlives the test.
     static HANDLER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// `turn_end` must carry `pendingMessages`, and it must be the queue depth
+    /// **after** the turn settled.
+    ///
+    /// This is the only data source for a remote UI's "N queued" indicator: the
+    /// drain hooks consume the queue, so the count has to come from the
+    /// A handler registered for the lifecycle `turn_end` tag must still run.
+    ///
+    /// Regression: routing the payload under its own tag replaced the lifecycle
+    /// event instead of accompanying it, so every existing `turn_end` subscriber
+    /// received nothing (observed 0 calls where 1 is expected).
+    #[test]
+    fn legacy_turn_end_subscribers_still_receive_the_lifecycle_event() {
+        static TURN_END_CALLS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn count_turn_end(
+            _ev: rpi_plugin_sdk::StablePluginEvent,
+            _ud: *mut std::ffi::c_void,
+        ) -> i32 {
+            TURN_END_CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "legacy".to_string(),
+            EventTag::TurnEnd,
+            count_turn_end,
+            std::ptr::null_mut(),
+        );
+        let snapshot = reg.snapshot();
+
+        let event = AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::types::Api::AnthropicMessages,
+                    "p",
+                    "m",
+                    0,
+                ),
+            )),
+            tool_results: vec![],
+            pending_messages: 0,
+        };
+        TURN_END_CALLS.store(0, Ordering::SeqCst);
+        for stable in translate_all(&event) {
+            dispatch_to_handlers(&snapshot, &stable);
+        }
+        assert_eq!(
+            TURN_END_CALLS.load(Ordering::SeqCst),
+            1,
+            "a legacy `turn_end` subscriber must still be called exactly once"
+        );
+    }
+
+    /// The `turn_end` payload tag owns an allocation, so it must be freed on
+    /// every dispatch path — including zero subscribers, where no handler runs.
+    ///
+    /// A leak here is invisible without accounting, so this asserts the arm the
+    /// cleanup takes rather than pretending to measure the allocator.
+    #[test]
+    fn turn_end_payload_is_freed_on_the_zero_subscriber_path() {
+        let event = StablePluginEvent::data(
+            EventTag::TurnEndPayload,
+            StbString::from_string(r#"{"pendingMessages":2}"#.to_string()),
+        );
+        // Reading it back first proves the payload is live and owning.
+        let view = unsafe { rpi_plugin_sdk::events::EventView::from_raw(&event) };
+        assert_eq!(
+            view.data_text().as_deref(),
+            Some(r#"{"pendingMessages":2}"#)
+        );
+        // The empty registry takes the `handlers.is_empty()` branch, which must
+        // free the allocation instead of leaving it to a handler that never runs.
+        let snapshot = crate::registry::ExtensionRegistry::new().snapshot();
+        dispatch_to_handlers(&snapshot, &event);
+    }
+
+    /// The lifecycle `turn_end` tag owns nothing now that the payload moved to
+    /// its own tag, so freeing it must be a no-op rather than a stray free.
+    #[test]
+    fn turn_end_lifecycle_event_owns_no_payload() {
+        let event = StablePluginEvent::empty(EventTag::TurnEnd);
+        let view = unsafe { rpi_plugin_sdk::events::EventView::from_raw(&event) };
+        assert_eq!(view.data_text(), None);
+        let snapshot = crate::registry::ExtensionRegistry::new().snapshot();
+        dispatch_to_handlers(&snapshot, &event);
+    }
+
+    /// read-only `pending_message_count` hook.
+    #[test]
+    fn turn_end_carries_pending_message_count() {
+        let assistant = AgentMessage::Assistant(Box::new(AssistantMessage {
+            role: rpi_ai::types::AssistantRole,
+            content: vec![rpi_ai::types::Content::text("hi")],
+            api: rpi_ai::types::Api::AnthropicMessages,
+            provider: "anthropic".to_string(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::zero(),
+            stop_reason: rpi_ai::types::StopReason::Stop,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        }));
+        let event = AgentEvent::TurnEnd {
+            message: assistant,
+            tool_results: vec![],
+            pending_messages: 3,
+        };
+        let translated = translate(&event).expect("turn_end maps to a tag");
+        // The payload rides under its own tag so an old host — which only sends
+        // the payload-free `TurnEnd` — can never be read through the union.
+        assert_eq!(translated.tag, EventTag::TurnEndPayload);
+        // SAFETY: `TurnEndPayload` carries the `data` variant; discriminating by
+        // tag is the documented contract for this union.
+        let payload = unsafe { translated.payload.data.data.to_string_lossy() };
+        assert!(
+            !payload.is_empty(),
+            "turn_end must carry a payload (an older host sent none)"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(parsed["pendingMessages"], 3, "{payload}");
+        assert_eq!(parsed["outcome"], "stop", "{payload}");
+        assert_eq!(parsed["toolResultCount"], 0, "{payload}");
+    }
+
     #[test]
     fn all_ten_agent_events_map_to_a_tag() {
         let am = AgentMessage::Assistant(Box::new(AssistantMessage {
@@ -1016,11 +1329,14 @@ mod tests {
             AgentEvent::TurnEnd {
                 message: am.clone(),
                 tool_results: vec![],
+                pending_messages: 0,
             },
             AgentEvent::MessageStart {
+                message_id: None,
                 message: am.clone(),
             },
             AgentEvent::MessageUpdate {
+                message_id: None,
                 // `MessageUpdate` carries the shared partial snapshot, so build
                 // the same `Arc` the provider would have handed over.
                 message: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
@@ -1028,7 +1344,10 @@ mod tests {
                     partial: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
                 },
             },
-            AgentEvent::MessageEnd { message: am },
+            AgentEvent::MessageEnd {
+                message_id: None,
+                message: am,
+            },
             AgentEvent::ToolExecutionStart {
                 tool_call_id: "c1".into(),
                 tool_name: "echo".into(),
@@ -1090,6 +1409,7 @@ mod tests {
         });
         let translate_delta = |delta: &str| {
             let event = AgentEvent::MessageUpdate {
+                message_id: None,
                 message: Arc::clone(&partial),
                 assistant_message_event: AssistantMessageEvent::TextDelta {
                     content_index: 0,
@@ -1131,7 +1451,10 @@ mod tests {
             end_turn: None,
             timestamp: 0,
         }));
-        let ev = AgentEvent::MessageEnd { message: am };
+        let ev = AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        };
         let stable = translate(&ev).expect("maps");
         assert_eq!(stable.tag, EventTag::MessageEnd);
         // free the payload string (host owns cleanup).
@@ -1146,6 +1469,107 @@ mod tests {
     extern "C" fn counting_handler(_ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
         HANDLER_HITS.fetch_add(1, Ordering::SeqCst);
         0
+    }
+
+    struct WaitingObserver {
+        released: Mutex<bool>,
+        ready: std::sync::Condvar,
+        entered: tokio::sync::Notify,
+        completed: std::sync::atomic::AtomicBool,
+    }
+
+    extern "C" fn waiting_observer(_ev: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
+        // The test owns this allocation until the awaited callback returns.
+        let state = unsafe { &*data.cast::<WaitingObserver>() };
+        state.entered.notify_one();
+        let (released, _) = state
+            .ready
+            .wait_timeout_while(
+                state.released.lock().unwrap(),
+                std::time::Duration::from_secs(5),
+                |released| !*released,
+            )
+            .unwrap();
+        state.completed.store(*released, Ordering::SeqCst);
+        0
+    }
+
+    #[tokio::test]
+    async fn awaited_observer_allows_sibling_futures_to_progress() {
+        let state = Box::new(WaitingObserver {
+            released: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut registry = crate::registry::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "waiting-observer".into(),
+            EventTag::ToolExecutionStart,
+            waiting_observer,
+            (&*state as *const WaitingObserver).cast_mut().cast(),
+        );
+        let emitter = ExtensionEmitter::new(
+            Arc::new(registry.snapshot()),
+            crate::loader::PluginKeepalive::empty(),
+        );
+        // Model a plugin waiting for a host action that needs a sibling tool
+        // future owned by this same parent task. A synchronous emit blocks
+        // before join can ever poll that sibling; the finite callback timeout
+        // makes that regression fail instead of hanging the test process.
+        let dispatch = emitter.emit(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call".into(),
+            tool_name: "read".into(),
+            args: serde_json::json!({}),
+        });
+        tokio::join!(dispatch, async {
+            *state.released.lock().unwrap() = true;
+            state.ready.notify_one();
+        });
+        assert!(
+            state.completed.load(Ordering::SeqCst),
+            "observer blocked the sibling future it depended on"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_observer_retains_background_scope_until_callback_finishes() {
+        let state = Box::new(WaitingObserver {
+            released: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut registry = crate::registry::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "waiting-observer".into(),
+            EventTag::AgentStart,
+            waiting_observer,
+            (&*state as *const WaitingObserver).cast_mut().cast(),
+        );
+        let emitter = ExtensionEmitter::new(
+            Arc::new(registry.snapshot()),
+            crate::loader::PluginKeepalive::empty(),
+        );
+        let scope = Arc::new(rpi_agent::tool_execution_scope::ToolExecutionScope::default());
+        let task_scope = Arc::clone(&scope);
+        let dispatch = emitter.emit(AgentEvent::AgentStart);
+        let task = tokio::spawn(async move { task_scope.run(dispatch).await });
+        state.entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut idle = Box::pin(scope.wait_idle());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut idle)
+                .await
+                .is_err()
+        );
+        *state.released.lock().unwrap() = true;
+        state.ready.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), idle)
+            .await
+            .unwrap();
+        assert!(state.completed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1179,7 +1603,10 @@ mod tests {
             timestamp: 0,
         }));
         // Use try_emit (sync) — no runtime needed.
-        emitter.try_emit(AgentEvent::MessageEnd { message: am });
+        emitter.try_emit(AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        });
         assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 1);
 
         // Stale registry → no dispatch.
@@ -1200,7 +1627,10 @@ mod tests {
             end_turn: None,
             timestamp: 0,
         }));
-        emitter.try_emit(AgentEvent::MessageEnd { message: am2 });
+        emitter.try_emit(AgentEvent::MessageEnd {
+            message_id: None,
+            message: am2,
+        });
         assert_eq!(
             HANDLER_HITS.load(Ordering::SeqCst),
             1,
@@ -1209,6 +1639,108 @@ mod tests {
     }
 
     // --- TeeEmitter: fan-out to both the broadcast + the extension emitter ----
+
+    struct ObservationOwner {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl rpi_agent::tool_program_observation::ToolProgramObserver for ObservationOwner {
+        fn begin<'a>(
+            &'a self,
+            _child: rpi_agent::tool_program_observation::ToolProgramChild,
+            _arguments: &'a serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+        ) -> BoxFuture<
+            'a,
+            Result<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObservation>, String>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("reached genuine owner".into()) })
+        }
+    }
+    struct ObservedEmitter(Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>);
+    impl AgentEmitter for ObservedEmitter {
+        fn tool_program_observer(
+            &self,
+        ) -> Option<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>> {
+            Some(self.0.clone())
+        }
+        fn emit(&self, _event: AgentEvent) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+    fn observation_child() -> rpi_agent::tool_program_observation::ToolProgramChild {
+        rpi_agent::tool_program_observation::ToolProgramChild {
+            root_id: "root".into(),
+            root_name: "program".into(),
+            parent_id: "root".into(),
+            request_id: "tp-original".into(),
+            name: "effect".into(),
+            ordinal: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn tee_emitter_preserves_single_nested_and_shared_observer_authority() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner: Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver> =
+            Arc::new(ObservationOwner {
+                calls: calls.clone(),
+            });
+        let observed: Arc<dyn AgentEmitter> = Arc::new(ObservedEmitter(owner.clone()));
+        let nested = TeeEmitter::new(vec![observed.clone()]);
+        let tee = TeeEmitter::new(vec![
+            Arc::new(rpi_agent::CollectorEmitter::default()),
+            Arc::new(nested),
+            observed,
+        ]);
+        let forwarded = tee.tool_program_observer().unwrap();
+        assert!(Arc::ptr_eq(&owner, &forwarded));
+        let error = forwarded
+            .begin(
+                observation_child(),
+                &serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "reached genuine owner");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(TeeEmitter::new(vec![]).tool_program_observer().is_none());
+        assert!(
+            TeeEmitter::new(vec![Arc::new(rpi_agent::CollectorEmitter::default())])
+                .tool_program_observer()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_emitter_refuses_distinct_observers_before_either_begin() {
+        let first = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tee = TeeEmitter::new(vec![
+            Arc::new(ObservedEmitter(Arc::new(ObservationOwner {
+                calls: first.clone(),
+            }))),
+            Arc::new(ObservedEmitter(Arc::new(ObservationOwner {
+                calls: second.clone(),
+            }))),
+        ]);
+        let error = tee
+            .tool_program_observer()
+            .unwrap()
+            .begin(
+                observation_child(),
+                &serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("multiple distinct"));
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn tee_emitter_fans_out_to_every_child() {
@@ -1253,7 +1785,11 @@ mod tests {
         }));
         // Broadcast path: both collectors receive the event, and the extension
         // emitter dispatches to the one registered handler.
-        tee.emit(AgentEvent::MessageEnd { message: am }).await;
+        tee.emit(AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        })
+        .await;
         assert_eq!(
             events_a.lock().unwrap().len(),
             1,
@@ -1281,36 +1817,47 @@ mod tests {
         let _guard = HANDLER_TEST_LOCK.lock().unwrap();
         HANDLER_HITS.store(0, Ordering::SeqCst);
         let mut reg = crate::registry::ExtensionRegistry::new();
-        reg.register_event_handler(
-            "test-plugin".to_string(),
+        let lifecycle_tags = [
             EventTag::SessionStart,
-            counting_handler,
-            std::ptr::null_mut(),
-        );
-        reg.register_event_handler(
-            "test-plugin".to_string(),
+            EventTag::SessionBeforeSwitch,
+            EventTag::SessionBeforeFork,
+            EventTag::SessionBeforeCompact,
+            EventTag::SessionCompact,
+            EventTag::SessionBeforeTree,
+            EventTag::SessionTree,
             EventTag::BeforeTuiStart,
-            counting_handler,
-            std::ptr::null_mut(),
-        );
+        ];
+        for tag in lifecycle_tags {
+            reg.register_event_handler(
+                "test-plugin".to_string(),
+                tag,
+                counting_handler,
+                std::ptr::null_mut(),
+            );
+        }
         let snap = Arc::new(reg.snapshot());
 
         // No subscriber for SessionShutdown → no handler invoked.
         assert!(!dispatch_empty_event(&snap, EventTag::SessionShutdown));
         assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 0);
 
-        // SessionStart + BeforeTuiStart both have one subscriber each.
-        assert!(dispatch_empty_event(&snap, EventTag::SessionStart));
-        assert!(dispatch_empty_event(&snap, EventTag::BeforeTuiStart));
-        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 2);
+        // Every payload-free session lifecycle tag is dispatched to its subscriber.
+        for tag in lifecycle_tags {
+            assert!(dispatch_empty_event(&snap, tag));
+        }
+        assert_eq!(
+            HANDLER_HITS.load(Ordering::SeqCst),
+            lifecycle_tags.len(),
+            "all subscribed lifecycle tags fire exactly once"
+        );
 
         // Stale registry (session swapped): dispatch is a silent no-op inside
         // `dispatch_to_handlers` — no handler is invoked — though the fn still
         // reports subscribers existed (matches `dispatch_data_event` semantics).
         reg.invalidate();
         assert!(dispatch_empty_event(&snap, EventTag::SessionStart));
-        assert!(dispatch_empty_event(&snap, EventTag::BeforeTuiStart));
-        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 2);
+        assert!(dispatch_empty_event(&snap, EventTag::SessionTree));
+        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), lifecycle_tags.len());
     }
 
     // --- dispatch_lifecycle_event: veto + timeout (P1) ---

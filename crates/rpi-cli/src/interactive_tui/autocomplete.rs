@@ -1,10 +1,63 @@
 //! Completion suggestions and editor cursor operations.
 
+use std::any::Any;
+
 use super::*;
+use rpi_tui::truncate_to_width;
 
 // ===========================================================================
 // Autocomplete
 // ===========================================================================
+
+/// Install one command-discovery snapshot at startup and after successful
+/// resource reloads. Skills expand in the harness's normal input path, not in
+/// slash dispatch, so images and queued messages keep their ordinary behavior.
+#[allow(dead_code)]
+pub(super) fn configure_resource_autocomplete(
+    autocomplete: &AutocompleteManager,
+    mut commands: Vec<SlashCommandEntry>,
+    resources: &rpi_harness::types::AgentHarnessResources,
+    cwd: &std::path::Path,
+    enable_skill_commands: bool,
+) {
+    let resources = crate::resource_commands::resource_command_entries(resources);
+    // Builtins/extensions are already in dispatch order. Deduplicate first-wins,
+    // then reserve hidden builtins and aliases against resource commands too.
+    let mut seen = std::collections::BTreeSet::new();
+    commands.retain(|command| seen.insert(command.name.clone()));
+    seen.extend(super::builtin_reserved_names(false));
+    let skills = if enable_skill_commands {
+        resources.skills
+    } else {
+        Vec::new()
+    };
+    for (name, description) in resources.templates.into_iter().chain(skills) {
+        let name = if name.starts_with('/') {
+            name
+        } else {
+            format!("/{name}")
+        };
+        if seen.insert(name.clone()) {
+            commands.push(SlashCommandEntry { name, description });
+        }
+    }
+    let mut combined = CombinedAutocompleteProvider::new();
+    combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(commands)));
+    combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+        cwd.to_path_buf(),
+    )));
+    autocomplete.set_provider(Arc::new(combined));
+}
+
+#[allow(dead_code)]
+pub(super) fn skill_commands_enabled(
+    global: &crate::settings::Settings,
+    project: &[crate::settings::Settings],
+) -> bool {
+    preferred_project_setting(project, |s| s.enable_skill_commands)
+        .or(global.enable_skill_commands)
+        .unwrap_or(true)
+}
 
 /// Refresh the autocomplete suggestion list from the current editor text +
 /// cursor. Renders the suggestions into `autocomplete_container` (above the
@@ -89,21 +142,43 @@ fn selection_is_explicit(state: &Arc<TuiState>, sugg: &AutocompleteSuggestions) 
 }
 
 /// Render (or clear) the autocomplete suggestion list into the container.
+///
+/// The popup reuses its row components in place: each render relabels the
+/// existing [`PopupRow`] children instead of `clear()` + rebuild, and the row
+/// count never shrinks while the popup stays open. The dock stacks this
+/// container as an auto-height entry, so its height is
+/// `container.render(width).len()`: a row count that follows the candidate
+/// count (`/clear` backspaced: 1 → 2 → 5 → 0) reflows the whole transcript on
+/// every keystroke — the panel flicker this module exists to avoid. Growing is
+/// allowed (a taller popup must show its rows); shrinking is padded with blank
+/// rows until the popup closes, and closing empties the container so the
+/// transcript reclaims the rows.
+///
+/// The pad rows stand ABOVE the live candidates, not below them: the dock
+/// places this container directly on top of the editor, so a pad tail would
+/// push the rows the user reads away from the input they belong to — the
+/// highlighted first choice would sit at the popup's top edge and stay there
+/// while the draft narrows, however close the panel once was. Blanking from
+/// the top keeps the candidates anchored to the editor's top border.
+///
+/// Keeping the row *count* flat is not enough on its own: a row rendered by
+/// `Text` word-wraps, so a long candidate costs two screen lines while the
+/// blank pad that replaces it costs one, and the popup still contracts behind
+/// a flat child count. Rows are therefore [`PopupRow`]s, which truncate to the
+/// render width and always emit exactly one line — one candidate is one
+/// screen row at every width.
+///
+/// The selection index and the explicit-selection stamp are retired exactly
+/// when candidates are gone, so ↑/↓ and Enter semantics do not outlive the
+/// popup even though its blank pad rows do.
 pub(super) fn render_autocomplete(
     state: &Arc<TuiState>,
     suggestions: Option<AutocompleteSuggestions>,
 ) {
-    state.autocomplete_container.clear();
-    let Some(sugg) = suggestions else {
-        *state.autocomplete_selection.lock().unwrap() = 0;
-        stamp_selection_for(state, None);
+    let Some(sugg) = suggestions.filter(|sugg| !sugg.items.is_empty()) else {
+        close_autocomplete_popup(state);
         return;
     };
-    if sugg.items.is_empty() {
-        *state.autocomplete_selection.lock().unwrap() = 0;
-        stamp_selection_for(state, None);
-        return;
-    }
     // Clamp the highlight to the full candidate list, then compute the visible
     // window (with a scroll offset) so ↓ can reach items past `max_visible`.
     let max_visible = state.autocomplete_max_visible;
@@ -131,31 +206,143 @@ pub(super) fn render_autocomplete(
     // Cap the list so the dock doesn't swallow the transcript.
     let accent = state.theme_manager.get().colors.accent;
     let muted = state.theme_manager.get().colors.muted;
-    for (i, item) in sugg
-        .items
+    let rows = (window_start..window_end)
+        .map(|i| {
+            let item = &sugg.items[i];
+            let prefix = if i == selection { "→ " } else { "  " };
+            let label = item.display_text();
+            if i == selection {
+                format!(
+                    "{prefix}{} {}",
+                    accent.fg(label),
+                    muted.fg(item.description.as_deref().unwrap_or(""))
+                )
+            } else {
+                format!(
+                    "{prefix}{} {}",
+                    muted.fg(label),
+                    muted.fg(item.description.as_deref().unwrap_or(""))
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    render_popup_rows(state, rows);
+}
+
+/// Close the popup: retire the navigation state and empty the container so
+/// the dock reclaims its rows immediately. Also the resting state after
+/// `apply_suggestion` and the selector/extension swaps.
+fn close_autocomplete_popup(state: &Arc<TuiState>) {
+    *state.autocomplete_selection.lock().unwrap() = 0;
+    stamp_selection_for(state, None);
+    state.autocomplete_container.clear();
+}
+
+/// Write `rows` into the popup container, relabeling its `Text` children in
+/// place and never shrinking the row count: rows that left the candidate
+/// window are blanked, not removed, so the dock keeps the height the popup
+/// already had while candidates shrink. The blanks are taken from the TOP of
+/// the container — the dock stacks it directly above the editor, so filling
+/// from the top would push the candidates up, away from the input line, and
+/// park the first choice at the popup's top edge however few rows remain.
+/// Only a close (`close_autocomplete_popup`) or an outside owner
+/// (selector/extension swaps clear the container) resets the row set.
+fn render_popup_rows(state: &Arc<TuiState>, rows: Vec<String>) {
+    let children = state.autocomplete_container.get_children();
+    if children
         .iter()
-        .enumerate()
-        .skip(window_start)
-        .take(window_end - window_start)
+        .any(|child| child.as_any().downcast_ref::<PopupRow>().is_none())
     {
-        let prefix = if i == selection { "→ " } else { "  " };
-        let label = item.display_text();
-        let line = if i == selection {
-            format!(
-                "{prefix}{} {}",
-                accent.fg(label),
-                muted.fg(item.description.as_deref().unwrap_or(""))
-            )
+        // The container only ever holds the rows this module created; a
+        // foreign child or an external reset re-binds it to the popup.
+        state.autocomplete_container.clear();
+        return render_popup_rows(state, rows);
+    }
+    let pad = children.len().saturating_sub(rows.len());
+    for (index, child) in children.iter().enumerate() {
+        let popup_row = child
+            .as_any()
+            .downcast_ref::<PopupRow>()
+            .expect("checked above");
+        let line = if index < pad {
+            String::new()
         } else {
-            format!(
-                "{prefix}{} {}",
-                muted.fg(label),
-                muted.fg(item.description.as_deref().unwrap_or(""))
-            )
+            rows[index - pad].clone()
         };
+        popup_row.set_line(line);
+    }
+    for row in rows.iter().skip(children.len()) {
         state
             .autocomplete_container
-            .add_child(Arc::new(Text::new(line, 1, 0)));
+            .add_child(Arc::new(PopupRow::new(row.clone())));
+    }
+}
+
+/// One autocomplete candidate, always exactly one screen line.
+///
+/// The dock allocates the popup's height from `render(width).len()`, so a row
+/// that word-wraps costs two lines and makes the popup — and with it the
+/// transcript viewport above it — contract as soon as that candidate leaves the
+/// window. Unlike `Text` (whose wrapping is the point) this row truncates to the
+/// render width with an ANSI-safe helper that keeps the SGR state of the kept
+/// columns, so a wide terminal shows the whole candidate and a narrow one shows
+/// a clipped prefix instead of a second line.
+///
+/// The line is stored as a raw string and truncated per width on render; the
+/// popup re-renders on every keystroke, and `truncate_to_width` is a single
+/// ANSI-aware pass, so no cache is needed to keep that cheap.
+pub(super) struct PopupRow {
+    line: Mutex<String>,
+}
+
+impl PopupRow {
+    pub(super) fn new(line: impl Into<String>) -> Self {
+        Self {
+            line: Mutex::new(line.into()),
+        }
+    }
+
+    pub(super) fn set_line(&self, line: impl Into<String>) {
+        *self.line.lock().unwrap() = line.into();
+    }
+
+    /// Collapse anything that would start a second line. A candidate label is
+    /// single-line by contract, but a provider is free to hand back text with a
+    /// newline in it (a file name, a description), and an embedded `\n` would
+    /// travel through `Container::render` as one string and still paint two
+    /// terminal rows — the same height leak this row exists to prevent.
+    fn single_line(line: &str) -> String {
+        if line.contains('\n') || line.contains('\r') {
+            line.replace(['\n', '\r'], " ")
+        } else {
+            line.to_string()
+        }
+    }
+}
+
+impl Component for PopupRow {
+    fn render(&self, width: usize) -> Vec<String> {
+        if width == 0 {
+            return vec![String::new()];
+        }
+        let line = Self::single_line(&self.line.lock().unwrap());
+        // `Text::new(line, 1, 0)` rendered with one column of left padding, so
+        // a row occupies the same left gutter as the label it replaces while
+        // the available text width shrinks by that column. The content column
+        // never drops below one: in a one-column viewport the gutter is what
+        // goes, not the character.
+        let content_width = width.saturating_sub(1).max(1);
+        let mut rendered = truncate_to_width(&line, content_width, "…");
+        if content_width < width {
+            rendered.insert(0, ' ');
+        }
+        vec![rendered]
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -178,24 +365,24 @@ pub(super) fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>)
     let start = sugg.start.min(text.len());
     let end = sugg.end.min(text.len());
     if sugg.is_path {
-        // The path provider returns a BASENAME (`report.txt`) but spans the
-        // whole path prefix, so applying its span drops the parent
-        // directories: Tab on `@/abs/nested/repo` produced `@report.txt`, a
-        // reference to a different file. Replace only the basename segment
-        // the caret sits in — the same span the Enter path uses — and keep
-        // the text as typed when the candidate does not complete that whole
-        // segment (no silent drop of what the user typed after the caret).
-        let (segment_start, segment_end) = path_segment_bounds(&text, start, cursor);
-        let completes_whole = state
-            .autocomplete
-            .get_suggestions(&text, segment_end)
+        // Path items now contain the complete display path, like native Pi.
+        // Replace the whole path token so recursive candidates such as
+        // `src/main.rs` do not get inserted into only the basename segment.
+        let (token_start, token_end) = path_token_bounds(&text, start, cursor);
+        let whole_suggestions = state.autocomplete.get_suggestions(&text, token_end);
+        let whole_suggestions = whole_suggestions.or_else(|| {
+            text.get(cursor..)
+                .filter(|rest| rest.starts_with('"'))
+                .and_then(|_| state.autocomplete.get_suggestions(&text, cursor))
+        });
+        let completes_whole = whole_suggestions
             .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text));
         if !completes_whole {
             return false;
         }
-        return apply_suggestion(state, editor, segment_start, segment_end, top);
+        return apply_suggestion(state, editor, token_start, token_end, top, false);
     }
-    apply_suggestion(state, editor, start, end, top)
+    apply_suggestion(state, editor, start, end, top, true)
 }
 
 /// Replace `text[start..end]` with `item`, keep the text after the span,
@@ -206,36 +393,55 @@ fn apply_suggestion(
     start: usize,
     end: usize,
     item: &AutocompleteItem,
+    allow_leading_space: bool,
 ) -> bool {
     let text = editor.get_text();
     // `start`/`end` are byte offsets on char boundaries, so the `text[..start]`
     // / `text[end..]` slices are sound for multibyte input.
     let start = start.min(text.len());
     let end = end.min(text.len());
-    let mut replaced = String::with_capacity(text.len() + item.text.len());
+    let mut replaced = String::with_capacity(text.len() + item.text.len() + 1);
     replaced.push_str(&text[..start]);
+    // Argument suggestions replace an empty span right after the command
+    // token (`/msg|` + Tab): the item itself carries `insert_space` for the
+    // trailing space, but the boundary between the command token and the
+    // inserted value also needs one, or `/msg` and `jixiuf@...` fuse.
+    if allow_leading_space
+        && start > 0
+        && item.insert_space
+        && !item.is_directory
+        && !text[..start].ends_with(char::is_whitespace)
+    {
+        replaced.push(' ');
+    }
     replaced.push_str(&item.text);
     // Keep the text AFTER the replaced span (mid-line completion: replacing
     // `[start, end)` must not drop the rest of the line).
     replaced.push_str(&text[end..]);
-    if item.insert_space && !replaced.ends_with('/') {
+    let add_space = item.insert_space && !item.is_directory;
+    if add_space {
         replaced.push(' ');
     }
+    // Quoted directory completions keep the closing quote after the caret so
+    // the next path segment is typed inside the quote, matching native Pi.
+    let inserted_cursor_len = if item.is_directory && item.text.ends_with('"') {
+        item.text.len() - 1
+    } else {
+        item.text.len()
+    };
     // New caret position: after the inserted text (byte offset; the editor
-    // snaps `set_cursor` to a char boundary as a safety net).
-    let new_cursor = replaced.len().min(
-        start
-            + item.text.len()
-            + if item.insert_space && !item.text.ends_with('/') {
-                1
-            } else {
-                0
-            },
-    );
+    // snaps `set_cursor` to a char boundary as a safety net). Include the
+    // optional separator before the item as well as the trailing separator.
+    let leading_space = allow_leading_space
+        && start > 0
+        && item.insert_space
+        && !item.is_directory
+        && !text[..start].ends_with(char::is_whitespace);
+    let new_cursor =
+        start + usize::from(leading_space) + inserted_cursor_len + usize::from(add_space);
     editor.set_text(&replaced);
     set_editor_cursor_offset(editor, &replaced, new_cursor);
-    state.autocomplete_container.clear();
-    *state.autocomplete_selection.lock().unwrap() = 0;
+    close_autocomplete_popup(state);
     true
 }
 
@@ -268,28 +474,42 @@ fn snap_to_char_boundary(text: &str, cursor: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// The byte range of the path segment (the basename) the caret sits in.
-///
-/// `token_start` is the byte just after the `@`; the range starts after the
-/// last `/` (or `\`) between there and the caret and ends at the next path
-/// separator or whitespace after it. Replacing the whole path prefix instead
-/// would drop the parent directories — the path provider returns a basename
-/// (`report.txt`), so `@/abs/nested/repo` would collapse to `@report.txt`,
-/// a reference to a different file.
-fn path_segment_bounds(text: &str, token_start: usize, cursor: usize) -> (usize, usize) {
+/// Return the complete path-token span around the caret. Unlike the previous
+/// basename-only implementation, this lets a candidate replace a full
+/// recursive path such as `src/main.rs` without duplicating its parent.
+fn path_token_bounds(text: &str, token_start: usize, cursor: usize) -> (usize, usize) {
     let cursor = snap_to_char_boundary(text, cursor);
     let token_start = token_start.min(cursor);
-    let before_caret = &text[token_start..cursor];
-    let start = before_caret
-        .rfind(['/', '\\'])
-        .map(|offset| token_start + offset + 1)
-        .unwrap_or(token_start);
-    let after_caret = &text[cursor..];
-    let end = after_caret
-        .find(|c: char| c == '/' || c == '\\' || c.is_whitespace())
+    let after_cursor = &text[cursor..];
+    let end = after_cursor
+        .find(|character: char| {
+            character.is_whitespace()
+                || character == '"'
+                || matches!(character, ')' | ']' | '}' | '>' | '`')
+                || matches!(
+                    character,
+                    '，' | '．'
+                        | '：'
+                        | '；'
+                        | '！'
+                        | '？'
+                        | '（'
+                        | '）'
+                        | '［'
+                        | '］'
+                        | '｛'
+                        | '｝'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '…'
+                        | '—'
+                )
+        })
         .map(|offset| cursor + offset)
         .unwrap_or(text.len());
-    (start, end)
+    (token_start, end)
 }
 
 /// What a bare Enter does while a completion popup is open. Mirrors the TS
@@ -328,17 +548,17 @@ pub(super) struct EnterCompletion {
     /// What the Enter key does.
     pub(super) action: EnterCompletionAction,
     /// The candidate to insert and the byte span it replaces.
-    pub(super) candidate: Option<(AutocompleteItem, usize, usize)>,
+    pub(super) candidate: Option<(AutocompleteItem, usize, usize, bool)>,
 }
 
 impl EnterCompletion {
     /// Write the resolved replacement into the editor. Returns `true` when a
     /// candidate was applied; a `Submit` decision carries none.
     pub(super) fn apply(&self, state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
-        let Some((item, start, end)) = self.candidate.as_ref() else {
+        let Some((item, start, end, allow_leading_space)) = self.candidate.as_ref() else {
             return false;
         };
-        apply_suggestion(state, editor, *start, *end, item)
+        apply_suggestion(state, editor, *start, *end, item, *allow_leading_space)
     }
 
     /// Whether the key loop consumes this Enter instead of forwarding it to
@@ -357,10 +577,18 @@ impl EnterCompletion {
 /// through to the editor unchanged, preserving the upstream behavior that an
 /// unknown `/skill:name` reaches the model untouched.
 ///
-/// Interception is armed only when the choice is unambiguous: the candidate
-/// list holds exactly one item, or the user has explicitly moved the
-/// highlight. A fresh ambiguous popup (several candidates, index 0) resolves
-/// to `Submit` — Enter sends what was typed, never a silently guessed row.
+/// A `/` popup is confirmed the way the panel presents it: Enter takes the
+/// HIGHLIGHTED row — index 0 on a fresh popup, which is the row the panel
+/// paints as the first choice — and then falls through to submit, exactly the
+/// row Tab (`accept_top_suggestion`) takes. Ambiguity is not a reason to
+/// refuse: a fuzzy provider answers every prefix of every command with
+/// several candidates, so requiring a sole candidate made most commands
+/// unreachable by Enter (`/cle` ⏎ sent `/cle` to the model instead of running
+/// `/clear`), while the panel had already shown which command row 0 is.
+///
+/// An `@`-path popup is different in one respect: taking a row CONSUMES the
+/// Enter instead of sending the prompt, so it still requires an unambiguous
+/// choice (one candidate, or an explicit ↑/↓) before Enter takes a row.
 pub(super) fn resolve_enter_completion(
     state: &Arc<TuiState>,
     editor: &Arc<Editor>,
@@ -374,12 +602,44 @@ pub(super) fn resolve_enter_completion(
         return None;
     }
     let start = popup.start.min(text.len());
-    // Same explicit-context rule as `navigate_autocomplete`: only the `/`
-    // token at input start or an `@`-file token counts as a popup the Enter
-    // key belongs to.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let is_argument_popup = !popup.is_path
+        && popup.start == command_end
+        && cursor > command_end
+        && text[..command_end].starts_with('/');
+    let explicit = if popup.is_path {
+        text[..start].ends_with('@') || text[..start].ends_with("@\"")
+    } else {
+        (popup.start == 0 && text.starts_with('/')) || is_argument_popup
+    };
     if !explicit {
         return None;
+    }
+    // The `/` completion context is the COMMAND token the user is typing. The
+    // provider answers for the whole text before the caret (`start` 0,
+    // `end` = caret), so with the caret in the ARGUMENTS (`/help me`) the
+    // replacement would run to the end of the line and swallow them: Enter on
+    // `/help me` must submit `/help me`, not `/help`.
+    //
+    // Extension ARGUMENT suggestions are the exception: their `start` equals
+    // the command token's end (the provider replaces only the argument span),
+    // and Enter there means "accept the highlighted target" — the guard below
+    // must not reject that popup.
+    let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let is_argument_popup =
+        !popup.is_path && popup.start == command_end && text[..command_end].starts_with('/');
+    if !popup.is_path && !is_argument_popup && cursor > command_end {
+        return None;
+    }
+    // An argument popup at the exact command boundary exists for Tab, but
+    // Enter at `/msg|` must still submit the command rather than silently
+    // choosing the first target. Argument completion becomes Enter-active
+    // only once the caret has entered the argument region.
+    if !popup.is_path && popup.start > 0 && cursor <= command_end {
+        return Some(EnterCompletion {
+            action: EnterCompletionAction::Submit,
+            candidate: None,
+        });
     }
     // Explicit selection: the user navigated THIS popup with ↑/↓. The stamp
     // (set by navigation, retired when the popup changes) is what carries the
@@ -392,28 +652,32 @@ pub(super) fn resolve_enter_completion(
     let Some(top) = popup.items.get(index) else {
         return None;
     };
-    if popup.items.len() > 1 && !explicit_selection {
+    // A path completion consumes the Enter. Keep the conservative submit
+    // behavior for ambiguous file matches, but let the highest-ranked
+    // directory win so recursive `@dir-prefix` results can be entered in one
+    // step, matching native Pi's directory-first ordering.
+    if popup.is_path && popup.items.len() > 1 && !explicit_selection && !top.is_directory {
         return Some(EnterCompletion {
             action: EnterCompletionAction::Submit,
             candidate: None,
         });
     }
     // A candidate only rewrites text when it completes the whole unit the
-    // caret sits in — the entire command token, or the entire path segment.
+    // caret sits in — the entire command token or the entire path token.
     // Otherwise the text stays exactly as typed: no silent rewrite to a
     // different command, and no silent drop of what the user typed after the
     // caret. An explicit ↑/↓ selection wins over that inference.
     let (replacement_start, replacement_end, completes_whole) = if popup.is_path {
-        // The path provider returns a BASENAME (`report.txt`) but spans the
-        // whole path prefix; replacing that span would drop the directory and
-        // point the reference at a different file. Replace only the basename
-        // segment, keeping the parent directories the user typed.
-        let (segment_start, segment_end) = path_segment_bounds(&text, start, cursor);
-        let whole = state
-            .autocomplete
-            .get_suggestions(&text, segment_end)
+        let (token_start, token_end) = path_token_bounds(&text, start, cursor);
+        let whole_suggestions = state.autocomplete.get_suggestions(&text, token_end);
+        let whole_suggestions = whole_suggestions.or_else(|| {
+            text.get(cursor..)
+                .filter(|rest| rest.starts_with('"'))
+                .and_then(|_| state.autocomplete.get_suggestions(&text, cursor))
+        });
+        let whole = whole_suggestions
             .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text));
-        (segment_start, segment_end, whole)
+        (token_start, token_end, whole)
     } else {
         // The replacement must cover the WHOLE command token the caret sits
         // in: the text after the caret that belongs to the same token is part
@@ -434,13 +698,22 @@ pub(super) fn resolve_enter_completion(
             candidate: None,
         });
     }
+    // An extension-argument popup replaces only the argument span (its
+    // `start` sits after the command token, which the draft keeps). Applying
+    // the target must NOT submit: the user still needs to type the message
+    // body, so the Enter is consumed like a path completion.
     Some(EnterCompletion {
-        action: if popup.is_path {
+        action: if popup.is_path || is_argument_popup {
             EnterCompletionAction::ApplyOnly
         } else {
             EnterCompletionAction::ApplyAndSubmit
         },
-        candidate: Some((top.clone(), replacement_start, replacement_end)),
+        candidate: Some((
+            top.clone(),
+            replacement_start,
+            replacement_end,
+            !popup.is_path,
+        )),
     })
 }
 
@@ -493,9 +766,16 @@ pub(super) fn navigate_autocomplete(
         return false;
     }
     let start = sugg.start.min(text.len());
-    // `/` commands keep the slash at `start`; the path provider keeps `@` by
-    // placing `start` *after* it, so look just before `start` for `@`.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let is_argument_popup = !sugg.is_path
+        && sugg.start == command_end
+        && cursor > command_end
+        && text[..command_end].starts_with('/');
+    let explicit = if sugg.is_path {
+        text[..start].ends_with('@') || text[..start].ends_with("@\"")
+    } else {
+        (sugg.start == 0 && text.starts_with('/')) || is_argument_popup
+    };
     if !explicit {
         return false;
     }

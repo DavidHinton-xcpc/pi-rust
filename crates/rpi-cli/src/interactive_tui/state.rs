@@ -42,6 +42,8 @@ pub(super) struct ProviderFormState {
 /// Which selector overlay (if any) is currently swapped into the editor slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SelectorKind {
+    /// `/context` — read-only loaded resources; dismiss without changing chat.
+    Context,
     /// `/model` — available models (live switch via `lane.set_model`).
     Model,
     /// `/thinking` — supported thinking levels (live via `lane.set_thinking_level`).
@@ -155,8 +157,16 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    pub(super) session_write_tasks: super::settlement::SessionWriteTasks,
+    pub(super) history_page: history::HistoryUi,
     /// The root selected at startup, retained across session switches/reloads.
     pub(super) session_dir: std::path::PathBuf,
+    /// The cwd captured at startup. Session pickers scope their default view
+    /// to this project; extensions may mutate the process cwd at runtime, so
+    /// reading `current_dir()` here would silently change the picker's scope.
+    pub(super) session_cwd: std::path::PathBuf,
+    /// `/session` and `-r` scope, reset to Project every time a picker opens.
+    pub(super) session_scope: std::sync::Mutex<crate::session::SessionScope>,
     /// The in-flight streaming assistant message (cleared on finalize).
     /// `Arc`-shared with the [`TranscriptView`] the event drain renders through,
     /// so the render-tick / reload / toggle paths keep direct access.
@@ -170,6 +180,11 @@ pub(super) struct TuiState {
     /// Whether package/custom themes may be selected in this session.
     /// Persisted display preference toggled by Ctrl+T (shared with the view).
     pub(super) hide_thinking: Arc<std::sync::Mutex<bool>>,
+    /// Allocator for the per-message ids click regions key on. Shared with every
+    /// [`TranscriptView`] this state builds, so ids stay unique across the
+    /// per-event views (a per-view counter would restart and make clicks toggle
+    /// the first live message).
+    pub(super) message_seq: crate::transcript_view::MessageIdSeq,
     /// Global tool-output expansion preference toggled by Ctrl+O (shared with
     /// the view).
     pub(super) tool_outputs_expanded: Arc<std::sync::Mutex<bool>>,
@@ -243,6 +258,10 @@ pub(super) struct TuiState {
     /// Monotonic source for OAuth flow ids. Kept separate so an inactive flow
     /// can use zero without allowing a late result to match a future flow.
     pub(super) provider_auth_generation: std::sync::atomic::AtomicU64,
+    /// Cancellation for the provider OAuth call in flight. Created when a flow
+    /// begins and cancelled when it ends (Esc, a finished result, or a new flow),
+    /// so a plugin's blocking begin, exchange or revoke can stop early.
+    pub(super) provider_auth_cancel: std::sync::Mutex<Option<CancellationToken>>,
     /// The select-list currently occupying the input slot for a choice-style
     /// provider form step (the protocol step). Mutually exclusive with
     /// [`Self::active_provider_input`].
@@ -280,6 +299,18 @@ pub(super) struct TuiState {
     /// `theme()` is read-only after OnceLock init, so per-instance state is the
     /// only way to apply a preset at runtime.
     pub(super) theme_manager: Arc<ThemeManager>,
+    /// Discovered custom theme files (name → path), rebuilt on `/reload`.
+    /// Empty when `--no-themes` is set or no theme dirs exist. Listing is
+    /// lazy: paths only, parsed when selected.
+    pub(super) theme_registry: std::sync::RwLock<crate::themes::ThemeRegistry>,
+    /// The theme spec currently active (the persisted form: preset name or
+    /// file path / registry name), so `/reload` can detect that the active
+    /// file theme vanished and fall back.
+    pub(super) active_theme_spec: std::sync::Mutex<Option<String>>,
+    /// The running theme-file watcher, if the active theme is a file. Swapped
+    /// whenever the active theme changes (selection or reload fallback);
+    /// presets leave it `None` (nothing to poll).
+    pub(super) theme_watcher: std::sync::Mutex<Option<crate::fs_watch::WatchHandle>>,
     /// The alt-screen handle, held so `set_status` can reflect run state in the
     /// terminal window title ("rpi — working" / "rpi"). `None` in unit tests
     /// that never call `set_status` with a title.
@@ -308,6 +339,17 @@ pub(super) struct TuiState {
     /// counts and prices prompt-cache misses across turns using the same
     /// noise floor, idle-gap, and model-change logic as the batch scan.
     pub(super) cache_tracker: std::sync::Mutex<rpi_harness::cache_stats::CacheMissTracker>,
+    /// Set by the event drain when the `AgentEvent` broadcast reported
+    /// `Lagged`, i.e. at least one event was dropped outright.
+    ///
+    /// `MessageUpdate` re-delivers a full snapshot, so a dropped delta is
+    /// harmless — but `MessageEnd` is terminal and carries the turn's usage.
+    /// Losing one freezes the footer's totals for the rest of the session, and
+    /// nothing later in the stream re-sends them. The flag makes that
+    /// possibility actionable at the end of the run, where an authoritative
+    /// rebuild is affordable; without it every turn would have to re-read the
+    /// whole branch to notice a gap that almost never happens.
+    pub(super) events_lagged: std::sync::atomic::AtomicBool,
     /// The in-progress scoped-models selection while the `/scoped-models`
     /// selector is open (toggle per item, Esc saves). `None` when not editing.
     pub(super) scoped_edit: std::sync::Mutex<Option<Vec<String>>>,
@@ -631,35 +673,62 @@ pub(super) struct PasteTail {
     pub(super) at: std::time::Instant,
 }
 
+/// Editor ownership and clipboard evidence for incrementally folding one paste.
+/// This is deliberately separate from `PasteTail`: folding must never become
+/// another reason to consume a submitting Enter.
+struct WindowsFoldSession {
+    editor: rpi_tui::editor::PasteSession,
+    // Short first batches are displayed before reading the clipboard. Only a
+    // later paste-shaped chunk can corroborate and refold that pending prefix.
+    clipboard: Option<String>,
+    received: String,
+    // Visible, provisional suffix since the last corroborated continuation.
+    // Check the whole suffix, not each scalar, for new-paste ambiguity.
+    pending: String,
+    at: std::time::Instant,
+}
+
 /// Windows crossterm reads console KEY_EVENTs, not bracketed-paste payloads, so
 /// a clipboard paste arrives as ordinary `KeyCode::Char` events.
 ///
-/// The caller decides paste-vs-typing with a **queue probe**, not a timer: the
-/// console hands a whole clipboard payload over already queued, so input still
-/// waiting behind the current key means paste, and an empty queue means this is
-/// typing that must reach the editor at once. Deciding on elapsed time instead
-/// is what made typing feel laggy — an IME committing a word delivers its
-/// characters with no gap at all, so every committed word sat in this buffer
-/// until the `burst` timeout expired.
+/// Collect continuous text until a short idle deadline before displaying it.
+/// A burst waits 120ms to avoid showing a paste prefix before it can fold;
+/// isolated characters use 15ms. Multi-character IME commits share this delay.
+/// Queue probing and clipboard corroboration still classify pasted newlines
+/// and join payloads that cross the display window.
 #[derive(Default)]
 pub(super) struct WindowsPasteRun {
     pub(super) text: String,
     pub(super) last_at: Option<std::time::Instant>,
     pub(super) burst: bool,
-    /// Set once the console proved this run is a paste: real input was still
-    /// queued behind one of its characters.
-    ///
-    /// This — not elapsed time, and not run length — is what separates a
-    /// clipboard payload from an IME commit. A committed word arrives with an
-    /// empty queue, so it never gets this flag, never leaves a [`PasteTail`]
-    /// behind, and can never absorb the Enter that submits it.
+    /// Real input was queued behind one of this run's characters. This is
+    /// newline evidence, not a physical paste boundary: coalesced IME commits
+    /// can set it too. Shape and input age keep their submitting Enter safe.
     pub(super) collected: bool,
     /// The most recent batch of this run already handed to the editor, kept
     /// while a trailing newline could still belong to it.
     pub(super) tail: Option<PasteTail>,
+    fold_session: Option<WindowsFoldSession>,
 }
 
 impl WindowsPasteRun {
+    /// Idle collection window, matching the original Windows buffering policy.
+    pub(super) fn grace(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(if self.burst { 120 } else { 15 })
+    }
+
+    /// Time left from the last text character, not from the last poll or mouse
+    /// event. Unrelated console events must not keep pending text hidden.
+    pub(super) fn remaining_delay(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if !self.is_buffering() {
+            return None;
+        }
+        Some(self.last_at.map_or(std::time::Duration::ZERO, |at| {
+            self.grace()
+                .saturating_sub(now.saturating_duration_since(at))
+        }))
+    }
+
     /// Whether anything is buffered, i.e. the current run is being treated as a
     /// paste.
     pub(super) fn is_buffering(&self) -> bool {
@@ -685,12 +754,8 @@ impl WindowsPasteRun {
         !self.is_paste_candidate()
     }
 
-    /// Record that the console proved this run is a paste, because real input
-    /// was still queued behind one of its characters.
-    ///
-    /// Callers set this from the queue-probe path and from the native batch
-    /// drain. The typing path — where the queue was empty — deliberately never
-    /// sets it.
+    /// Record queued-input evidence from the probe or native batch drain.
+    /// This flag alone cannot distinguish a paste from an IME commit.
     pub(super) fn mark_collected(&mut self) {
         self.collected = true;
     }
@@ -767,13 +832,10 @@ impl WindowsPasteRun {
     /// - **No carry**: a live run corroborates when the console proved it is a
     ///   paste (`collected`) or its text already contains a newline. Queue
     ///   occupancy alone cannot separate a paste's first line from a coalesced
-    ///   IME commit, but it does not have to: the last character of an IME
-    ///   batch always finds an empty queue behind it, so the batch flushes
-    ///   *before* its submitting Enter is classified — a live `collected` run
-    ///   at Enter time means real input was queued behind that very character,
-    ///   which an IME commit never produces. The newline gate covers the
-    ///   console-batch boundary where the paste's first line ends before any
-    ///   newline has been accepted into the run.
+    ///   IME commit. Idle buffering can leave either live at Enter time, so
+    ///   `windows_enter_in_paste` additionally rejects a lone short live
+    ///   candidate after machine-speed continuation has expired. The newline
+    ///   gate covers the boundary before any pasted newline has been accepted.
     ///
     /// Returning the candidates separately — rather than one glued string —
     /// is what keeps one paste's continuation apart from two pastes'
@@ -828,15 +890,25 @@ impl WindowsPasteRun {
 
     /// Hand the buffered run to the editor.
     ///
-    /// Only a run the console proved is a paste keeps its text as a
-    /// [`PasteTail`], so a trailing newline delivered in a later batch is still
-    /// attributed to that paste instead of submitting the prompt. A short IME
-    /// commit is a burst too — its characters arrive with no gap at all — but
-    /// it was collected from an empty queue, so it leaves no tail and its Enter
-    /// still submits.
+    /// Queued-input evidence retains a [`PasteTail`] for a newline delivered
+    /// in a later batch. A coalesced IME commit can retain a tail too; its short
+    /// shape and original input timestamp prevent swallowing a human Enter.
+    /// Waiting to display the text must not renew that evidence's lifetime.
+    #[cfg(test)]
     pub(super) fn flush(&mut self, editor: &Editor, now: std::time::Instant) {
+        self.flush_with_clipboard(editor, now, || None);
+    }
+
+    /// Flush immediately, using clipboard evidence only to group the display
+    /// of chunks already received. Never wait for or insert missing content.
+    pub(super) fn flush_with_clipboard(
+        &mut self,
+        editor: &Editor,
+        now: std::time::Instant,
+        clipboard: impl FnOnce() -> Option<String>,
+    ) {
         if !self.text.is_empty() {
-            editor.handle_paste(&self.text);
+            self.insert_paste_chunk(editor, now, clipboard);
             if self.burst && self.collected {
                 // Accumulate, never replace: batches of *one* payload all take
                 // this path, so dropping the earlier ones would make the
@@ -860,7 +932,10 @@ impl WindowsPasteRun {
                     text,
                     last: batch,
                     mature,
-                    at: now,
+                    // Evidence ages from input, not delayed presentation.
+                    // Otherwise a 120ms-old IME word would look freshly pasted
+                    // immediately after the idle flush and eat a typed Enter.
+                    at: self.last_at.unwrap_or(now),
                 });
             } else {
                 self.tail = None;
@@ -871,6 +946,170 @@ impl WindowsPasteRun {
         self.collected = false;
         self.last_at = None;
     }
+
+    /// Explicit new pastes / non-text actions terminate both kinds of carry.
+    pub(super) fn end_paste_session(&mut self) {
+        crate::key_trace::paste_note(|| {
+            format!(
+                "boundary fold={} tail={}",
+                self.fold_session.is_some(),
+                self.tail.is_some()
+            )
+        });
+        self.fold_session = None;
+        self.tail = None;
+    }
+
+    fn insert_paste_chunk(
+        &mut self,
+        editor: &Editor,
+        now: std::time::Instant,
+        read_clipboard: impl FnOnce() -> Option<String>,
+    ) {
+        crate::key_trace::paste_note(|| {
+            format!(
+                "chunk bytes={} chars={} lines={} burst={} collected={} previous={} received_bytes={} confirmed={} age_ms={}",
+                self.text.len(), self.text.chars().count(), self.text.split('\n').count(),
+                self.burst, self.collected, self.fold_session.is_some(),
+                self.fold_session.as_ref().map_or(0, |s| s.received.len()),
+                self.fold_session.as_ref().is_some_and(|s| s.clipboard.is_some()),
+                self.fold_session.as_ref().map_or(0, |s| now.duration_since(s.at).as_millis()),
+            )
+        });
+        let previous = self.fold_session.take().filter(|session| {
+            let grace = if session.clipboard.is_some() {
+                PASTE_MATURE_CARRY_GAP
+            } else {
+                PASTE_BURST_GAP
+            };
+            now.duration_since(session.at) <= grace
+        });
+        let evidence = self.burst && self.collected;
+        let paste_shaped =
+            self.text.contains(['\n', '\r']) || self.text.chars().count() >= PASTE_RUN_MIN_CHARS;
+        let combined_shaped = paste_shaped
+            || previous.as_ref().is_some_and(|session| {
+                session.received.contains(['\n', '\r'])
+                    || session.received.chars().count() + self.text.chars().count()
+                        >= PASTE_RUN_MIN_CHARS
+            });
+        let corroborate = previous
+            .as_ref()
+            .is_some_and(|session| session.clipboard.is_some() || combined_shaped)
+            || (evidence && paste_shaped);
+        // Do not read the clipboard for an ordinary coalesced IME commit. A
+        // short prefix can be displayed now and corroborated by a later batch.
+        let clipboard = if corroborate {
+            read_clipboard().map(|text| normalize_console_paste(&text))
+        } else {
+            None
+        };
+        let batch = normalize_console_paste(&self.text);
+        crate::key_trace::paste_note(|| {
+            format!(
+                "evidence={evidence} shaped={paste_shaped} clipboard_read={corroborate} available={} bytes={} batch_prefix={}",
+                clipboard.is_some(), clipboard.as_ref().map_or(0, String::len),
+                clipboard.as_ref().is_some_and(|c| c.starts_with(&batch)),
+            )
+        });
+        if let Some(mut session) = previous {
+            let received = format!("{}{}", session.received, self.text);
+            let normalized = normalize_console_paste(&received);
+            let carry_unfolded;
+            if let Some(clipboard) = clipboard.as_ref() {
+                // A scalar that equals the clipboard's first scalar is not
+                // enough to decide a boundary. Keep the entire provisional
+                // prefix visible until later bytes disambiguate it.
+                let pending = normalize_console_paste(&format!("{}{}", session.pending, self.text));
+                let ambiguous = clipboard.starts_with(&pending);
+                let large = clipboard.split('\n').count() > 10 || clipboard.chars().count() > 1000;
+                let unchanged = session
+                    .clipboard
+                    .as_ref()
+                    .is_none_or(|previous| previous == clipboard);
+                let prefix = clipboard.starts_with(&normalized);
+                let eligible = unchanged && large && !batch.is_empty() && !ambiguous && prefix;
+                let appended =
+                    eligible && editor.append_paste_session(&mut session.editor, &self.text);
+                crate::key_trace::paste_note(|| {
+                    format!(
+                        "append unchanged={unchanged} large={large} ambiguous={ambiguous} cumulative_prefix={prefix} received_bytes={} common_prefix_bytes={} eligible={eligible} accepted={appended}",
+                        normalized.len(),
+                        clipboard.bytes().zip(normalized.bytes()).take_while(|(a, b)| a == b).count(),
+                    )
+                });
+                if appended {
+                    if normalized.len() < clipboard.len() {
+                        session.received = received;
+                        session.pending.clear();
+                        session.clipboard = Some(clipboard.clone());
+                        session.at = now;
+                        self.fold_session = Some(session);
+                    }
+                    return;
+                }
+                carry_unfolded = unchanged && large && prefix && ambiguous;
+                if carry_unfolded {
+                    session.clipboard = Some(clipboard.clone());
+                }
+            } else {
+                // No clipboard I/O for short IME-shaped fragments. Keeping
+                // their owned, visible span is not evidence to fold them.
+                carry_unfolded = !paste_shaped && (session.clipboard.is_some() || !combined_shaped);
+            }
+            if carry_unfolded
+                && now.duration_since(session.at) <= PASTE_BURST_GAP
+                && editor.append_paste_session_unfolded(&mut session.editor, &self.text)
+            {
+                session.received = received;
+                session.pending.push_str(&self.text);
+                session.at = now;
+                crate::key_trace::paste_note(|| {
+                    format!(
+                        "decision=provisional pending_bytes={} confirmed={}",
+                        session.pending.len(),
+                        session.clipboard.is_some()
+                    )
+                });
+                if session
+                    .clipboard
+                    .as_ref()
+                    .is_none_or(|c| normalized.len() < c.len())
+                {
+                    self.fold_session = Some(session);
+                }
+                return;
+            }
+        }
+        let can_start = match clipboard.as_ref() {
+            Some(clipboard) => {
+                let large = clipboard.split('\n').count() > 10 || clipboard.chars().count() > 1000;
+                large && batch.len() < clipboard.len() && clipboard.starts_with(&batch)
+            }
+            None => !paste_shaped,
+        };
+        if evidence && !batch.is_empty() && can_start {
+            crate::key_trace::paste_note(|| {
+                format!("decision=start confirmed={}", clipboard.is_some())
+            });
+            self.fold_session = Some(WindowsFoldSession {
+                editor: editor.start_paste_session(&self.text),
+                clipboard,
+                received: self.text.clone(),
+                pending: String::new(),
+                at: now,
+            });
+            return;
+        }
+        crate::key_trace::paste_note(|| format!("decision=independent can_start={can_start}"));
+        editor.handle_paste(&self.text);
+    }
+}
+
+/// Console text and clipboard text use the same newline coordinates. Keep
+/// tabs/control bytes here: the editor owns its own display normalization.
+fn normalize_console_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Never turn a lone Enter into a newline. A queued next key proves this is
@@ -892,7 +1131,18 @@ pub(super) fn windows_enter_in_paste(
     if more_queued {
         return true;
     }
-    let candidates = run.paste_tail_texts(now);
+    let mut candidates = run.paste_tail_texts(now);
+    // An IME word may still be buffered when a human presses Enter. Its
+    // clipboard prefix alone must not turn that submit into a newline.
+    // A fresh carried paste plus this suffix remains a valid candidate.
+    if !run.text.contains(['\n', '\r'])
+        && run.text.chars().count() < PASTE_RUN_MIN_CHARS
+        && run
+            .last_at
+            .is_some_and(|at| now.saturating_duration_since(at) > PASTE_BURST_GAP)
+    {
+        candidates.retain(|candidate| candidate != &run.text);
+    }
     if candidates.is_empty() {
         return false;
     }
@@ -904,6 +1154,26 @@ pub(super) fn windows_enter_in_paste(
                 normalized.starts_with(&prefix)
             })
     })
+}
+
+/// Flush pending text before a shortcut or editor action can clear/move it.
+/// Bare Enter must first be classified against the live paste run, then
+/// flushed before autocomplete/submission; releases are never barriers.
+pub(super) fn windows_paste_key_barrier(key: &KeyEvent) -> bool {
+    if !should_dispatch_key(key.kind) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter if key.modifiers.is_empty() => false,
+        KeyCode::Char(_)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            false
+        }
+        _ => true,
+    }
 }
 
 /// Whether the key loop should drain the console natively instead of probing
@@ -1037,17 +1307,23 @@ pub(super) fn format_tokens(n: i64) -> String {
 /// Record a submitted message for ↑ recall (mirrors TS `addToHistory`):
 /// trims, skips empty + consecutive duplicates, caps at [`HISTORY_LIMIT`], and
 /// resets the browse state so a fresh prompt never resumes mid-history.
+///
+/// The browse reset is unconditional: resubmitting a recalled entry is a
+/// duplicate and adds nothing to history, but the session still ended — a
+/// stale `history_index` would leave the next ↓ restoring a draft that had
+/// already been submitted.
 pub(super) fn push_history(state: &Arc<TuiState>, text: &str) {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return;
     }
-    let mut history = state.history.lock().unwrap();
-    if history.first() == Some(&trimmed) {
-        return;
+    {
+        let mut history = state.history.lock().unwrap();
+        if history.first() != Some(&trimmed) {
+            history.insert(0, trimmed);
+            history.truncate(HISTORY_LIMIT);
+        }
     }
-    history.insert(0, trimmed);
-    history.truncate(HISTORY_LIMIT);
     *state.history_index.lock().unwrap() = -1;
     *state.history_draft.lock().unwrap() = None;
 }
@@ -1128,6 +1404,47 @@ pub(super) fn poll_auto_send(
     }
 }
 
+/// Whether an ↑/↓ press belongs to prompt history rather than to the caret.
+///
+/// Inside a multi-line draft the editor owns the arrow whenever the caret can
+/// still travel in that direction: ↑ moves between logical lines until it
+/// reaches the first line, ↓ until it reaches the last. Only the press that
+/// cannot move the caret any further switches to history, which is what makes
+/// a multi-line prompt — typed or recalled — editable line by line.
+///
+/// A single-line draft keeps the pre-existing contract: the arrows never
+/// replace it. That behaviour is deliberate — swapping a typed draft for a
+/// history entry was reported as "text disappeared" — and a single-line prompt
+/// has no second row to move to, so there is no "again" press to reinterpret.
+/// An active browse session is the exception: after recalling a single-line
+/// entry the editor is exactly that shape, and ↑/↓ must keep walking history
+/// until ↓ past the newest entry ends the session.
+///
+/// `direction` is -1 (↑, older) or 1 (↓, newer), matching [`navigate_history`].
+pub(super) fn arrow_belongs_to_history(
+    state: &Arc<TuiState>,
+    editor: &Arc<Editor>,
+    direction: i32,
+) -> bool {
+    if state.history.lock().unwrap().is_empty() {
+        return false;
+    }
+    // A fresh prompt has no caret row to move to, so the first arrow press
+    // recalls immediately (upstream's `historyPrevious` on an empty editor).
+    if editor.get_text().is_empty() {
+        return true;
+    }
+    if editor.line_count() < 2 {
+        return *state.history_index.lock().unwrap() != -1;
+    }
+    let (row, _col) = editor.cursor_position();
+    if direction < 0 {
+        row == 0
+    } else {
+        row + 1 >= editor.line_count()
+    }
+}
+
 /// Navigate message history. `direction` is -1 (↑, older) or 1 (↓, newer).
 /// Mirrors TS `navigateHistory`: the first entry into browse mode stashes the
 /// current editor text as the draft; navigating back past the newest entry
@@ -1151,22 +1468,35 @@ pub(super) fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, dire
         // Exited browse mode: restore the draft (or clear if there was none).
         let draft = state.history_draft.lock().unwrap().take();
         match draft {
-            Some(d) => {
-                let len = d.len();
-                editor.set_text(&d);
-                editor.set_cursor(0, len);
-            }
+            Some(d) => set_editor_text_caret_at_end(editor, &d),
             None => editor.set_text(""),
         }
     } else {
         let text = history[new_index as usize].clone();
-        let len = text.len();
-        editor.set_text(&text);
-        editor.set_cursor(0, len);
+        // A recalled prompt is edited from its tail: `set_text` parks the
+        // caret at (0, 0), which for a multi-line entry left ↑ as the only
+        // working arrow — ↓ looked like it skipped the entry entirely.
+        set_editor_text_caret_at_end(editor, &text);
     }
 }
 
 impl TuiState {
+    /// Current active theme spec (the persisted form: preset name or file
+    /// path / registry name).
+    pub(super) fn active_theme_spec(&self) -> Option<String> {
+        self.active_theme_spec
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Record the active theme spec (selection, reload fallback).
+    pub(super) fn set_active_theme_spec(&self, spec: Option<String>) {
+        if let Ok(mut guard) = self.active_theme_spec.lock() {
+            *guard = spec;
+        }
+    }
+
     pub(super) fn cancel_js_preparation(&self) -> bool {
         let cancellation = self.js_preparation_cancel.lock().unwrap().take();
         if let Some(cancellation) = cancellation {
@@ -1194,7 +1524,90 @@ impl TuiState {
         {
             previous.cancel();
         }
+        self.history_page.invalidate();
+        if self.history_page.is_bound() && self.history_page.is_latest() {
+            self.history_page.mount_active(&self.chat_container);
+        }
         cancellation
+    }
+
+    /// Start a provider OAuth flow: allocate its id and publish the id and its
+    /// cancellation token in one step under the token lock, so an Esc that ends
+    /// the flow always finds the token to cancel. A previous flow's token is
+    /// cancelled, so a call from an older flow cannot outlive it.
+    pub(super) fn begin_provider_auth(&self) -> (u64, CancellationToken) {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let flow_id = self
+            .provider_auth_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = slot.replace(cancellation.clone()) {
+            previous.cancel();
+        }
+        self.provider_auth_flow_id
+            .store(flow_id, std::sync::atomic::Ordering::Release);
+        (flow_id, cancellation)
+    }
+
+    /// The token for flow `flow_id`'s next provider call. If that flow is no
+    /// longer active it is already cancelled, so a late submit cannot run
+    /// unobserved or borrow a newer flow's token.
+    pub(super) fn provider_auth_token(&self, flow_id: u64) -> CancellationToken {
+        let slot = self.provider_auth_cancel.lock().unwrap();
+        match slot.as_ref() {
+            Some(cancellation)
+                if self
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == flow_id =>
+            {
+                cancellation.clone()
+            }
+            _ => {
+                let cancellation = CancellationToken::new();
+                cancellation.cancel();
+                cancellation
+            }
+        }
+    }
+
+    /// End the active provider OAuth flow, if any, and cancel its call. Returns
+    /// whether a flow was active, i.e. this end won it from a completing result.
+    pub(super) fn end_provider_auth(&self) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let ended = self
+            .provider_auth_flow_id
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+            != 0;
+        if let Some(cancellation) = slot.take() {
+            cancellation.cancel();
+        }
+        ended
+    }
+
+    /// End flow `flow_id` only if it is still the active one, for a result
+    /// about to write the store. Exactly one of this and an Esc's
+    /// [`Self::end_provider_auth`] wins; a losing claim changes nothing.
+    pub(super) fn claim_provider_auth(&self, flow_id: u64) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let claimed = flow_id != 0
+            && self
+                .provider_auth_flow_id
+                .compare_exchange(
+                    flow_id,
+                    0,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok();
+        if claimed {
+            // The call already returned; this only clears the slot.
+            if let Some(cancellation) = slot.take() {
+                cancellation.cancel();
+            }
+        }
+        claimed
     }
 
     /// Clear the user-bash slot. Called when the command finishes so the
@@ -1218,8 +1631,18 @@ impl TuiState {
 
     pub(super) fn set_status(&self, status: RunStatus) {
         *self.status.lock().unwrap() = status;
+        if status == RunStatus::Working {
+            self.history_page.invalidate();
+            if self.history_page.is_bound() && self.history_page.is_latest() {
+                self.history_page.mount_active(&self.chat_container);
+            }
+        }
         self.apply_status(status);
     }
+
+    // =======================================================================
+    // Footer usage accounting across the live/reconcile race
+    // =======================================================================
 
     /// The dock container listing queued messages (upstream's
     /// `pendingMessagesContainer`).
@@ -1247,16 +1670,16 @@ impl TuiState {
         }
         let colors = current_theme().colors;
         container.add_child(Arc::new(Spacer::new(1)));
-        for text in &messages.steering {
+        for message in &messages.steering {
             container.add_child(Arc::new(Text::new(
-                colors.muted.fg(&format!("Steering: {text}")),
+                colors.muted.fg(&format!("Steering: {}", message.text)),
                 1,
                 0,
             )));
         }
-        for text in &messages.follow_up {
+        for message in &messages.follow_up {
             container.add_child(Arc::new(Text::new(
-                colors.muted.fg(&format!("Follow-up: {text}")),
+                colors.muted.fg(&format!("Follow-up: {}", message.text)),
                 1,
                 0,
             )));
@@ -1282,6 +1705,10 @@ impl TuiState {
         }
         *status = RunStatus::Working;
         drop(status);
+        self.history_page.invalidate();
+        if self.history_page.is_bound() && self.history_page.is_latest() {
+            self.history_page.mount_active(&self.chat_container);
+        }
         self.apply_status(RunStatus::Working);
         true
     }
@@ -1303,7 +1730,6 @@ impl TuiState {
                 // `show_terminal_progress` disables it entirely.
                 if self.show_terminal_progress {
                     self.editor.set_working(Some(WorkingState {
-                        frame: 0,
                         started_at: std::time::Instant::now(),
                         message: "Working…".to_string(),
                     }));
@@ -1487,6 +1913,11 @@ impl TuiState {
     /// real keystroke.
     pub(super) fn take_editor_change(&self) -> Option<serde_json::Value> {
         let text = self.editor.get_text();
+        // Publish the draft for `GetEditorText` (pi's `ui.getEditorText`) on
+        // every tick, including a cursor-only move: a plugin that inserts at the
+        // caret must not see a stale position.
+        let cursor = super::autocomplete::editor_cursor_offset(&self.editor, &text);
+        self.editor_text.set_draft(&text, cursor);
         {
             let mut last = self.last_editor_text.lock().unwrap();
             if *last == text {
@@ -1564,6 +1995,7 @@ impl TuiState {
     /// container: the footer's accumulated usage/context badge, the `/copy`
     /// cache, and the tool/bash component maps keyed by `tool_call_id`.
     pub(super) fn reset_session_state(&self) {
+        self.history_page.reset();
         self.footer.reset_session_counters();
         *self.last_assistant_text.lock().unwrap() = String::new();
         self.current_assistant.lock().unwrap().take();
@@ -1574,6 +2006,19 @@ impl TuiState {
 
     pub(super) fn set_hide_thinking(&self, hide: bool) {
         *self.hide_thinking.lock().unwrap() = hide;
+        // The global toggle applies to the WHOLE transcript, not just the
+        // in-flight message: restored history pages carry their own assistant
+        // components (created far from `start_assistant`).
+        let mut pending = self.chat_container.get_children();
+        pending.extend(self.history_page.active.get_children());
+        while let Some(child) = pending.pop() {
+            if let Some(container) = child.as_any().downcast_ref::<Container>() {
+                pending.extend(container.get_children());
+            }
+            if let Some(assistant) = child.as_any().downcast_ref::<AssistantMessageComponent>() {
+                assistant.set_hide_thinking(hide);
+            }
+        }
         if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {
             comp.set_hide_thinking(hide);
         }
@@ -1592,7 +2037,24 @@ impl TuiState {
     pub(super) fn toggle_tool_outputs(&self) -> bool {
         let next = !*self.tool_outputs_expanded.lock().unwrap();
         self.transcript_view().set_expanded(next);
+        self.apply_history_tool_expansion(&self.chat_container);
         next
+    }
+
+    pub(super) fn apply_history_tool_expansion(&self, root: &Container) {
+        let expanded = *self.tool_outputs_expanded.lock().unwrap();
+        let mut pending = root.get_children();
+        while let Some(child) = pending.pop() {
+            if let Some(container) = child.as_any().downcast_ref::<Container>() {
+                pending.extend(container.get_children());
+            }
+            if let Some(tool) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+                tool.set_expanded(expanded);
+            }
+            if let Some(bash) = child.as_any().downcast_ref::<BashExecutionComponent>() {
+                bash.set_expanded(expanded);
+            }
+        }
     }
 
     /// The model id currently tracked as active (footer + Ctrl+P anchor).
@@ -1621,21 +2083,44 @@ impl TuiState {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
+    /// Streamed messages belong in the live slot, even while it is detached.
+    pub(super) fn transcript_container(&self) -> Arc<Container> {
+        if self.history_page.is_bound() {
+            self.history_page.active.clone()
+        } else {
+            self.chat_container.clone()
+        }
+    }
+
+    /// Keep command/background notices visible on the page being viewed.
+    /// On latest history they join streamed output, so later replies follow them.
+    /// Older pages have no live slot; their notices retire with the visible page.
+    pub(super) fn notice_container(&self) -> Arc<Container> {
+        self.history_page.notice_container(&self.chat_container)
+    }
+
     /// Build a [`TranscriptView`] over the shared component maps. Cheap (clones
     /// a handful of `Arc`s) and lets the event drain render the transcript
     /// through the same code path as the remote client.
     ///
     /// [`TranscriptView`]: crate::transcript_view::TranscriptView
     pub(super) fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
+        let managed = self.history_page.is_bound();
         crate::transcript_view::TranscriptView::with_maps(
-            self.chat_container.clone(),
+            self.transcript_container(),
             self.current_assistant.clone(),
             self.tool_components.clone(),
             self.bash_components.clone(),
             self.hide_thinking.clone(),
             self.tool_outputs_expanded.clone(),
             self.markdown_transformer.clone(),
+            self.message_seq.clone(),
         )
+        .with_panels(if managed {
+            self.history_page.panels.clone()
+        } else {
+            self.chat_container.clone()
+        })
         .with_show_images(self.images_visible())
     }
 
@@ -1673,7 +2158,13 @@ impl TuiState {
 
     pub(super) fn set_show_images(&self, show: bool) {
         *self.show_images.lock().unwrap() = show;
-        for child in self.chat_container.get_children() {
+        let mut pending = self.chat_container.get_children();
+        // The live slot can be detached while an older page is visible.
+        pending.extend(self.history_page.active.get_children());
+        while let Some(child) = pending.pop() {
+            if let Some(container) = child.as_any().downcast_ref::<Container>() {
+                pending.extend(container.get_children());
+            }
             if let Some(image) = child.as_any().downcast_ref::<Image>() {
                 image.set_inline_visible(show);
             }

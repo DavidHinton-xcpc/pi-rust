@@ -211,6 +211,7 @@ rpi auth login|check|logout
 rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
 rpi install <crate>
 rpi uninstall <crate>
+rpi extension update [name] # 更新全部符合条件的扩展，或按名称更新
 rpi update                 # 更新 rpi CLI 自身
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
@@ -220,7 +221,7 @@ rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ### CLI 自更新
 
 `rpi update` 默认从 GitHub Release 下载预编译的 CLI，不需要本地 Rust/Cargo。
-版本按 crates.io 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
+稳定版版本按 GitHub Releases 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
 压缩包/可执行文件的 SHA-256。校验目标平台、完整性和实际版本后，原子替换当前 CLI。
 Windows 会暂存更新，等待当前进程退出后完成替换。
 
@@ -229,14 +230,35 @@ Windows 会暂存更新，等待当前进程退出后完成替换。
 `--offline` 仅报告缓存的版本信息，不下载也不编译。旧 Release 没有 manifest 时，
 可等待协议资产补齐，或显式使用 `rpi update --build`。
 
+通过 Homebrew 安装时，使用 `brew upgrade rpi` 更新。启动时的更新提示也会显示这条命令。
+
 ### 启动资源清单
 
 启动 TUI 时，`Context` 会列出实际加载成功的系统提示词和项目指令文件路径，
 包括 `SYSTEM.md`、`APPEND_SYSTEM.md` 以及 `AGENTS.md` / `CLAUDE.md`。
 项目 `SYSTEM.md` 和 `APPEND_SYSTEM.md` 优先于全局同名文件；清单只显示生效的来源。
-没有加载文件时，启动页会省略 `Context`。`/context` 可查看当前完整资源清单，
-成功执行 `/reload` 后，启动页的 `Context` 和 `/context` 都会更新。
+没有加载文件时，启动页会省略 `Context`。`/context` 可在临时面板中查看当前完整资源清单，
+输入文字可筛选，↑/↓ 浏览，Esc 或 Enter 关闭。关闭只移除面板，不会清空聊天记录、
+模型上下文或已加载的文件；用量统计请使用 `/usage`。
+成功执行 `/reload` 后，启动页的 `Context` 和再次打开的 `/context` 都会更新。
 设置 `quietStartup: true` 可隐藏启动资源清单。
+
+### 技能命令
+
+与 pi 一样，使用 `/skill:名称 [附加要求]` 显式调用已发现的技能，例如：
+
+```text
+/skill:review 检查本次改动，重点关注并发问题
+```
+
+`/` 补全会列出技能名。`disable-model-invocation: true` 只阻止模型自动选择，
+不影响显式调用或补全。设置 `enableSkillCommands: false` 可隐藏技能补全，
+但手动输入 `/skill:名称` 仍有效。成功执行 `/reload` 后，补全更新为最新技能清单。
+普通模式每次调用读取当前技能文件正文；`--resource-config` 精确资源模式则使用启动时已验证的正文快照，文件变更需重启生效。
+附加要求保留原有空格和换行。命令发现 API 同样列出技能，标记为 `source: "skill"`；
+`enableSkillCommands` 只过滤本地 TUI 补全，不影响 API 的技能清单。
+未知技能或读取/解析失败的命令原样进入普通输入流程，不会吞掉请求。
+`/skills` 仍可列出清单，旧的 `/skills 名称 [附加要求]` 用法保持兼容。
 
 ### 更新日志
 
@@ -256,6 +278,21 @@ rpi 使用全局 `settings.json` 中的 `lastRpiChangelogVersion` 记录已读�
 
 可在 `settings.json` 的 `keybindings` 中设置 `"tui.altScreen.bottom": "ctrl+end"`。
 提示会显示实际快捷键；设置为 `null` 可禁用按键，点击入口仍可使用。
+
+### 数学公式渲染
+
+助手回复中的 LaTeX 公式会直接渲染成可读文本，不需要终端支持图片协议：
+
+- 行内公式：`$e^{i\pi}+1=0$` → `e^(iπ)+1=0`。
+- 独立公式：`$$ … $$`、`\[ … \]`，以及 `\begin{aligned}`、`\begin{pmatrix}`、
+  `\begin{cases}` 等环境。独立的 `\\` 换行和 `&` 对齐点会保留成多行、多列，
+  矩阵会带对应的括号（`()`、`[]`、`{}`、`|`、`‖`）。
+- 覆盖范围：常见希腊字母与运算符、`\frac`、`\sqrt`、上下标、`\mathbb`/`\mathcal`、
+  `\text`/`\operatorname`、`\hat`/`\vec`/`\overline` 等装饰。
+
+渲染是尽力而为的 Unicode 近似：终端无法排版 TeX，也没有绘制分式横线或积分号大小的
+能力，无法转换成 Unicode 的上下标会退化成 `^(…)`/`_(…)`；未知命令保留命令名而不是
+报错。代码块和行内代码里的 `$` 保持原样，`$5` 这类货币金额不会被当作公式。
 
 ### 远程模式（`--server` / `--connect`）
 
@@ -312,6 +349,22 @@ rpi 使用自己的 `.rpi` 目录：
 
 全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/` 和 `extensions/`。同名资源发生冲突时，项目资源优先于全局资源。
 
+### 自定义主题
+
+主题文件是 pi 兼容的 JSON（`name` + `colors`，支持 `#rrggbb`、`oklch()`/`okhsl()`、
+0-255 调色板索引与 `vars` 变量引用；缺省字段回落默认配色）。三个来源可用：
+
+- 内置 preset：`dark` / `light` / `monochrome`；
+- 文件路径：`rpi --theme ~/ocean.json`，或 `settings.json` 的 `"theme"` 字段写路径
+  （`--theme` 优先于 settings；加载失败时警告并回落默认主题，不阻断启动）；
+- 主题目录发现：`~/.rpi/agent/themes/*.json`（全局）与 `.rpi/themes/*.json`（项目，
+  优先于全局）。`/theme` 选择器在三个内置项之后列出发现的主题（按文件名），
+  选中即生效并持久化；`/theme <名字>` 直达应用。扩展包也可贡献主题
+  （`resources_discover` 的 `themePaths`，优先级在目录之后）。
+
+`--no-themes` 关闭目录发现与扩展主题（内置 preset 仍可用）。untrusted 项目不会
+加载其 `.rpi/themes/`；`/reload` 会重建主题列表，被移除的激活主题回落默认配色。
+
 项目级 `.rpi/settings.json` 可以追加资源目录：
 
 ```json
@@ -339,7 +392,7 @@ rpi --project-only
 RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 ```
 
-会话默认保存到 agent 配置目录下的 sessions；`--no-session` 可使用临时会话。
+会话默认保存到当前项目的 `<cwd>/.rpi/sessions`；`RPI_CODING_AGENT_SESSION_DIR` 可覆盖该路径，命令行 `--session-dir <dir>` 和 `settings.json` 的 `sessionDir` 优先于它。根目录内再按 cwd 编码分子目录。`--no-session` 可使用临时会话。
 
 ## 6. Rust 插件
 
@@ -371,6 +424,8 @@ rpi install my-extension --github https://github.com/owner/repo
 
 自定义仓库也须发布同一分发协议。显式仓库不依赖 crates.io；省略版本时，只在该仓库的 `<包名>-v<版本>` 标签中选择最新稳定版本。不会使用仓库的全局 latest Release。后续 `--force` 重装和启动更新检查会保留来源，并核对新版本的 manifest 是否适配当前平台。
 
+扩展目录仓库已迁移到 `pi-rust/rpi-extension`（原 `pi-rust/rpi-package`）。两个地址视为同一项目：已有安装（包括只记录 `prebuilt:<仓库>` 来源的旧记录）和 `--github pi-rust/rpi-package` 调用仍可升级，版本发现会按新仓库的 `<包名>-v<版本>` 标签跟随迁移并改写安装来源；旧仓库已发布的版本及其 CDN 前缀继续可用，因此固定旧版本的安装不会失效。
+
 发布者必须先上传所声明平台的压缩包，最后上传 manifest。manifest 尚未发布、目标平台缺失或校验不通过时安装失败，不会自动编译或选择其他版本。需要源码编译时显式使用：
 
 ```bash
@@ -380,11 +435,22 @@ rpi install rpi-todo --build --version 0.2.0 --force
 
 预编译安装记录包括版本、仓库、目标平台、源码提交、SDK ABI 和校验值；安装与卸载使用同一事务机制。加载时仍会验证实际插件入口与 API 结构大小。系统原生运行库依赖仍由操作系统提供。
 
+包可以在库文件旁附带运行所需的文件，例如 Node 工作进程 `runtime/main.mjs`。压缩包根目录的 `runtime-assets.json` 索引由包的发布构建工具生成，列出每个文件的路径、大小和 SHA-256。安装器先在内存中校验全部内容，再与库文件一起以事务方式写入扩展目录，并记录在安装注册表中。升级会替换这些文件；卸载会连同因此变空的目录一并删除。路径须为相对的 ASCII 普通路径，不得包含 `..`、隐藏组件、`node_modules`、原生库后缀、Windows 设备名（如 `CON`、`NUL`、`COM1`）、以点结尾的组件、符号链接或索引未声明的文件；单文件不超过 128 MiB，展开后的总量不超过 256 MiB，压缩包条目总数不超过 128。没有索引的压缩包只安装库文件。旧版 rpi 不支持此功能：它读取这类压缩包时只安装库文件而不会拒绝，因此发布声明了附属文件的包之前，应先升级 rpi。
+
 本地开发：
 
 ```bash
 rpi install my-extension --path ../my-rpi-extension --force
 ```
+
+推荐用 `rpi extension update` 更新全部项目链接扩展和全局 registry/prebuilt 扩展，
+或用 `rpi extension update <name>` 按名称更新。预编译扩展可以用
+`rpi extension update --cdn <URL>` 通过 HTTPS CDN 下载归档；清单仍从 GitHub
+获取，CDN 失败会回退到 GitHub。该选项不影响项目链接扩展或 Cargo 构建扩展。
+更新保留原来的 Cargo 构建后端或显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+旧命令 `rpi package update [name]` 仍兼容，但扩展更新推荐使用
+`rpi extension update [name]`。项目链接管理仍使用 `rpi package link`、
+`rpi package list`、`rpi package unlink`，这些命令名称不变。
 
 开发扩展项目时使用 watch 模式：
 
@@ -412,7 +478,7 @@ rpi package unlink my-extension
 
 ### 网页搜索与抓取
 
-联网工具由独立的 [rpi-package 扩展](https://github.com/pi-rust/rpi-package) 提供，
+联网工具由独立的 [rpi-extension 扩展](https://github.com/pi-rust/rpi-extension) 提供，
 不属于 CLI 默认内置工具。按需安装后重启 rpi：
 
 ```bash

@@ -29,10 +29,12 @@
 
 pub mod agent_session;
 pub mod app;
+pub mod approval_gate;
 pub mod args;
 pub mod auth;
 pub mod auth_guidance;
 pub mod brand;
+mod cdn;
 pub mod changelog;
 mod child_agents;
 pub mod config;
@@ -49,28 +51,44 @@ pub mod fs_watch;
 pub mod install;
 pub mod interactive_tui;
 pub mod key_trace;
+pub mod message_agent;
+mod mini;
 pub mod model_registry;
 pub mod modes;
+mod native_durable;
 pub mod packages;
 pub mod prebuilt_extensions;
 mod prebuilt_release;
 pub mod provider;
+pub mod provider_probe;
 pub mod remote;
+mod resource_commands;
 pub mod resource_dirs;
+pub mod resource_management;
+pub mod resource_selection;
 pub mod resume_picker;
 pub(crate) mod rpc;
+mod saved_session_read;
 pub mod session;
 pub mod session_cwd;
 pub mod session_driver;
+pub mod session_gc;
 pub mod settings;
 mod side_questions;
 pub mod source_info;
+mod startup_diagnostics;
+pub mod themes;
 pub mod timings;
 mod transcript_navigation;
 pub mod transcript_view;
 pub mod trust;
 pub mod tui_shell;
 pub mod updates;
+
+/// One session's agent home (auth/models/settings/trust, resources, sessions).
+/// `AgentHome::process()` is the historical CLI home; embedding hosts pass an
+/// explicit path to run isolated sessions in one process.
+pub use config::AgentHome;
 
 /// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export
 /// (sourced from `package.json`; here from `env!("CARGO_PKG_VERSION")`).

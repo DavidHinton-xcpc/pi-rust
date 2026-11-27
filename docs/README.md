@@ -16,8 +16,10 @@
 | Rust 动态库扩展与 ABI | [扩展开发](extensions/authoring.md) |
 | 启动、会话与关闭事件 | [扩展生命周期](extensions/lifecycle.md) |
 | 子 agent 配置继承、权限与生命周期 | [宿主管理的子 agent](extensions/subagents.md) |
+| Native RPC 精确启动资源、工具与观测（Stage A） | [Resource selection RPC](resource-selection-rpc.md) |
 | 无头服务端与远程 TUI | [远程模式](remote/user-guide.md) |
 | Agent 与扩展调试 | [Rust 调试指南](debugging/rust-debugging.md) |
+| Windows 上修饰键 + Enter 失效（终端改写 vs 守卫） | [Shift+Enter 排查](debugging/windows-shift-enter.md) |
 | 重复思考、取消与崩溃恢复排查 | [问题复盘](debugging/llm-repetition-forensics.md)（历史证据与修复过程） |
 | 启动、内存与安装体积测量 | [性能基准](performance/benchmark-vs-pi.md)（含测量日期与边界） |
 | 流式消息复制、增量合并与实测 | [消息传递优化](performance/message-copy.md) |
@@ -25,6 +27,7 @@
 | 同机运行时复测、瓶颈定位与优化验证 | [2026-10-24 Linux 复测](performance/runtime-20261024/README.md) |
 | 长历史复制、会话追加与工具修复优化 | [2026-10-24 长历史复测](performance/history-20261024/README.md) |
 | 剩余性能差距、调用栈与单项控制实验 | [2026-10-24 性能定位](performance/diagnosis-20261024/README.md) |
+| 回归测试总清单、CI 覆盖、会话恢复、资源与海量历史冷启动 | [测试清单与流程](maintaining/testing.md) |
 | 发版与跨平台分发 | [发布流程](maintaining/releasing.md) |
 | 对外介绍与文章草稿 | [推广素材](promotion/README.md) |
 | CLI `docs` 工具的模型可读输入 | [内置文档源](rpi-tool/README.md) |

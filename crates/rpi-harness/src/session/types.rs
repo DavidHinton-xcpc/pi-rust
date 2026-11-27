@@ -14,13 +14,111 @@ use std::collections::BTreeMap;
 use rpi_ai::types::{DeferredHandle, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
-use crate::error::SessionResult;
+use crate::error::{SessionError, SessionResult};
 
 /// JSON value alias — mirrors `JsonValue` from the TS module. `pi-harness`
 /// stores opaque app payloads as `serde_json::Value` rather than a recursive
 /// Rust enum; the behavior (JSON-serializable, no symbols/functions) is the
 /// same and the codec's `assert_json_serializable` keeps it sound.
 pub type JsonValue = serde_json::Value;
+
+/// Backend identity for a history image. `revision` is the reducer's highest
+/// mutation sequence; `generation` changes only after a successful complete
+/// history replacement. They are intentionally independent so a rewrite can
+/// preserve reducer sequence authority without admitting same-sequence ABA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryIdentity {
+    pub revision: u64,
+    pub generation: u64,
+}
+
+/// A complete reducer history image for the replacement API. Progress is
+/// deliberately not part of this image and must be preserved by a backend.
+/// JSONL callers additionally need the canonical mutation image because a
+/// reducer snapshot does not retain the historical lane name on each entry.
+#[derive(Debug, Clone)]
+pub struct HistoryReplacement {
+    pub state: crate::session::state::SessionState,
+    pub canonical_mutations: Option<Vec<SessionMutation>>,
+}
+
+/// A serialized reducer checkpoint used by the explicit bounded compaction
+/// path. Derived indexes are rebuilt by [`SessionState`] deserialization; the
+/// checkpoint is not a writer token and does not carry progress streams.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryCheckpoint {
+    pub format: String,
+    pub version: u32,
+    pub history_identity: HistoryIdentity,
+    pub state: crate::session::state::SessionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_archive: Option<crate::durable::experimental_ledger::archive::ReceiptArchive>,
+}
+
+impl HistoryCheckpoint {
+    pub const FORMAT: &'static str = "rpi-native-session-history-checkpoint";
+    pub const VERSION: u32 = 1;
+    /// Logical serialized-image bound; this is not a physical RSS guarantee.
+    pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    pub fn new(
+        history_identity: HistoryIdentity,
+        state: crate::session::state::SessionState,
+    ) -> SessionResult<Self> {
+        if state.sequence() != history_identity.revision {
+            return Err(SessionError::invalid_entry(
+                "history checkpoint identity does not match reducer sequence",
+            ));
+        }
+        let checkpoint = Self {
+            format: Self::FORMAT.to_owned(),
+            version: Self::VERSION,
+            history_identity,
+            state,
+            receipt_archive: None,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Attach the validated historical receipt archive that belongs to this
+    /// checkpoint. Old-generation receipts remain historical and cannot act as
+    /// current writer proof.
+    pub fn with_receipt_archive(
+        mut self,
+        archive: crate::durable::experimental_ledger::archive::ReceiptArchive,
+    ) -> SessionResult<Self> {
+        self.receipt_archive = Some(archive);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> SessionResult<()> {
+        if self.format != Self::FORMAT
+            || self.version != Self::VERSION
+            || self.state.sequence() != self.history_identity.revision
+        {
+            return Err(SessionError::invalid_entry(
+                "invalid history checkpoint format or identity",
+            ));
+        }
+        if let Some(archive) = &self.receipt_archive {
+            archive.validate().map_err(|_| {
+                SessionError::invalid_entry("invalid history checkpoint receipt archive")
+            })?;
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| SessionError::invalid_entry("history checkpoint is not serializable"))?;
+        if encoded.len() > Self::MAX_BYTES {
+            return Err(SessionError::invalid_entry(
+                "history checkpoint exceeds the serialized size limit",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Reverse of [`provisioned_into_entry`]: pull a [`ProvisionedEntry`] out of a
 /// full [`Entry`] (dropping storage-assigned `seq`/`parent_id`/`timestamp`).
@@ -338,115 +436,150 @@ impl Serialize for Entry {
 impl<'de> Deserialize<'de> for Entry {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;
-        let obj = raw
-            .as_object()
-            .ok_or_else(|| serde::de::Error::custom("entry is not a JSON object"))?;
-        let ty = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| serde::de::Error::custom("entry missing \"type\""))?;
-        let base = deserialize_base(obj).map_err(serde::de::Error::custom)?;
-        let entry = match ty {
+        let serde_json::Value::Object(obj) = raw else {
+            return Err(serde::de::Error::custom("entry is not a JSON object"));
+        };
+        Self::decode_flat_object(obj)
+    }
+}
+
+impl Entry {
+    /// Consume the codec's already-parsed object without rebuilding its Value
+    /// tree. Keep serde_json's private RawValue normalization on the uncommon
+    /// path: an otherwise unknown key can change Value deserialization semantics.
+    pub(crate) fn from_json_object(
+        obj: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, serde_json::Error> {
+        if object_contains_raw_value_key(&obj) {
+            serde_json::from_value(serde_json::Value::Object(obj))
+        } else {
+            Self::decode_flat_object(obj)
+        }
+    }
+
+    fn decode_flat_object<E: serde::de::Error>(
+        mut obj: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, E> {
+        let ty = String::from(
+            obj.get("type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| E::custom("entry missing \"type\""))?,
+        );
+        let base = deserialize_base(&obj).map_err(E::custom)?;
+        let entry = match ty.as_str() {
             "message" => Entry::Message(MessageEntry {
                 base,
-                message: serde_json::from_value(obj.get("message").cloned().ok_or_else(|| {
-                    serde::de::Error::custom("message entry missing \"message\"")
-                })?)
-                .map_err(serde::de::Error::custom)?,
+                message: serde_json::from_value(
+                    obj.remove("message")
+                        .ok_or_else(|| E::custom("message entry missing \"message\""))?,
+                )
+                .map_err(E::custom)?,
                 terminate: obj.get("terminate").and_then(|v| v.as_bool()),
             }),
-            "model_change" => {
-                Entry::ModelChange(ModelChangeEntry {
-                    base,
-                    provider: serde_json::from_value(obj.get("provider").cloned().ok_or_else(
-                        || serde::de::Error::custom("model_change missing \"provider\""),
-                    )?)
-                    .map_err(serde::de::Error::custom)?,
-                    model_id: serde_json::from_value(obj.get("modelId").cloned().ok_or_else(
-                        || serde::de::Error::custom("model_change missing \"modelId\""),
-                    )?)
-                    .map_err(serde::de::Error::custom)?,
-                })
-            }
+            "model_change" => Entry::ModelChange(ModelChangeEntry {
+                base,
+                provider: serde_json::from_value(
+                    obj.remove("provider")
+                        .ok_or_else(|| E::custom("model_change missing \"provider\""))?,
+                )
+                .map_err(E::custom)?,
+                model_id: serde_json::from_value(
+                    obj.remove("modelId")
+                        .ok_or_else(|| E::custom("model_change missing \"modelId\""))?,
+                )
+                .map_err(E::custom)?,
+            }),
             "thinking_level_change" => Entry::ThinkingLevel(ThinkingLevelEntry {
                 base,
                 thinking_level: serde_json::from_value(
-                    obj.get("thinkingLevel").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("thinking_level_change missing \"thinkingLevel\"")
+                    obj.remove("thinkingLevel").ok_or_else(|| {
+                        E::custom("thinking_level_change missing \"thinkingLevel\"")
                     })?,
                 )
-                .map_err(serde::de::Error::custom)?,
+                .map_err(E::custom)?,
             }),
             "active_tools_change" => Entry::ActiveTools(ActiveToolsEntry {
                 base,
                 active_tool_names: serde_json::from_value(
-                    obj.get("activeToolNames").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("active_tools_change missing \"activeToolNames\"")
+                    obj.remove("activeToolNames").ok_or_else(|| {
+                        E::custom("active_tools_change missing \"activeToolNames\"")
                     })?,
                 )
-                .map_err(serde::de::Error::custom)?,
+                .map_err(E::custom)?,
             }),
             "compaction" => {
-                let retained_tail =
-                    serde_json::from_value(obj.get("retainedTail").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("compaction missing \"retainedTail\"")
-                    })?)
-                    .map_err(serde::de::Error::custom)?;
-                let summary =
-                    serde_json::from_value(obj.get("summary").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("compaction missing \"summary\"")
-                    })?)
-                    .map_err(serde::de::Error::custom)?;
-                let tokens_before =
-                    serde_json::from_value(obj.get("tokensBefore").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("compaction missing \"tokensBefore\"")
-                    })?)
-                    .map_err(serde::de::Error::custom)?;
+                let retained_tail = serde_json::from_value(
+                    obj.remove("retainedTail")
+                        .ok_or_else(|| E::custom("compaction missing \"retainedTail\""))?,
+                )
+                .map_err(E::custom)?;
+                let summary = serde_json::from_value(
+                    obj.remove("summary")
+                        .ok_or_else(|| E::custom("compaction missing \"summary\""))?,
+                )
+                .map_err(E::custom)?;
+                let tokens_before = serde_json::from_value(
+                    obj.remove("tokensBefore")
+                        .ok_or_else(|| E::custom("compaction missing \"tokensBefore\""))?,
+                )
+                .map_err(E::custom)?;
                 Entry::Compaction(CompactionEntry {
                     base,
                     summary,
                     retained_tail,
                     tokens_before,
-                    details: obj.get("details").cloned(),
+                    details: obj.remove("details"),
                     usage: obj
-                        .get("usage")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                        .remove("usage")
+                        .and_then(|v| serde_json::from_value(v).ok()),
                 })
             }
             "branch_summary" => Entry::BranchSummary(BranchSummaryEntry {
                 base,
-                from_id: serde_json::from_value(obj.get("fromId").cloned().ok_or_else(|| {
-                    serde::de::Error::custom("branch_summary missing \"fromId\"")
-                })?)
-                .map_err(serde::de::Error::custom)?,
-                summary: serde_json::from_value(obj.get("summary").cloned().ok_or_else(|| {
-                    serde::de::Error::custom("branch_summary missing \"summary\"")
-                })?)
-                .map_err(serde::de::Error::custom)?,
-                details: obj.get("details").cloned(),
+                from_id: serde_json::from_value(
+                    obj.remove("fromId")
+                        .ok_or_else(|| E::custom("branch_summary missing \"fromId\""))?,
+                )
+                .map_err(E::custom)?,
+                summary: serde_json::from_value(
+                    obj.remove("summary")
+                        .ok_or_else(|| E::custom("branch_summary missing \"summary\""))?,
+                )
+                .map_err(E::custom)?,
+                details: obj.remove("details"),
                 usage: obj
-                    .get("usage")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    .remove("usage")
+                    .and_then(|v| serde_json::from_value(v).ok()),
             }),
             "custom" => Entry::Custom(CustomEntry {
                 base,
                 custom_type: serde_json::from_value(
-                    obj.get("customType")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("custom missing \"customType\""))?,
+                    obj.remove("customType")
+                        .ok_or_else(|| E::custom("custom missing \"customType\""))?,
                 )
-                .map_err(serde::de::Error::custom)?,
-                data: obj.get("data").cloned(),
+                .map_err(E::custom)?,
+                data: obj.remove("data"),
             }),
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "unknown entry type {other}"
-                )))
-            }
+            other => return Err(E::custom(format!("unknown entry type {other}"))),
         };
         Ok(entry)
     }
 }
+
+fn object_contains_raw_value_key(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    fn contains(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(obj) => object_contains_raw_value_key(obj),
+            serde_json::Value::Array(values) => values.iter().any(contains),
+            _ => false,
+        }
+    }
+    obj.contains_key("$serde_json::private::RawValue") || obj.values().any(contains)
+}
+
+#[cfg(test)]
+#[path = "entry_decode_tests.rs"]
+pub(crate) mod entry_decode_tests;
 
 fn deserialize_base(obj: &serde_json::Map<String, serde_json::Value>) -> Result<EntryBase, String> {
     Ok(EntryBase {
@@ -721,6 +854,18 @@ pub struct OperationFinishedRecord {
     pub outcome: OperationOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<OperationError>,
+    /// Stable run result identity; absent on legacy/non-run terminal records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResultIdentity>,
+}
+
+/// References existing entries instead of duplicating assistant payloads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunResultIdentity {
+    pub leaf_id: String,
+    pub final_entry_id: Option<String>,
+    pub assistant_entry_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1081,13 +1226,41 @@ pub struct EntryCursor {
     pub after_seq: u64,
 }
 
+/// Reserved native archival data, not context-transform/projector input.
+/// Match exact versioned types; ordinary extension custom entries stay visible.
+pub(crate) fn is_tool_program_body_type(custom_type: &str) -> bool {
+    matches!(
+        custom_type,
+        crate::tool_program_body::CHUNK_CUSTOM_TYPE | crate::tool_program_body::COMMIT_CUSTOM_TYPE
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EntryQuery {
+    /// Internal context/recovery policy, applied before payload hydration.
+    /// False by default: explicit history/export queries still expose bodies.
+    pub exclude_tool_program_bodies: bool,
     pub entry_type: Option<&'static str>,
     pub custom_type: Option<String>,
+    /// Exact identity, useful for a bounded branch-membership check.
+    pub entry_id: Option<String>,
+    /// Tool inspection filters before cloning unrelated transcript payloads.
+    pub tool_call_id: Option<String>,
+    /// Select assistant/user boundaries for bounded legacy tool correlation.
+    pub message_boundary_only: bool,
+    /// Host-managed custom-message outbox metadata. Filtering precedes cloning.
+    pub outbox_key: Option<String>,
     pub order: Option<EntryOrder>,
     pub limit: Option<usize>,
     pub cursor: Option<EntryCursor>,
+}
+
+/// Real entry identity and parent link, without a transcript payload.
+/// Ancestry includes all entry kinds, including archival custom entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryAncestry {
+    pub id: String,
+    pub parent_id: Option<String>,
 }
 
 /// Branch-scan bounds. Mirrors TS `BranchBounds`.
@@ -1100,6 +1273,168 @@ pub struct BranchBounds {
     pub stop_at_id: Option<String>,
 }
 
+// Bounded transcript reads. These are session/storage types, not UI or RPC types.
+/// Chronological transcript window ending exclusively before `before_id`.
+#[derive(Debug, Clone)]
+pub struct TranscriptPageQuery {
+    pub limit: usize,
+    pub before_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptPage {
+    pub entries: Vec<Entry>,
+    pub total: usize,
+    pub has_more: bool,
+    pub leaf_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageSummaryQuery {
+    #[serde(default = "default_summary_limit")]
+    pub limit: usize,
+    #[serde(default = "default_summary_role")]
+    pub role: String,
+    pub before_id: Option<String>,
+    pub leaf_id: Option<String>,
+}
+fn default_summary_limit() -> usize {
+    10
+}
+fn default_summary_role() -> String {
+    "user".into()
+}
+impl Default for MessageSummaryQuery {
+    fn default() -> Self {
+        Self {
+            limit: 10,
+            role: default_summary_role(),
+            before_id: None,
+            leaf_id: None,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSummary {
+    pub entry_id: String,
+    pub role: String,
+    pub preview: String,
+    pub timestamp: i64,
+    pub has_images: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSummaryPage {
+    pub filtered: bool,
+    pub role: String,
+    pub messages: Vec<MessageSummary>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub next_before_id: Option<String>,
+    pub has_more: bool,
+    pub leaf_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageWindowQuery {
+    #[serde(default = "default_window_limit")]
+    pub limit: usize,
+    pub anchor_id: Option<String>,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+    pub leaf_id: Option<String>,
+}
+fn default_window_limit() -> usize {
+    48
+}
+impl Default for MessageWindowQuery {
+    fn default() -> Self {
+        Self {
+            limit: 48,
+            anchor_id: None,
+            before_id: None,
+            after_id: None,
+            leaf_id: None,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct MessageWindowPage {
+    pub entries: Vec<Entry>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub next_before_id: Option<String>,
+    pub next_after_id: Option<String>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+    pub leaf_id: Option<String>,
+}
+
+/// A bounded, UI-independent page of every entry variant on one pinned branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BranchEntryPageQuery {
+    pub leaf_id: Option<String>,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+    #[serde(default = "default_branch_page_limit")]
+    pub limit: usize,
+    #[serde(default = "default_branch_page_bytes")]
+    pub max_bytes: usize,
+}
+fn default_branch_page_limit() -> usize {
+    50
+}
+fn default_branch_page_bytes() -> usize {
+    4 * 1024 * 1024
+}
+impl Default for BranchEntryPageQuery {
+    fn default() -> Self {
+        Self {
+            leaf_id: None,
+            before_id: None,
+            after_id: None,
+            limit: default_branch_page_limit(),
+            max_bytes: default_branch_page_bytes(),
+        }
+    }
+}
+
+/// Entries are chronological. Cursors are exclusive and belong to `leaf_id`.
+/// The byte budget counts complete JSON entries (not envelope/separators); an
+/// oversized entry is returned alone, never truncated or silently skipped.
+#[derive(Debug, Clone)]
+pub struct BranchEntryPage {
+    pub entries: Vec<Entry>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub next_before_id: Option<String>,
+    pub next_after_id: Option<String>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+    pub leaf_id: Option<String>,
+}
+
+/// Full-branch settings and assistant-only usage, without context messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchOverview {
+    pub thinking_level: String,
+    pub model: Option<(String, String)>,
+    pub active_tool_names: Option<Vec<String>>,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub cost_total: f64,
+    /// Latest eligible assistant cache-hit percentage, not an aggregate rate.
+    pub cache_hit_rate: Option<f64>,
+    /// Latest positive successful measurement since the last compaction.
+    pub context_tokens: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecordQuery {
     pub lane: Option<String>,
@@ -1107,10 +1442,33 @@ pub struct RecordQuery {
     pub run_id: Option<String>,
     /// Exact operation intent kind. Valid only with type `operation_started`.
     pub operation_kind: Option<&'static str>,
+    /// Queue filters are applied before copying payloads or applying the limit.
+    pub queue_kind: Option<QueueKind>,
+    pub tool_call_id: Option<String>,
+    pub target_entry_id: Option<String>,
+    /// Select only enqueues with neither a committed target nor a cancellation.
+    pub pending_queue_only: bool,
     /// Exclusive chronological lower bound: `seq > after_seq`, regardless of order.
     pub after_seq: Option<u64>,
     pub order: Option<EntryOrder>,
     pub limit: Option<usize>,
+}
+
+/// A bounded chronological page. Bounds are exclusive; `from_end` selects
+/// the newest matching window without changing the ascending output order.
+#[derive(Debug, Clone)]
+pub struct RecordPageQuery {
+    pub lane: String,
+    pub after_seq: Option<u64>,
+    pub before_seq: Option<u64>,
+    pub limit: usize,
+    pub from_end: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordPage {
+    pub records: Vec<LaneRecord>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1137,6 +1495,15 @@ pub struct SessionStats {
 pub struct LanePointer {
     pub lane: String,
     pub leaf_id: Option<String>,
+}
+
+/// Authoritative live lane identity. `generation` advances only for explicit
+/// lane create/move mutations; ordinary entry/record appends do not change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaneBranch {
+    pub lane: String,
+    pub leaf_id: Option<String>,
+    pub generation: u64,
 }
 
 /// `LogItem` — the unified mutation log `get_log` returns. Mirrors the TS union
@@ -1309,14 +1676,172 @@ pub trait SessionStorage: Send + Sync {
         false
     }
 
+    /// Whether this binding currently owns a backend writer lease. The default
+    /// is false so hosts fail closed for durable backends that have not opted
+    /// into an ownership capability; in-memory backends remain local-only.
+    fn writer_lease_held(&self) -> bool {
+        false
+    }
+
+    /// Retire a backend writer binding. Compatibility backends may treat this
+    /// as a no-op; durable bindings must not silently reacquire afterwards.
+    fn release_writer_lease(&self) {}
+
     // Lanes
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>>;
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()>;
     async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()>;
 
+    /// Atomically read one lane's current leaf and explicit lane-mutation
+    /// generation. Custom storage defaults to fail-closed: callers must not
+    /// substitute the ordinary leaf or history revision for this identity.
+    async fn lane_branch(&self, lane: &str) -> SessionResult<SessionLaneBranch> {
+        let _ = lane;
+        Err(SessionError::storage("lane branch identity is unsupported"))
+    }
+
+    // Transient payloads use a separate sequence domain and never enter history.
+    // CommitStream bindings remain immutable lane records.
+    async fn append_progress(
+        &self,
+        records: Vec<AssistantFrameRecord>,
+    ) -> SessionResult<Vec<AssistantFrameRecord>>;
+    async fn read_progress(&self, run_id: &str) -> SessionResult<Vec<AssistantFrameRecord>>;
+    /// Retire payloads proven terminal by this session's durable OperationFinished.
+    /// Returns deleted payload count; neither history nor progress sequence advances.
+    async fn prune_completed_progress(&self) -> SessionResult<usize>;
+
     // Entries + records
+    /// Snapshot token for optimistic, conditional history writes. Transient
+    /// progress must not advance it. Unsupported backends fail closed.
+    async fn history_revision(&self) -> SessionResult<u64> {
+        Err(SessionError::storage(
+            "conditional history writes are unsupported",
+        ))
+    }
+
+    /// Replacement generation, distinct from the reducer's
+    /// `history_revision` sequence. Ordinary appends do not advance it;
+    /// successful whole-history replacement advances it under the same backend
+    /// CAS boundary. The compatibility default is zero for legacy or
+    /// replacement-unsupported backends.
+    async fn history_generation(&self) -> SessionResult<u64> {
+        Ok(0)
+    }
+
+    /// Observe the reducer revision and replacement generation as one backend
+    /// identity. Backends should override this when both values share a gate;
+    /// the compatibility default is only a best-effort pair.
+    async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+        Ok(HistoryIdentity {
+            revision: self.history_revision().await?,
+            generation: self.history_generation().await?,
+        })
+    }
+
+    /// Return the current physical history-file size when this backend has a
+    /// stable file representation. `None` is intentional for Memory/SQLite or
+    /// backends that cannot provide a physical-size observation; it is not a
+    /// resource guarantee or an RSS/IO bound.
+    async fn history_physical_bytes(&self) -> SessionResult<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Read the explicit checkpoint image, when this backend persists one.
+    /// The compatibility default is absent; it does not infer a checkpoint
+    /// from ordinary mutation history.
+    async fn history_checkpoint(&self) -> SessionResult<Option<HistoryCheckpoint>> {
+        Ok(None)
+    }
+
+    /// Atomically replace the complete history image only when both identity
+    /// components match. Implementations must preserve progress and reject a
+    /// stale `(revision, generation)` without publishing any part of the
+    /// replacement. Unsupported backends fail closed.
+    async fn replace_history_if_revision_and_generation(
+        &self,
+        _expected_revision: u64,
+        _expected_generation: u64,
+        _replacement: HistoryReplacement,
+    ) -> SessionResult<HistoryIdentity> {
+        Err(SessionError::storage(
+            "whole-history replacement is unsupported",
+        ))
+    }
+
+    /// Publish a validated checkpoint image under the same revision-plus-
+    /// generation CAS. The default delegates to the existing complete-image
+    /// replacement for resident backends; JSONL overrides this to publish the
+    /// checkpoint in reserved header metadata and remove old mutation lines.
+    async fn replace_history_with_checkpoint_if_revision_and_generation(
+        &self,
+        expected_revision: u64,
+        expected_generation: u64,
+        checkpoint: HistoryCheckpoint,
+    ) -> SessionResult<HistoryIdentity> {
+        checkpoint.validate()?;
+        if checkpoint.history_identity
+            != (HistoryIdentity {
+                revision: expected_revision,
+                generation: expected_generation,
+            })
+        {
+            return Err(SessionError::storage(
+                "history checkpoint identity does not match replacement CAS",
+            ));
+        }
+        if checkpoint.receipt_archive.is_some() {
+            return Err(SessionError::storage(
+                "checkpoint receipt archives are unsupported by this backend",
+            ));
+        }
+        self.replace_history_if_revision_and_generation(
+            expected_revision,
+            expected_generation,
+            HistoryReplacement {
+                state: checkpoint.state,
+                canonical_mutations: None,
+            },
+        )
+        .await
+    }
+
+    /// Compare the original revision and append within the storage's mutation
+    /// boundary. Never implement this as a read followed by ordinary append.
+    async fn append_entry_if_revision(
+        &self,
+        _entry: ProvisionedEntry,
+        _lane: &str,
+        _expected: u64,
+    ) -> SessionResult<Entry> {
+        Err(SessionError::storage(
+            "conditional history writes are unsupported",
+        ))
+    }
+
+    async fn append_record_if_revision(
+        &self,
+        _record: LaneRecord,
+        _expected: u64,
+    ) -> SessionResult<LaneRecord> {
+        Err(SessionError::storage(
+            "conditional history writes are unsupported",
+        ))
+    }
+
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry>;
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord>;
+
+    /// Accept a cancellation batch without exposing a partially reduced batch.
+    /// This is an ACK boundary, not a power-loss transaction guarantee.
+    async fn append_queue_cancellations(
+        &self,
+        _records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        Err(SessionError::storage(
+            "queue cancellation batches are unsupported",
+        ))
+    }
 
     async fn append_record_and_entry(
         &self,
@@ -1356,7 +1881,71 @@ pub trait SessionStorage: Send + Sync {
     }
 
     // Reads
+    /// Optional bounded estimate for the default, hook-free lane context.
+    /// `None` means unsupported; read/validation failures must remain errors.
+    async fn context_usage(
+        &self,
+        _lane: &str,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        Ok(None)
+    }
+
+    /// Optional metadata-first transcript paging. `None` means unsupported;
+    /// supported backends return errors rather than falling back on failure.
+    async fn transcript_page(
+        &self,
+        _lane: &str,
+        _query: &TranscriptPageQuery,
+    ) -> SessionResult<Option<TranscriptPage>> {
+        Ok(None)
+    }
+    async fn branch_entry_page(
+        &self,
+        lane: &str,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        crate::session::branch_queries::storage_branch_entry_page(self, lane, query).await
+    }
+    async fn branch_overview(&self, lane: &str) -> SessionResult<BranchOverview> {
+        crate::session::branch_queries::storage_branch_overview(self, lane).await
+    }
+    async fn message_summaries(
+        &self,
+        lane: &str,
+        query: &MessageSummaryQuery,
+    ) -> SessionResult<MessageSummaryPage> {
+        let _ = (lane, query);
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message summaries unsupported by storage",
+        ))
+    }
+    async fn message_window(
+        &self,
+        lane: &str,
+        query: &MessageWindowQuery,
+    ) -> SessionResult<MessageWindowPage> {
+        let _ = (lane, query);
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message windows unsupported by storage",
+        ))
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>>;
+
+    /// Read a reserved entry and return `(tool_call_id, tool_name)` if it is a
+    /// tool result. The default hydrates the full entry; metadata-backed stores
+    /// may decode less, but must retain selected-payload integrity checks.
+    async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
+        let Some(Entry::Message(message)) = self.get_entry(id).await? else {
+            return Ok(None);
+        };
+        let rpi_agent::message::AgentMessage::ToolResult(result) = message.message else {
+            return Ok(None);
+        };
+        Ok(Some((result.tool_call_id, result.tool_name)))
+    }
+
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>>;
     async fn find_entries_on_branch(
         &self,
@@ -1364,6 +1953,34 @@ pub trait SessionStorage: Send + Sync {
         bounds: &BranchBounds,
         start: &str,
     ) -> SessionResult<Vec<Entry>>;
+
+    /// Validated ancestry, newest first, inclusive of the first matching bound.
+    /// `start` is the resolved branch tip; `bounds.start` is resolved by the view.
+    /// Native metadata-backed stores avoid payload reads. The compatibility
+    /// fallback hydrates full entries through the ordinary, unfiltered query;
+    /// custom stores should override this method to provide metadata-only reads.
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<EntryAncestry>> {
+        Ok(self
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::NewestFirst),
+                    ..Default::default()
+                },
+                bounds,
+                start,
+            )
+            .await?
+            .into_iter()
+            .map(|entry| EntryAncestry {
+                id: entry.id().to_owned(),
+                parent_id: entry.parent_id().map(str::to_owned),
+            })
+            .collect())
+    }
 
     /// Default, hook-free context projection. Backends may override this to
     /// walk their owned state while borrowing entries; the fallback preserves
@@ -1376,6 +1993,7 @@ pub trait SessionStorage: Send + Sync {
         let path = self
             .find_entries_on_branch(
                 &EntryQuery {
+                    exclude_tool_program_bodies: true,
                     order: Some(EntryOrder::OldestFirst),
                     ..Default::default()
                 },
@@ -1389,6 +2007,8 @@ pub trait SessionStorage: Send + Sync {
         ))
     }
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>>;
+    /// Count and select within one storage snapshot, cloning only the page.
+    async fn record_page(&self, query: &RecordPageQuery) -> SessionResult<RecordPage>;
     /// Returns unfinished `operation_started` records, newest first. Recovery
     /// uses `limit: 2`: 0 = idle, 1 = suspended, 2 = corruption.
     async fn find_open_operations(
@@ -1404,6 +2024,13 @@ pub trait SessionStorage: Send + Sync {
     async fn get_label(&self, id: &str) -> SessionResult<Option<String>>;
     async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()>;
     async fn get_stats(&self) -> SessionResult<SessionStats>;
+
+    /// Wait for any in-flight durable write to settle.
+    ///
+    /// Only durable backends have anything to wait for. The in-memory backend is
+    /// consistent by construction and the SQLite backend commits each mutation
+    /// inside the call that returns it, so the default is a no-op.
+    async fn drain(&self) {}
 }
 
 /// Repo-level lifecycle. Mirrors TS `SessionRepo`.
@@ -1427,6 +2054,47 @@ pub trait SessionRepo: Send + Sync {
 /// `SessionTree`. Lane-bound harness runners own one of these views.
 #[async_trait::async_trait]
 pub trait SessionTree: Send + Sync {
+    /// Optional bounded estimate for this lane's default, hook-free context.
+    /// `None` means unsupported, not an error fallback.
+    async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        Ok(None)
+    }
+
+    /// Optional metadata-first transcript paging for this lane-bound view.
+    async fn transcript_page(
+        &self,
+        _query: &TranscriptPageQuery,
+    ) -> SessionResult<Option<TranscriptPage>> {
+        Ok(None)
+    }
+    async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        crate::session::branch_queries::tree_branch_entry_page(self, query).await
+    }
+    async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        crate::session::branch_queries::tree_branch_overview(self).await
+    }
+    async fn message_summaries(
+        &self,
+        query: &MessageSummaryQuery,
+    ) -> SessionResult<MessageSummaryPage> {
+        let _ = query;
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message summaries unsupported by tree",
+        ))
+    }
+    async fn message_window(&self, query: &MessageWindowQuery) -> SessionResult<MessageWindowPage> {
+        let _ = query;
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message windows unsupported by tree",
+        ))
+    }
     async fn get_leaf_id(&self) -> SessionResult<Option<String>>;
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>>;
     async fn get_stats(&self) -> SessionResult<SessionStats>;
@@ -1445,6 +2113,28 @@ pub trait SessionTree: Send + Sync {
         query: &EntryQuery,
         bounds: &BranchBounds,
     ) -> SessionResult<Vec<Entry>>;
+    /// All identities on this branch, newest first, inclusive of the first
+    /// matching bound. Native views forward to storage metadata without loading
+    /// bodies. This compatibility fallback may hydrate full entries on custom
+    /// trees; override it to avoid those reads. Empty lane yields an empty path.
+    async fn branch_ancestry(&self, bounds: &BranchBounds) -> SessionResult<Vec<EntryAncestry>> {
+        Ok(self
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::NewestFirst),
+                    ..Default::default()
+                },
+                bounds,
+            )
+            .await?
+            .into_iter()
+            .map(|entry| EntryAncestry {
+                id: entry.id().to_owned(),
+                parent_id: entry.parent_id().map(str::to_owned),
+            })
+            .collect())
+    }
+
     async fn find_entry_on_branch(
         &self,
         query: &EntryQuery,

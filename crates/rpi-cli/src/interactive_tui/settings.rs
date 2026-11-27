@@ -46,7 +46,6 @@ pub(super) fn open_settings_selector(
     lane: &Arc<dyn AgentLane>,
     catalog: &[rpi_ai::Model],
     lane_model_id: &str,
-    chat: &Arc<Container>,
 ) {
     let settings = crate::settings::load_settings().unwrap_or_default();
     let items = settings_menu_items(&settings, state, lane_model_id);
@@ -63,11 +62,8 @@ pub(super) fn open_settings_selector(
     let lane_sel = lane.clone();
     let catalog_sel = catalog.to_vec();
     let lane_model_sel = lane_model_id.to_string();
-    let chat_sel = chat.clone();
     list.on_select(Arc::new(move |item| match item.key.as_str() {
-        "theme" => {
-            open_settings_theme_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel, &chat_sel)
-        }
+        "theme" => open_settings_theme_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel),
         "model" => open_settings_model_selector(
             &state_sel,
             &ec_sel,
@@ -76,7 +72,6 @@ pub(super) fn open_settings_selector(
             &lane_sel,
             &catalog_sel,
             &lane_model_sel,
-            &chat_sel,
         ),
         "thinking" => open_settings_thinking_selector(
             &state_sel,
@@ -86,23 +81,17 @@ pub(super) fn open_settings_selector(
             &lane_sel,
             &catalog_sel,
             &lane_model_sel,
-            &chat_sel,
         ),
-        "scoped-models" => open_scoped_models_selector(
-            &state_sel,
-            &ec_sel,
-            &editor_sel,
-            &tui_sel,
-            &catalog_sel,
-            &chat_sel,
-        ),
+        "scoped-models" => {
+            open_scoped_models_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel, &catalog_sel)
+        }
         _ => close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel),
     }));
 
     // ---- value rows ----
     // Apply live where possible, then persist so the choice survives a restart.
     let state_change = state.clone();
-    let chat_change = chat.clone();
+    let chat_change = state.notice_container();
     let tui_change = tui.clone();
     list.on_change(Arc::new(move |key, value| {
         let mut settings = crate::settings::load_settings().unwrap_or_default();
@@ -159,6 +148,7 @@ pub(super) fn settings_menu_items(
     };
     let hide_thinking = state.hide_thinking();
     let show_images = state.show_images.lock().map(|guard| *guard).unwrap_or(true);
+    let images_supported = rpi_tui::get_capabilities().protocol != rpi_tui::ImageProtocol::None;
     let show_cache_miss = settings.show_cache_miss_notices.unwrap_or(false);
     let http_idle = settings
         .http_idle_timeout_ms()
@@ -196,7 +186,11 @@ pub(super) fn settings_menu_items(
             "Show images",
             bool_setting_value(show_images),
         )
-        .with_description("Render images inline in the terminal")
+        .with_description(if images_supported {
+            "Render images inline in the terminal"
+        } else {
+            "Terminal cannot display inline images; previews stay as placeholders"
+        })
         .with_values(&["true", "false"]),
         SettingItem::new(
             "cache-miss-notices",
@@ -277,6 +271,26 @@ pub(super) fn bool_setting_value(value: bool) -> &'static str {
     }
 }
 
+/// Note shown after the inline-image setting changes.
+///
+/// `protocol` is passed in rather than read from the terminal so the wording is
+/// testable off a real terminal. Enabling images on a terminal that speaks
+/// neither Kitty nor iTerm2 is a no-op the user cannot otherwise see: the image
+/// component falls back to its `[Attached image]` placeholder, so a plain
+/// "enabled" reads as a promise rpi does not keep.
+pub(super) fn images_setting_note(enabled: bool, protocol: rpi_tui::ImageProtocol) -> String {
+    match (enabled, protocol) {
+        (false, _) => "Inline images disabled.".to_string(),
+        (true, rpi_tui::ImageProtocol::None) => {
+            "Inline images enabled, but this terminal cannot display them: ".to_string()
+                + "images will stay as text placeholders. rpi renders inline images "
+                + "through the Kitty graphics protocol (kitty, Ghostty, WezTerm, Warp) "
+                + "or iTerm2 inline images."
+        }
+        (true, _) => "Inline images enabled.".to_string(),
+    }
+}
+
 /// Apply one `/settings` value change to the running TUI and to `settings`.
 ///
 /// Returns a note to show in the transcript when the change is user-visible;
@@ -302,9 +316,9 @@ pub(super) fn apply_setting_change(
         "show-images" => {
             state.set_show_images(as_bool());
             settings.show_images = Some(as_bool());
-            Some(format!(
-                "Inline images {}.",
-                if as_bool() { "enabled" } else { "disabled" }
+            Some(images_setting_note(
+                as_bool(),
+                rpi_tui::get_capabilities().protocol,
             ))
         }
         // Live: read from `state` once per cache-miss notice.
@@ -370,46 +384,51 @@ pub(super) fn open_settings_theme_selector(
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-    chat: &Arc<Container>,
 ) {
-    let items = vec![
+    let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
+    let registry = state
+        .theme_registry
+        .read()
+        .ok()
+        .map(|registry| registry.clone());
+    if let Some(registry) = registry {
+        for name in registry.names() {
+            items.push(SelectItem::new(name, name));
+        }
+    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     list.on_select(Arc::new(move |item| {
-        let preset = match item.value.as_str() {
-            "light" => Some(ThemePreset::Light),
-            "monochrome" => Some(ThemePreset::Monochrome),
-            "dark" => Some(ThemePreset::Dark),
-            name => {
-                add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
-                close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
-                tui_sel.render_now(true);
-                return;
+        let registry = state_sel.theme_registry.read().ok().map(|r| r.clone());
+        match crate::themes::apply_and_persist(
+            &item.value,
+            &state_sel.theme_manager,
+            registry.as_ref(),
+        ) {
+            Ok(message) => {
+                state_sel.set_active_theme_spec(Some(item.value.clone()));
+                if let Some(registry_now) = registry.as_ref() {
+                    crate::themes::restart_theme_watcher(
+                        &state_sel.theme_watcher,
+                        Some(&item.value),
+                        registry_now,
+                        &state_sel.theme_manager,
+                        theme_watch_notify(&state_sel, tui_sel.clone()),
+                    );
+                }
+                add_note_message(&chat_sel, &message);
             }
-        };
-        let Some(preset) = preset else { return };
-        apply_theme_preset(preset);
-        state_sel.theme_manager.apply_preset(preset);
-        let mut settings = crate::settings::load_settings().unwrap_or_default();
-        settings.theme = Some(item.value.clone());
-        let saved = crate::settings::save_settings(&settings);
-        add_note_message(
-            &chat_sel,
-            &format!(
-                "Theme set to {} (saved{})",
-                item.label,
-                if saved.is_ok() { "" } else { ", not saved" },
-            ),
-        );
+            Err(message) => add_error_message(&chat_sel, &message),
+        }
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
         tui_sel.render_now(true);
     }));
@@ -442,11 +461,10 @@ pub(super) fn open_settings_model_selector(
     lane: &Arc<dyn AgentLane>,
     catalog: &[rpi_ai::Model],
     lane_model_id: &str,
-    chat: &Arc<Container>,
 ) {
     let items = model_selector_items(catalog, lane_model_id);
     if items.is_empty() {
-        add_note_message(chat, "No models in the catalog.");
+        add_note_message(&state.notice_container(), "No models in the catalog.");
         tui.request_render(false);
         return;
     }
@@ -457,7 +475,7 @@ pub(super) fn open_settings_model_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(model) = find_model_selector_match(&catalog_arc, &item.value) else {
@@ -468,7 +486,7 @@ pub(super) fn open_settings_model_selector(
         let lane = lane_sel.clone();
         let state = state_sel.clone();
         let tui = tui_sel.clone();
-        tokio::spawn(async move {
+        state.session_write_tasks.clone().spawn(async move {
             report_model_selection(&lane, &state, &tui, model, true).await;
         });
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
@@ -604,9 +622,10 @@ pub(super) fn provider_selector_items(
     manifests: &[rpi_extensions::ProviderManifest],
     current_provider: Option<&str>,
 ) -> Vec<SelectItem> {
-    let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
-    let models_cfg = crate::config::load_models_config().unwrap_or_default();
-    let auth = crate::config::read_auth().unwrap_or_default();
+    let home = crate::config::AgentHome::process();
+    let catalog = crate::provider::catalog_with_manifests(&home, manifests).unwrap_or_default();
+    let models_cfg = home.models_config().unwrap_or_default();
+    let auth = home.read_auth().unwrap_or_default();
     let auth_states = crate::credentials::statuses(&models_cfg, &auth, manifests);
 
     let mut providers: Vec<(String, usize)> = Vec::new();
@@ -658,9 +677,10 @@ pub(super) fn login_provider_items_with_oauth(
     manifests: &[rpi_extensions::ProviderManifest],
     oauth_providers: &[rpi_extensions::OAuthProviderInfo],
 ) -> Vec<SelectItem> {
-    let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
-    let models_cfg = crate::config::load_models_config().unwrap_or_default();
-    let auth = crate::config::read_auth().unwrap_or_default();
+    let home = crate::config::AgentHome::process();
+    let catalog = crate::provider::catalog_with_manifests(&home, manifests).unwrap_or_default();
+    let models_cfg = home.models_config().unwrap_or_default();
+    let auth = home.read_auth().unwrap_or_default();
     let mut ids = Vec::new();
     for model in &catalog {
         if !ids.iter().any(|id: &String| id == &model.provider) {
@@ -813,7 +833,7 @@ fn begin_api_key_login(
         let key = text.trim();
         if key.is_empty() {
             add_error_message(
-                &state_submit.chat_container,
+                &state_submit.notice_container(),
                 &format!("API key for {provider_submit} cannot be empty."),
             );
             tui_submit.request_render(false);
@@ -828,14 +848,14 @@ fn begin_api_key_login(
         ) {
             Ok(()) => {
                 add_note_message(
-                    &state_submit.chat_container,
+                    &state_submit.notice_container(),
                     &format!("Saved credentials for {provider_submit}; reloading providers…"),
                 );
                 let _ = tx_submit.send(TuiMessage::ReloadExtensions);
                 finish_provider_login(&state_submit, &ec_submit, &editor_submit, &tui_submit);
             }
             Err(error) => add_error_message(
-                &state_submit.chat_container,
+                &state_submit.notice_container(),
                 &format!("Could not save {provider_submit} credentials: {error}"),
             ),
         }
@@ -848,12 +868,15 @@ fn begin_api_key_login(
     let tui_cancel = tui.clone();
     input.on_escape(Arc::new(move || {
         finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
-        add_note_message(&state_cancel.chat_container, "Provider login cancelled.");
+        add_note_message(
+            &state_cancel.notice_container(),
+            "Provider login cancelled.",
+        );
     }));
     tui.request_render(false);
 }
 
-fn begin_provider_oauth_login(
+pub(super) fn begin_provider_oauth_login(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
@@ -861,13 +884,7 @@ fn begin_provider_oauth_login(
     tx: &mpsc::UnboundedSender<TuiMessage>,
     provider_id: &str,
 ) {
-    let flow_id = state
-        .provider_auth_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-        .wrapping_add(1);
-    state
-        .provider_auth_flow_id
-        .store(flow_id, std::sync::atomic::Ordering::Release);
+    let (flow_id, cancel) = state.begin_provider_auth();
     show_provider_auth_status(
         state,
         editor_container,
@@ -881,6 +898,47 @@ fn begin_provider_oauth_login(
         input: serde_json::json!({}),
         purpose: ProviderOAuthPurpose::Login,
         flow_id,
+        cancel,
+    });
+}
+/// Start revoking a stored OAuth credential. The flow begins before its status
+/// screen shows, so an Esc on that screen always ends this flow and cancels the
+/// revoke it queued; an Esc before the screen shows sends no revoke at all.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn begin_provider_oauth_logout(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    provider_id: &str,
+    access: String,
+    refresh: String,
+) {
+    let (flow_id, cancel) = state.begin_provider_auth();
+    #[cfg(test)]
+    if let Some(hook) = AFTER_PROVIDER_FLOW_BEGIN.with(std::cell::Cell::take) {
+        hook();
+    }
+    show_provider_auth_status(
+        state,
+        editor_container,
+        editor,
+        tui,
+        &format!("Revoking OAuth credentials for {provider_id}…"),
+    );
+    if !provider_flow_still_shown(state, editor_container, editor, tui, flow_id) {
+        return;
+    }
+    let _ = tx.send(TuiMessage::ProviderOAuthAction {
+        provider: provider_id.to_string(),
+        action: "revoke".to_string(),
+        input: serde_json::json!({
+            "credential": {"access": access, "refresh": refresh}
+        }),
+        purpose: ProviderOAuthPurpose::Logout,
+        flow_id,
+        cancel,
     });
 }
 pub(super) fn show_provider_auth_status(
@@ -916,26 +974,38 @@ pub(super) fn handle_provider_oauth_result(
     purpose: ProviderOAuthPurpose,
     flow_id: u64,
 ) {
-    let value = match result {
-        Ok(value) => value,
-        Err(error) => {
-            finish_provider_login(state, editor_container, editor, tui);
-            add_error_message(
-                &state.chat_container,
-                &format!("OAuth {action} failed for {provider}: {error}"),
-            );
-            tui.request_render(false);
-            return;
-        }
-    };
-    let response = match rpi_extensions::OAuthActionResponse::parse(value) {
+    // A result from a flow that already ended (Esc, or a newer flow) must not
+    // act, so a login cancelled while its call ran can never save a credential.
+    if state
+        .provider_auth_flow_id
+        .load(std::sync::atomic::Ordering::Acquire)
+        != flow_id
+    {
+        return;
+    }
+    let response = result
+        .map_err(|error| format!("OAuth {action} failed for {provider}: {error}"))
+        .and_then(|value| {
+            rpi_extensions::OAuthActionResponse::parse(value)
+                .map_err(|error| format!("Invalid OAuth response from {provider}: {error}"))
+        });
+    // Every outcome but a login interaction ends the flow. Claim it before
+    // acting, so a result that lost to Esc neither writes the store nor ends a
+    // newer flow; after the claim only the editor is restored, since a flow
+    // begun meanwhile is not this result's to end.
+    let continues_flow = matches!(
+        (purpose, &response),
+        (ProviderOAuthPurpose::Login, Ok(response))
+            if matches!(response.kind, rpi_extensions::OAuthResponseKind::Interaction)
+    );
+    if !continues_flow && !claim_provider_flow(state, flow_id) {
+        return;
+    }
+    let response = match response {
         Ok(response) => response,
-        Err(error) => {
-            finish_provider_login(state, editor_container, editor, tui);
-            add_error_message(
-                &state.chat_container,
-                &format!("Invalid OAuth response from {provider}: {error}"),
-            );
+        Err(message) => {
+            restore_provider_editor(state, editor_container, editor, tui);
+            add_error_message(&state.notice_container(), &message);
             tui.request_render(false);
             return;
         }
@@ -963,9 +1033,9 @@ pub(super) fn handle_provider_oauth_result(
                     token.expires_at,
                 ) {
                     Ok(()) => {
-                        finish_provider_login(state, editor_container, editor, tui);
+                        restore_provider_editor(state, editor_container, editor, tui);
                         add_note_message(
-                            &state.chat_container,
+                            &state.notice_container(),
                             &format!(
                                 "OAuth credentials saved for {provider}; reloading providers…"
                             ),
@@ -973,17 +1043,17 @@ pub(super) fn handle_provider_oauth_result(
                         let _ = tx.send(TuiMessage::ReloadExtensions);
                     }
                     Err(error) => {
-                        finish_provider_login(state, editor_container, editor, tui);
+                        restore_provider_editor(state, editor_container, editor, tui);
                         add_error_message(
-                            &state.chat_container,
+                            &state.notice_container(),
                             &format!("Could not save OAuth credentials for {provider}: {error}"),
                         );
                     }
                 },
                 Ok(None) | Err(_) => {
-                    finish_provider_login(state, editor_container, editor, tui);
+                    restore_provider_editor(state, editor_container, editor, tui);
                     add_error_message(
-                        &state.chat_container,
+                        &state.notice_container(),
                         &format!("OAuth login for {provider} returned no valid credential."),
                     );
                 }
@@ -992,38 +1062,38 @@ pub(super) fn handle_provider_oauth_result(
         }
         (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Error)
         | (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Success) => {
-            finish_provider_login(state, editor_container, editor, tui);
+            restore_provider_editor(state, editor_container, editor, tui);
             add_error_message(
-                &state.chat_container,
+                &state.notice_container(),
                 &format!("OAuth login for {provider} did not return credentials."),
             );
             tui.request_render(false);
         }
         (ProviderOAuthPurpose::Logout, rpi_extensions::OAuthResponseKind::Success) => {
-            finish_provider_login(state, editor_container, editor, tui);
+            restore_provider_editor(state, editor_container, editor, tui);
             match crate::config::delete_credential(provider) {
                 Ok(true) => {
                     add_note_message(
-                        &state.chat_container,
+                        &state.notice_container(),
                         &format!("OAuth credentials revoked for {provider}; reloading providers…"),
                     );
                     let _ = tx.send(TuiMessage::ReloadExtensions);
                 }
                 Ok(false) => add_note_message(
-                    &state.chat_container,
+                    &state.notice_container(),
                     &format!("No saved credentials found for {provider}."),
                 ),
                 Err(error) => add_error_message(
-                    &state.chat_container,
+                    &state.notice_container(),
                     &format!("Could not remove {provider} credentials: {error}"),
                 ),
             }
             tui.request_render(false);
         }
         (ProviderOAuthPurpose::Logout, _) => {
-            finish_provider_login(state, editor_container, editor, tui);
+            restore_provider_editor(state, editor_container, editor, tui);
             add_error_message(
-                &state.chat_container,
+                &state.notice_container(),
                 &format!(
                     "OAuth revoke for {provider} did not succeed; local credentials were kept."
                 ),
@@ -1033,7 +1103,7 @@ pub(super) fn handle_provider_oauth_result(
     }
 }
 
-fn begin_provider_oauth_input(
+pub(super) fn begin_provider_oauth_input(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
@@ -1078,12 +1148,6 @@ fn begin_provider_oauth_input(
         body,
         "Enter submits · Esc cancels this OAuth flow",
     );
-    *state.active_provider_input.lock().unwrap() = Some(input.clone());
-    editor.set_focused(false);
-    editor_container.clear();
-    editor_container.add_child(frame);
-    tui.set_focus(Some(input.clone()));
-
     let state_submit = state.clone();
     let ec_submit = editor_container.clone();
     let editor_submit = editor.clone();
@@ -1093,7 +1157,10 @@ fn begin_provider_oauth_input(
     input.on_submit(Arc::new(move |text| {
         let value = text.trim();
         if value.is_empty() {
-            add_error_message(&state_submit.chat_container, "OAuth input cannot be empty.");
+            add_error_message(
+                &state_submit.notice_container(),
+                "OAuth input cannot be empty.",
+            );
             tui_submit.request_render(false);
             return;
         }
@@ -1105,7 +1172,7 @@ fn begin_provider_oauth_input(
             &format!("Completing OAuth login for {provider_submit}…"),
         );
         add_note_message(
-            &state_submit.chat_container,
+            &state_submit.notice_container(),
             &format!("Completing OAuth login for {provider_submit}…"),
         );
         let _ = tx_submit.send(TuiMessage::ProviderOAuthAction {
@@ -1114,6 +1181,7 @@ fn begin_provider_oauth_input(
             input: serde_json::json!({"value": value}),
             purpose: ProviderOAuthPurpose::Login,
             flow_id,
+            cancel: state_submit.provider_auth_token(flow_id),
         });
     }));
 
@@ -1122,20 +1190,93 @@ fn begin_provider_oauth_input(
     let editor_cancel = editor.clone();
     let tui_cancel = tui.clone();
     input.on_escape(Arc::new(move || {
-        finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
-        add_note_message(&state_cancel.chat_container, "OAuth login cancelled.");
+        if finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel) {
+            add_note_message(&state_cancel.notice_container(), "OAuth login cancelled.");
+        }
     }));
-    tui.request_render(false);
+    // Publish the form only once its callbacks exist, so no key reaches it
+    // unhandled.
+    *state.active_provider_input.lock().unwrap() = Some(input.clone());
+    editor.set_focused(false);
+    editor_container.clear();
+    editor_container.add_child(frame);
+    tui.set_focus(Some(input.clone()));
+    if provider_flow_still_shown(state, editor_container, editor, tui, flow_id) {
+        tui.request_render(false);
+    }
 }
+#[cfg(test)]
+thread_local! {
+    /// Runs inside [`claim_provider_flow`] before the claim, so a test can
+    /// land an Esc between a result's flow check and its credential write.
+    pub(super) static BEFORE_PROVIDER_FLOW_CLAIM: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in [`begin_provider_oauth_logout`] right after the flow begins, so
+    /// a test can land an Esc before the status screen shows.
+    pub(super) static AFTER_PROVIDER_FLOW_BEGIN: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Call after a flow's screen or form is shown. An Esc handled on the key
+/// worker while it was drawn already ended the flow and restored the editor,
+/// which the drawing then covered: restore it again and report the flow over,
+/// so no screen is left waiting for a result that never comes. A newer flow
+/// that began meanwhile is left running; its own Esc and result still work.
+fn provider_flow_still_shown(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    flow_id: u64,
+) -> bool {
+    match state
+        .provider_auth_flow_id
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        active if active == flow_id => true,
+        0 => {
+            restore_provider_editor(state, editor_container, editor, tui);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Claim `flow_id` before a result ends it. Esc's
+/// [`finish_provider_login`] swaps the same id to zero, so exactly one of a
+/// cancel and a completion wins.
+fn claim_provider_flow(state: &TuiState, flow_id: u64) -> bool {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_PROVIDER_FLOW_CLAIM.with(std::cell::Cell::take) {
+        hook();
+    }
+    state.claim_provider_auth(flow_id)
+}
+
+/// End the provider auth UI and cancel its call. Returns whether this call
+/// ended an active OAuth flow, i.e. won it against a completing result.
 pub(super) fn finish_provider_login(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
+) -> bool {
+    let ended = state.end_provider_auth();
+    restore_provider_editor(state, editor_container, editor, tui);
+    ended
+}
+
+/// Put the editor back in the input slot, without touching any flow.
+fn restore_provider_editor(
+    state: &TuiState,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
 ) {
-    state
-        .provider_auth_flow_id
-        .store(0, std::sync::atomic::Ordering::Release);
     *state.active_provider_input.lock().unwrap() = None;
     editor_container.clear();
     editor_container.add_child(editor.clone());
@@ -1227,7 +1368,8 @@ pub(super) async fn switch_provider(
     lane: &Arc<dyn AgentLane>,
 ) -> Result<(rpi_ai::Model, String), String> {
     let catalog =
-        crate::provider::catalog_with_manifests(manifests).map_err(|error| error.to_string())?;
+        crate::provider::catalog_with_manifests(&crate::config::AgentHome::process(), manifests)
+            .map_err(|error| error.to_string())?;
     let provider_id = canonicalize_provider_input(input, &catalog)?;
     let candidates: Vec<_> = available
         .iter()
@@ -1523,7 +1665,7 @@ fn handle_provider_form_input(
         ProviderFormStep::Id => {
             if provider_id_exists(text) {
                 add_error_message(
-                    &state.chat_container,
+                    &state.notice_container(),
                     &format!("Provider \"{text}\" already exists. Choose another id."),
                 );
                 *state.provider_form.lock().unwrap() = Some(form);
@@ -1544,7 +1686,7 @@ fn handle_provider_form_input(
         ProviderFormStep::BaseUrl => {
             if !is_valid_provider_url(text) {
                 add_error_message(
-                    &state.chat_container,
+                    &state.notice_container(),
                     &format!("Invalid URL \"{text}\". It must start with http:// or https://."),
                 );
                 *state.provider_form.lock().unwrap() = Some(form);
@@ -1565,8 +1707,8 @@ fn handle_provider_form_input(
         ProviderFormStep::ModelName => {
             form.model_name = text.to_string();
             match save_provider_from_form(&form) {
-                Ok(note) => add_note_message(&state.chat_container, &note),
-                Err(error) => add_error_message(&state.chat_container, &error),
+                Ok(note) => add_note_message(&state.notice_container(), &note),
+                Err(error) => add_error_message(&state.notice_container(), &error),
             }
             finish_provider_form(state, editor_container, editor, tui);
             return;
@@ -1602,7 +1744,7 @@ fn cancel_provider_form(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
-    add_note_message(&state.chat_container, "Provider add cancelled.");
+    add_note_message(&state.notice_container(), "Provider add cancelled.");
     finish_provider_form(state, editor_container, editor, tui);
 }
 
@@ -1645,34 +1787,17 @@ pub(super) fn remove_provider(input: &str) -> Result<String, String> {
 /// Write the completed form into `models.json` as a new provider with one
 /// model.
 pub(super) fn save_provider_from_form(form: &ProviderFormState) -> Result<String, String> {
-    let mut cfg = crate::config::load_models_config().map_err(|error| error.to_string())?;
-    let provider = crate::config::ProviderConfig {
-        name: None,
-        base_url: Some(form.base_url.clone()),
-        api_key: Some(form.api_key.clone()),
-        api: Some(form.api.clone()),
-        headers: None,
-        auth_header: None,
-        models: vec![crate::config::ModelDefinition {
-            id: form.model_id.clone(),
-            name: if form.model_name.is_empty() {
-                None
-            } else {
-                Some(form.model_name.clone())
-            },
-            base_url: None,
-            reasoning: None,
-            thinking_level_map: None,
-            context_window: None,
-            max_tokens: None,
-            cost: None,
-            input: None,
-            headers: None,
-            compat: None,
-        }],
-    };
-    cfg.providers.insert(form.id.clone(), provider);
-    crate::config::save_models_config(&cfg).map_err(|error| error.to_string())?;
+    crate::config::add_provider(
+        &form.id,
+        &form.api,
+        &form.base_url,
+        &form.api_key,
+        &form.model_id,
+        Some(&form.model_name),
+        None,
+        None,
+        None,
+    )?;
     Ok(format!(
         "Added provider \"{}\" ({} · {} model) — restart rpi to use it.",
         form.id, form.api, form.model_id
@@ -1734,7 +1859,6 @@ pub(super) fn open_settings_thinking_selector(
     lane: &Arc<dyn AgentLane>,
     catalog: &[rpi_ai::Model],
     lane_model_id: &str,
-    chat: &Arc<Container>,
 ) {
     let model = catalog
         .iter()
@@ -1751,7 +1875,10 @@ pub(super) fn open_settings_thinking_selector(
         items.push(SelectItem::new(name, name).with_description(thinking_level_description(*lvl)));
     }
     if items.is_empty() {
-        add_note_message(chat, "This model has no supported thinking levels.");
+        add_note_message(
+            &state.notice_container(),
+            "This model has no supported thinking levels.",
+        );
         tui.request_render(false);
         return;
     }
@@ -1761,7 +1888,7 @@ pub(super) fn open_settings_thinking_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(level) = thinking_level_from_name(&item.value) else {
@@ -1774,7 +1901,7 @@ pub(super) fn open_settings_thinking_selector(
         };
         let lane = lane_sel.clone();
         let footer_sel = state_sel.footer.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_thinking_level(level).await;
         });
         footer_sel.set_thinking_level(Some(thinking_level_name(level)));
@@ -1819,10 +1946,9 @@ pub(super) fn open_scoped_models_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     catalog: &[rpi_ai::Model],
-    chat: &Arc<Container>,
 ) {
     if catalog.is_empty() {
-        add_note_message(chat, "No models in the catalog.");
+        add_note_message(&state.notice_container(), "No models in the catalog.");
         tui.request_render(false);
         return;
     }
@@ -1840,7 +1966,7 @@ pub(super) fn open_scoped_models_selector(
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     let tui_sel = tui.clone();
     list.on_select(Arc::new(move |item| {
         // Toggle the model in the in-progress set; the selector stays open.
@@ -1859,7 +1985,7 @@ pub(super) fn open_scoped_models_selector(
     let ec_cancel = editor_container.clone();
     let editor_cancel = editor.clone();
     let tui_cancel = tui.clone();
-    let chat_cancel = chat.clone();
+    let chat_cancel = state.notice_container();
     list.on_cancel(Arc::new(move || {
         // Save the edited set to settings.json and close.
         let set = state_cancel

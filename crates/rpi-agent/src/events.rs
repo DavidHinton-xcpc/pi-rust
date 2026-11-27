@@ -45,10 +45,25 @@ pub enum AgentEvent {
     TurnEnd {
         message: AgentMessage,
         tool_results: Vec<ToolResultMessage>,
+        /// How many messages were sitting in the steering + follow-up queues
+        /// when this turn settled.
+        ///
+        /// Consumers use it for a `pendingMessages` indicator ("N queued"):
+        /// the UI needs to know "there are still N messages waiting", which is
+        /// *not* the same as "a follow-up arrived" (`follow_ups` is drained
+        /// before the round decides to continue).
+        ///
+        /// Additive field: every constructor passes it explicitly; every
+        /// consumer that doesn't care uses `..`.
+        #[doc(alias = "pendingMessages")]
+        pending_messages: usize,
     },
     /// Emitted when any message (user prompt, assistant response, tool result,
     /// custom) is appended to the transcript.
-    MessageStart { message: AgentMessage },
+    MessageStart {
+        message: AgentMessage,
+        message_id: Option<String>,
+    },
     /// Emitted only for assistant messages, on each streaming delta. Carries
     /// the underlying `AssistantMessageEvent` plus a **shared** snapshot of the
     /// partial assistant message.
@@ -59,11 +74,16 @@ pub enum AgentEvent {
     /// need it as JSON use [`crate::message::assistant_json`] to keep the wire
     /// shape identical without copying.
     MessageUpdate {
+        /// Session entry ID assigned by the durable host, absent for direct agents.
+        message_id: Option<String>,
         message: Arc<AssistantMessage>,
         assistant_message_event: AssistantMessageEvent,
     },
     /// Emitted when a message finishes (complement of `MessageStart`).
-    MessageEnd { message: AgentMessage },
+    MessageEnd {
+        message: AgentMessage,
+        message_id: Option<String>,
+    },
     /// Emitted before a tool call starts executing.
     ToolExecutionStart {
         tool_call_id: String,
@@ -122,8 +142,22 @@ impl AgentEvent {
 ///   Order is preserved because `try_emit` is only ever called from within a
 ///   single tool's `execute`, and `emit` is awaited between tool phases.
 pub trait AgentEmitter: Send + Sync {
+    /// Optional native child observation; ordinary emitters remain unchanged.
+    fn tool_program_observer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::tool_program_observation::ToolProgramObserver>> {
+        None
+    }
+
     /// Async emit — awaited by the loop so event order matches emit call order.
     fn emit(&self, event: AgentEvent) -> futures::future::BoxFuture<'static, ()>;
+
+    /// Mark a queue delivery explicitly; hosts may attach its durable reservation.
+    /// Unlike ordinary generation this consumes the next queued delivery, even
+    /// when its content is identical to another message in the run.
+    fn emit_injected(&self, event: AgentEvent) -> futures::future::BoxFuture<'static, ()> {
+        self.emit(event)
+    }
 
     /// Sync non-blocking emit for the tool `on_update` path. Must never panic
     /// and must never block (it's called from a `&dyn Fn` closure inside

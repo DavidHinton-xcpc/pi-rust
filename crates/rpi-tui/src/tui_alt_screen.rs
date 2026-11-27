@@ -4,6 +4,7 @@
 //! transcript and fixed bottom dock, as described in `tui-plan.md`.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -20,6 +21,10 @@ use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
+use crate::terminal_image::{kitty_image_id, with_frame_uploaded_images, CellDimensions};
+use crate::thinking_region::{
+    collect_regions as collect_thinking_regions, strip_markers as strip_thinking_region_markers,
+};
 
 /// Symbol for ViewportTUI capability check.
 pub const VIEWPORT_TUI: &[u8] = b"rpi-tui/viewport";
@@ -45,6 +50,19 @@ fn merge_pending_render(parked: Option<bool>, reuse_scroll_content: bool) -> Opt
         Some(parked) => Some(parked && reuse_scroll_content),
         None => Some(reuse_scroll_content),
     }
+}
+
+/// Ask one terminal for its cell size in pixels.
+///
+/// The answer comes from the terminal object rather than the process-wide
+/// capability cache, so a renderer's geometry belongs to the terminal it is
+/// drawing to. `None` means "this terminal cannot report pixels" (Windows, or
+/// a Unix terminal that leaves the ioctl fields at zero).
+fn poll_cell_dimensions_of(terminal: &dyn Terminal) -> Option<CellDimensions> {
+    crate::terminal_image::query_cell_dimensions(
+        terminal.window_size(),
+        Some((terminal.columns() as u16, terminal.rows() as u16)),
+    )
 }
 
 /// Coalescing render-scheduler state — the Rust port of upstream's
@@ -139,19 +157,42 @@ pub struct TuiAltScreen {
     /// the terminal reflowed its rows, so the frame cannot be patched cell by
     /// cell and must be repainted whole.
     painted_size: Mutex<(usize, usize)>,
+    /// Cell size in pixels the frame in `previous_screen` was laid out for.
+    ///
+    /// Image placements derive their row count from the cell geometry, so a
+    /// frame built for another geometry cannot be diffed against: the rows that
+    /// look unchanged still hold the previous geometry. Tracked separately from
+    /// `painted_size` because the character grid can stay identical while the
+    /// pixels per cell change (font zoom, another monitor's DPI).
+    painted_cells: Mutex<CellDimensions>,
+    /// The cell geometry this renderer last polled, or `None` until it polls.
+    ///
+    /// The polled value lives on the instance rather than only in the
+    /// process-wide capability cache so that a renderer always compares and
+    /// lays out against geometry it read itself. Tests then isolate by
+    /// construction: a fake terminal reports its own pixel size and nothing
+    /// another test does can move this renderer's geometry between two frames.
+    cell_geometry: Mutex<Option<CellDimensions>>,
     /// Set when a resize event reaches the loop. The window can end up at the
     /// size it already had (dragged out and back) while every intermediate
     /// resize reflowed the terminal's rows, so the next frame repaints whole.
     resize_dirty: AtomicBool,
     scroll_top: Mutex<usize>,
     stick_to_bottom: Mutex<bool>,
-    current_frame: Mutex<Option<LayoutFrame>>,
+    /// Share the immutable painted frame with input without cloning its layout
+    /// tree and visible strings for every mouse event.
+    current_frame: Mutex<Option<Arc<LayoutFrame>>>,
     /// When true, render into the terminal's main buffer and let the terminal
     /// own scrollback (upstream's default `regular` mode).
     main_screen_mode: Mutex<bool>,
     main_hardware_row: Mutex<usize>,
+    /// Logical row at physical screen row zero, NOT the number of saved rows.
+    /// Reconciliation rebases this mapping without touching native snapshots.
     main_viewport_top: Mutex<usize>,
     main_previous_cursor: Mutex<Option<(usize, usize)>>,
+    /// Force live rows to repaint without forgetting the saved document or
+    /// the physical cursor used for the next relative movement.
+    main_force_repaint: AtomicBool,
     // Input handlers
     #[allow(dead_code)]
     input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
@@ -173,6 +214,137 @@ pub struct TuiAltScreen {
     scheduler_thread: Mutex<Option<JoinHandle<()>>>,
     /// Fullscreen text selection (anchor/focus in content coordinates).
     selection: crate::selection::SelectionState,
+    /// Clickable per-message thinking regions resolved from the last painted
+    /// frame (frame-scoped, like the cursor marker protocol). Empty until the
+    /// renderer scans a frame that carries thinking-region markers.
+    thinking_regions: Mutex<Vec<crate::thinking_region::ThinkingRegion>>,
+    /// Image payloads this screen's terminal is known to hold. Terminal state,
+    /// so it belongs to the screen that owns the terminal — never a process
+    /// global, which a second screen, a reconnect, or a terminal restart would
+    /// silently invalidate.
+    kitty_uploads: Mutex<crate::terminal_image::KittyUploads>,
+}
+
+/// Locate the old live-screen boundary in a revised logical document. The
+/// unchanged prefix/suffix handles page eviction and late header insertion.
+/// If an old edit and new tail growth share a frame, a unique live-row anchor
+/// lets growth remain incremental instead of silently clipping new output.
+fn main_screen_live_anchor(previous: &[String], current: &[String], top: usize) -> Option<usize> {
+    let prefix = previous
+        .iter()
+        .zip(current)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if top <= prefix {
+        return Some(top.min(current.len()));
+    }
+    let suffix = previous[prefix..]
+        .iter()
+        .rev()
+        .zip(current[prefix..].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    if top >= previous.len() - suffix {
+        return Some(current.len() - suffix + top - (previous.len() - suffix));
+    }
+    // A blank or a single repeated row is not a reliable content identity.
+    let anchor = previous.get(top..top.checked_add(3)?)?;
+    if anchor.iter().filter(|row| !row.trim().is_empty()).count() < 2 {
+        return None;
+    }
+    if previous
+        .windows(anchor.len())
+        .filter(|window| *window == anchor)
+        .take(2)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let mut matches = current
+        .windows(anchor.len())
+        .enumerate()
+        .filter_map(|(row, window)| (window == anchor).then_some(row));
+    let row = matches.next()?;
+    matches.next().is_none().then_some(row)
+}
+
+/// If all old live rows were removed, locate the latest surviving saved
+/// block. A unique three-row block avoids mistaking repeated blank/log rows
+/// for message identity. Current rows preceding this cutoff are snapshots,
+/// not output to replay after a collapse, edit or page deletion.
+fn main_screen_saved_anchor(previous: &[String], current: &[String], top: usize) -> Option<usize> {
+    let mut blocks = std::collections::HashMap::new();
+    for block in previous[..top].windows(3) {
+        if block.iter().filter(|row| !row.trim().is_empty()).count() < 2 {
+            continue;
+        }
+        let key = (block[0].as_str(), block[1].as_str(), block[2].as_str());
+        blocks
+            .entry(key)
+            .and_modify(|entry: &mut (bool, Option<usize>)| entry.0 = false)
+            .or_insert((true, None));
+    }
+    for (row, block) in current.windows(3).enumerate() {
+        let key = (block[0].as_str(), block[1].as_str(), block[2].as_str());
+        if let Some((unique, at)) = blocks.get_mut(&key) {
+            if at.is_some() {
+                *unique = false;
+            }
+            *at = Some(row + 3);
+        }
+    }
+    blocks
+        .values()
+        .filter_map(|(unique, at)| unique.then_some(*at).flatten())
+        .max()
+}
+
+/// Choose a live boundary from positional correspondence when content anchors
+/// are ambiguous. The previous live rows are the publication frontier; a saved
+/// anchor must not move that frontier backwards. A positional prefix ending
+/// before the old live view is treated as a collapsed prefix only when none of
+/// the old live rows survive at their positions, which covers collapse-plus-
+/// append without mistaking a saved edit for new output.
+fn main_screen_positional_frontier(
+    previous: &[String],
+    current: &[String],
+    top: usize,
+) -> Option<usize> {
+    if previous.is_empty() || current.is_empty() {
+        return None;
+    }
+    let comparable = previous.len().min(current.len());
+    let live_start = top.min(comparable);
+    let live_survives = (live_start..comparable).any(|row| previous[row] == current[row]);
+    if current.len() <= previous.len() {
+        // Equal-length frames are repairs, not publication growth. Shrinking
+        // frames need the existing content/saved-anchor policy because a
+        // positional truncation alone cannot tell a collapsed panel from a
+        // live tail that should be cleared.
+        return (current.len() == previous.len()).then_some(top.min(current.len()));
+    }
+    if live_survives {
+        return Some(top.min(current.len()));
+    }
+
+    let prefix = previous
+        .iter()
+        .zip(current)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if prefix > 0 && prefix < top && prefix < previous.len() {
+        return Some(prefix);
+    }
+    Some(top.min(current.len()))
+}
+
+fn normalize_main_screen_lines(mut lines: Vec<String>) -> Vec<String> {
+    for line in &mut lines {
+        *line = line.replace(CURSOR_MARKER, "");
+    }
+    strip_thinking_region_markers(&mut lines);
+    lines
 }
 
 impl TuiAltScreen {
@@ -200,6 +372,8 @@ impl TuiAltScreen {
             full_redraw_count: Mutex::new(0),
             previous_screen: Mutex::new(Vec::new()),
             painted_size: Mutex::new((0, 0)),
+            painted_cells: Mutex::new(crate::terminal_image::get_cell_dimensions()),
+            cell_geometry: Mutex::new(None),
             resize_dirty: AtomicBool::new(false),
             scroll_top: Mutex::new(0),
             stick_to_bottom: Mutex::new(true),
@@ -208,6 +382,7 @@ impl TuiAltScreen {
             main_hardware_row: Mutex::new(0),
             main_viewport_top: Mutex::new(0),
             main_previous_cursor: Mutex::new(None),
+            main_force_repaint: AtomicBool::new(false),
             input_handler: Mutex::new(None),
             resize_handler: Mutex::new(None),
             overlays: Arc::new(OverlayManager::new()),
@@ -216,6 +391,8 @@ impl TuiAltScreen {
             scheduler_started: AtomicBool::new(false),
             scheduler_thread: Mutex::new(None),
             selection: crate::selection::SelectionState::new(),
+            thinking_regions: Mutex::new(Vec::new()),
+            kitty_uploads: Mutex::new(crate::terminal_image::KittyUploads::new()),
         }
     }
 
@@ -364,6 +541,15 @@ impl TuiAltScreen {
             .unwrap_or(false)
     }
 
+    /// Publish a synchronous batch of component-tree changes between frames.
+    /// Build expensive replacement components before entering this closure.
+    /// Do not render, request a render, or await inside the update. Acquire this
+    /// gate before taking any component locks that rendering also needs.
+    pub fn update_components<R>(&self, update: impl FnOnce() -> R) -> R {
+        let _render_guard = self.render_lock.lock().unwrap();
+        update()
+    }
+
     /// Set the layout root component.
     pub fn set_layout_root(&self, component: Option<Arc<dyn Component>>) {
         if let Ok(mut root) = self.layout_root.lock() {
@@ -451,6 +637,25 @@ impl TuiAltScreen {
         true
     }
 
+    /// Resolve a left-button press against the last painted frame's thinking
+    /// click regions. Returns the owning message id when the click lands on a
+    /// thinking label/body row; the host decides what toggling means. Only
+    /// presses (not drags or releases) hit, so a selection drag is never
+    /// mistaken for a toggle; the host must call this BEFORE feeding the
+    /// event to the selection tracker.
+    pub fn thinking_region_hit(&self, event: &crossterm::event::MouseEvent) -> Option<String> {
+        use crossterm::event::MouseButton;
+        if self.uses_main_screen()
+            || self.is_render_suspended()
+            || self.has_overlay()
+            || event.kind != crossterm::event::MouseEventKind::Down(MouseButton::Left)
+        {
+            return None;
+        }
+        let regions = self.thinking_regions.lock().ok()?;
+        crate::thinking_region::hit(&regions, event.column, event.row).map(|r| r.message_id.clone())
+    }
+
     /// Feed a left-button mouse event to the fullscreen selection tracker.
     ///
     /// Must be called before the host interprets the event itself (the host
@@ -463,15 +668,12 @@ impl TuiAltScreen {
         let Some(frame) = self.current_frame.lock().ok().and_then(|f| f.clone()) else {
             return false;
         };
-        let (columns, rows) = {
-            let Ok(terminal) = self.terminal.lock() else {
-                return false;
-            };
-            (terminal.info().columns, terminal.info().rows)
-        };
+        // Resolve against the geometry actually painted, not the terminal's
+        // live size. Taking the terminal lock here would also stall the input
+        // reader behind render diffing and slow writes, queuing stale drags.
         let changed = self
             .selection
-            .handle_mouse_event(event, &frame, rows, columns);
+            .handle_mouse_event(event, &frame, frame.height, frame.width);
         if changed {
             self.request_render_reusing_scroll_content();
         }
@@ -606,6 +808,11 @@ impl TuiAltScreen {
     /// The repaint is forced even when the window ends up at the size it already
     /// had, because every intermediate resize reflowed the terminal's rows.
     pub fn note_resize(&self) {
+        // A resize can change the cell size in pixels (font zoom, moving to a
+        // monitor with a different DPI). Image sizing divides the source image
+        // by the cell size, so a stale cache would keep the old geometry. This
+        // is a no-op on terminals that do not report pixel sizes.
+        self.poll_cell_dimensions();
         self.resize_dirty.store(true, Ordering::Release);
         self.request_render(false);
     }
@@ -618,6 +825,13 @@ impl TuiAltScreen {
     /// so hosts call this from their periodic tick. The render path re-reads the
     /// size on every frame too; this catches a window that changed while no
     /// event reached the loop.
+    ///
+    /// The cell size in pixels is polled here as well, because the character
+    /// grid can stay identical while the cell geometry changes (font zoom, a
+    /// move to a monitor with another DPI) and no resize event is guaranteed to
+    /// arrive for that. A geometry change repaints every row: image placements
+    /// re-derive their row count from the cell size, so a diff against the old
+    /// frame would keep rows at the previous geometry.
     pub fn ensure_size(&self) {
         let Some((columns, rows)) = self.terminal.lock().ok().map(|terminal| {
             terminal.refresh_size();
@@ -625,18 +839,80 @@ impl TuiAltScreen {
         }) else {
             return;
         };
-        if columns == 0 || rows == 0 || *self.painted_size.lock().unwrap() == (columns, rows) {
+        if columns == 0 || rows == 0 {
+            return;
+        }
+        let size_changed = *self.painted_size.lock().unwrap() != (columns, rows);
+        self.poll_cell_dimensions();
+        let cells_changed = self.cell_geometry_changed();
+        if !size_changed && !cells_changed {
             return;
         }
         // Alt-screen frames need every row repainted: the terminal reflowed the
         // old frame, so it can no longer be patched cell by cell. Main-screen
-        // mode keeps its document and rebuilds it when it sees the size change.
+        // mode keeps its document and reconciles only the live tail.
         if !self.uses_main_screen() {
             if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
             }
         }
+        self.resize_dirty.store(true, Ordering::Release);
         self.request_render(false);
+    }
+
+    /// The cell geometry this renderer has polled, polling once if it has not.
+    ///
+    /// Reading through this instead of [`crate::terminal_image::get_cell_dimensions`]
+    /// keeps the renderer's own view of the geometry separate from the
+    /// process-wide cache, which other terminals (and, in tests, other
+    /// renderers) also write.
+    fn current_cell_dimensions(&self) -> CellDimensions {
+        if let Some(cells) = *self.cell_geometry.lock().unwrap() {
+            return cells;
+        }
+        self.poll_cell_dimensions()
+    }
+
+    /// Poll the terminal's pixel size and record it on this renderer.
+    ///
+    /// A terminal that cannot report a pixel size leaves the previously polled
+    /// geometry in place, so a transient `Unsupported` reply cannot reset an
+    /// established geometry mid-session. Before the first successful poll the
+    /// process-wide cache supplies the fallback, which keeps a terminal that
+    /// never reports pixels rendering at the historical default.
+    fn poll_cell_dimensions(&self) -> CellDimensions {
+        let polled = self
+            .terminal
+            .lock()
+            .ok()
+            .and_then(|terminal| poll_cell_dimensions_of(terminal.as_ref()));
+        self.record_cell_dimensions(polled)
+    }
+
+    /// Poll through a terminal lock the caller already holds.
+    ///
+    /// Renderers take the terminal lock for the whole frame; re-locking here
+    /// would deadlock against themselves.
+    fn poll_cell_dimensions_with(&self, terminal: &dyn Terminal) -> CellDimensions {
+        self.record_cell_dimensions(poll_cell_dimensions_of(terminal))
+    }
+
+    fn record_cell_dimensions(&self, polled: Option<CellDimensions>) -> CellDimensions {
+        let mut slot = self.cell_geometry.lock().unwrap();
+        if let Some(polled) = polled {
+            *slot = Some(polled);
+        }
+        slot.unwrap_or_else(crate::terminal_image::get_cell_dimensions)
+    }
+
+    /// Whether the polled cell geometry differs from the frame on screen.
+    ///
+    /// Compared against `painted_cells` (what the last frame was laid out for),
+    /// not against the previous poll: a geometry change that arrived while a
+    /// repaint was parked must still be picked up by the next tick.
+    fn cell_geometry_changed(&self) -> bool {
+        let current = self.current_cell_dimensions();
+        *self.painted_cells.lock().unwrap() != current
     }
 
     fn enter_alt_screen(&self) {
@@ -645,6 +921,9 @@ impl TuiAltScreen {
             terminal.write("\x1b[?1049h\x1b[?7l");
             // Clear screen and hide cursor
             terminal.write("\x1b[2J\x1b[H\x1b[?25l");
+            // A fresh alternate buffer holds no images: the next frame has to
+            // carry each payload again instead of placing it by id.
+            self.invalidate_kitty_uploads();
             terminal.flush();
         }
     }
@@ -665,8 +944,61 @@ impl TuiAltScreen {
                 // farewell after this.
                 terminal.write("\x1b[?1049l\x1b[2J\x1b[H\x1b[?25h");
             }
+            // Whatever the terminal kept for the alternate buffer is gone with
+            // it; the next frame has to carry the payloads again.
+            self.invalidate_kitty_uploads();
             terminal.flush();
         }
+    }
+
+    /// Forget the image payloads this screen believes its terminal holds.
+    ///
+    /// Called for every event that can drop the terminal's image store: a
+    /// screen clear, a resize, and entering or leaving the alternate screen.
+    fn invalidate_kitty_uploads(&self) {
+        self.kitty_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate();
+    }
+
+    /// Image ids the terminal is known to hold, as the set a layout pass reads.
+    ///
+    /// Published to components for the duration of a render (see
+    /// [`with_frame_uploaded_images`]) so a row for an image the terminal
+    /// already has is emitted as a small placement instead of carrying the
+    /// multi-megabyte payload again. Copying the ids is a few numbers; holding
+    /// the ledger lock across a layout pass would serialize the render thread
+    /// against the frame writer.
+    fn uploaded_image_ids(&self) -> Arc<HashSet<u32>> {
+        let ids: HashSet<u32> = self
+            .kitty_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .painted_ids()
+            .iter()
+            .copied()
+            .collect();
+        Arc::new(ids)
+    }
+
+    /// Record the images a just-rendered frame shows as held by the terminal.
+    ///
+    /// Both row forms count (`a=T` and `a=p`): the frame that carries a payload
+    /// is followed by frames that only place it, and forgetting those would send
+    /// the payload again on every repaint — the exact cost this bookkeeping
+    /// exists to avoid.
+    fn record_painted_images(&self, rows: &[String]) {
+        let mut uploads = self
+            .kitty_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for row in rows {
+            if let Some(id) = kitty_image_id(row) {
+                uploads.note_painted(id);
+            }
+        }
+        uploads.end_frame();
     }
 
     /// Hand the terminal back to the shell so the process can be stopped
@@ -730,83 +1062,198 @@ impl TuiAltScreen {
         terminal.refresh_size();
         let width = terminal.columns();
         let height = terminal.rows();
+        if width == 0 || height == 0 {
+            // No physical screen to paint. Preserve the baseline and pending
+            // resize/forced repaint until the terminal is usable again.
+            return;
+        }
+        // The main screen is the other half of the same invariant: an image's
+        // row count is derived from the cell geometry, so a document laid out
+        // for a stale geometry is wrong even when the columns did not move.
+        // Polling here too means a host that renders without a periodic tick
+        // still picks up a font zoom / DPI change instead of only noticing it
+        // through `ensure_size`. The terminal lock is already held, so this
+        // polls through it rather than re-locking.
+        let cells = self.poll_cell_dimensions_with(terminal.as_ref());
+        let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
+        let previous_cells = *self.painted_cells.lock().unwrap();
+        let force_repaint = self.main_force_repaint.swap(false, Ordering::AcqRel);
+        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
+        let previous_uploads = self.uploaded_image_ids();
+        if (previous_width, previous_height) != (width, height)
+            || previous_cells != cells
+            || resize_dirty
+            || force_repaint
+        {
+            // Revoke trust BEFORE layout chooses placement-only rows. An
+            // explicit repaint is also the recovery path if the terminal lost
+            // pixels without notifying us. Ordinary suffix repairs keep the
+            // store warm; they erase cells, not image data.
+            self.invalidate_kitty_uploads();
+        }
         let root: Arc<dyn Component> = self
             .get_layout_root()
             .unwrap_or_else(|| Arc::new(self.container.clone()));
-        let raw_lines = root.render(width);
+        // Components inside the frame read the geometry this renderer polled
+        // (frame-scoped), not the process-wide cache.
+        let raw_lines = {
+            let uploaded = self.uploaded_image_ids();
+            crate::render::with_main_screen_frame(|| {
+                crate::terminal_image::with_frame_cell_geometry(cells, || {
+                    with_frame_uploaded_images(uploaded, || root.render(width))
+                })
+            })
+        };
         let cursor = raw_lines.iter().enumerate().rev().find_map(|(row, line)| {
             line.find(CURSOR_MARKER)
                 .map(|idx| (row, visible_width(&line[..idx])))
         });
-        let lines: Vec<String> = raw_lines
-            .into_iter()
-            .map(|line| line.replace(CURSOR_MARKER, ""))
-            .collect();
+        // Main screen mode deliberately never enables click regions (its rows
+        // belong to native scrollback and cannot be hit-tested), but its
+        // renderer must still strip the markers: an assistant message carries
+        // them on its thinking rows in every mode.
+        let lines = normalize_main_screen_lines(raw_lines);
+        // This is the retained primary document: keep both transmission and
+        // placement rows trusted across ordinary live-suffix repairs.
+        self.record_painted_images(&lines);
         let previous = self
             .previous_screen
             .lock()
             .map(|p| p.clone())
             .unwrap_or_default();
-        // The previous frame's geometry, recorded by whichever renderer ran
-        // last. A mismatch means the terminal reflowed its rows.
-        let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
-        terminal.write(&crate::terminal_image::removed_kitty_placements(
-            &previous, &lines,
-        ));
 
+        let canonical_changed = previous != lines;
+        let viewport_top = *self.main_viewport_top.lock().unwrap();
+        // An empty logical document can follow a real paint (page eviction,
+        // clear, collapsed panels). It must not start a second initial replay.
+        let initialized = previous_width != 0 && previous_height != 0;
+        let anchor = if canonical_changed {
+            main_screen_live_anchor(&previous, &lines, viewport_top)
+        } else {
+            Some(viewport_top)
+        };
+        let saved_anchor = if anchor.is_none() {
+            main_screen_saved_anchor(&previous, &lines, viewport_top)
+        } else {
+            None
+        };
+        let old_live = previous.get(viewport_top..).unwrap_or_default();
+        let layout_only_reflow = initialized && previous_width != width && {
+            let old_width_raw = crate::render::with_main_screen_frame(|| {
+                crate::terminal_image::with_frame_cell_geometry(previous_cells, || {
+                    with_frame_uploaded_images(previous_uploads, || root.render(previous_width))
+                })
+            });
+            normalize_main_screen_lines(old_width_raw) == previous
+        };
+        let positional_top = if anchor.is_none() && !layout_only_reflow {
+            main_screen_positional_frontier(&previous, &lines, viewport_top)
+        } else {
+            None
+        };
+        let mapped_top = if layout_only_reflow {
+            lines.len().saturating_sub(height)
+        } else if let Some(positional_top) = positional_top {
+            positional_top
+        } else {
+            anchor.or(saved_anchor).unwrap_or_else(|| {
+                // A collapsed/replaced historical panel has no surviving live
+                // anchor. Its unchanged prefix was already emitted: do not pull
+                // those saved message rows back onto the screen as duplicates.
+                previous
+                    .iter()
+                    .zip(&lines)
+                    .take_while(|(old, new)| old == new)
+                    .count()
+            })
+        };
+        let reconcile_tail = initialized
+            && (previous_width != width
+                || previous_height != height
+                || previous_cells != cells
+                || resize_dirty
+                || force_repaint
+                || anchor.is_none()
+                || lines.len().saturating_sub(mapped_top) < old_live.len());
+        let next_top = if reconcile_tail
+            && anchor.or(saved_anchor).is_none()
+            && positional_top.is_none()
+            && !layout_only_reflow
+        {
+            mapped_top.max(lines.len().saturating_sub(height))
+        } else {
+            mapped_top
+        };
+        let new_live = &lines[next_top..];
         let mut first_changed = None;
         let mut last_changed = None;
-        for index in 0..previous.len().max(lines.len()) {
-            if previous.get(index) != lines.get(index) {
-                first_changed.get_or_insert(index);
-                last_changed = Some(index);
+        for row in 0..old_live.len().max(new_live.len()) {
+            if old_live.get(row) != new_live.get(row) {
+                first_changed.get_or_insert(next_top + row);
+                last_changed = Some(next_top + row);
             }
         }
-        let viewport_top = *self.main_viewport_top.lock().unwrap();
-        let changed_in_scrollback = first_changed.is_some_and(|first| {
-            first < viewport_top || lines.len().saturating_sub(1) < viewport_top
-        });
+        // Only live placements belong to the mutable screen. Removing a
+        // logical page must not delete images from already-emitted snapshots.
+        terminal.write(&crate::terminal_image::removed_kitty_placements(
+            old_live, new_live,
+        ));
 
-        // Saved scrollback cannot be addressed by cursor movement or CSI T:
-        // SD only inserts blanks in the live screen. Rebuild the document when
-        // an old row changes, otherwise repainting its tail appends duplicate
-        // history until a bounded terminal buffer evicts the conversation start.
-        // Size changes also require a rebuild; ordinary screen-local updates
-        // remain incremental.
-        if (previous_width != 0 && previous_width != width)
-            || (previous_height != 0 && previous_height != height)
-            || changed_in_scrollback
-        {
+        if reconcile_tail {
+            // Native saved rows are immutable snapshots: CUP/CSI T cannot
+            // reach them. Never erase/replay history to patch an old status,
+            // late notice, Markdown reflow or evicted page. Repaint only the
+            // mutable suffix and rebase its LOGICAL coordinates. A reliable
+            // anchor can include unpublished growth: emit ALL of it, even on
+            // a forced/resize frame. Only real forward overflow saves rows;
+            // repairing an equal-sized live suffix never advances scrollback.
             terminal.write("\x1b[?2026h");
-            terminal.write("\x1b[2J\x1b[H\x1b[3J");
-            terminal.write(&lines.join("\r\n"));
+            // ED(2) archives the entire live screen in iTerm2, including the
+            // editor/status dock. Erase each live row in place instead; CUD
+            // never scrolls, even at the bottom, and saved rows stay untouched.
+            let mut clear = String::from("\x1b[H\x1b[2K");
+            for _ in 1..height {
+                clear.push_str("\x1b[1B\x1b[2K");
+            }
+            clear.push_str("\x1b[H");
+            terminal.write(&clear);
+            // Erasing cells drops the *placements* on them, not the image data
+            // the terminal already holds — so the ledger stays valid and the
+            // rows rewritten below re-place each image instead of re-sending
+            // its payload. Forgetting the uploads here made every repaired live
+            // suffix (a status tick, a late notice) retransmit every screenshot
+            // in the window, which is what pinned a core on image-heavy
+            // sessions.
+            terminal.write(&lines[next_top..].join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
-            *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
-        } else if previous.is_empty() {
+            *self.main_viewport_top.lock().unwrap() =
+                next_top.max(lines.len().saturating_sub(height));
+        } else if !initialized {
             terminal.write("\x1b[?2026h");
             terminal.write(&lines.join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
-            if first_changed.is_none() && cursor == previous_cursor {
+            if first_changed.is_none() && cursor == previous_cursor && !canonical_changed {
                 return;
             }
+            // Rebase logical coordinates without moving the terminal cursor.
+            let physical_row = self
+                .main_hardware_row
+                .lock()
+                .unwrap()
+                .saturating_sub(viewport_top);
+            *self.main_hardware_row.lock().unwrap() = next_top + physical_row;
+            *self.main_viewport_top.lock().unwrap() = next_top;
             if let (Some(first), Some(last)) = (first_changed, last_changed) {
                 let mut hardware_row = *self.main_hardware_row.lock().unwrap();
                 let mut viewport_top = *self.main_viewport_top.lock().unwrap();
                 let viewport_bottom = viewport_top + height.saturating_sub(1);
-                let deleted_tail_only = first >= lines.len();
-                let append_start = first == previous.len() && first > 0;
-                let move_target = if deleted_tail_only {
-                    lines.len().saturating_sub(1)
-                } else if append_start {
-                    first - 1
-                } else {
-                    first
-                };
+                let append_start = first == next_top + old_live.len() && first > next_top;
+                let move_target = if append_start { first - 1 } else { first };
                 let mut output = String::from("\x1b[?2026h");
                 if move_target > viewport_bottom {
                     let current_screen = hardware_row
@@ -830,50 +1277,27 @@ impl TuiAltScreen {
                 }
                 output.push_str(if append_start { "\r\n" } else { "\r" });
                 let render_end = last.min(lines.len().saturating_sub(1));
-                if !deleted_tail_only {
-                    for index in first..=render_end {
-                        if index > first {
-                            output.push_str("\r\n");
+                for index in first..=render_end {
+                    if index > first {
+                        output.push_str("\r\n");
+                    }
+                    let old = old_live.get(index - next_top);
+                    if let Some((column, text)) =
+                        old.and_then(|old| crate::line_diff::patch(old, &lines[index]))
+                    {
+                        if column > 0 {
+                            output.push_str(&format!("\x1b[{column}C"));
                         }
-                        if let Some((column, text)) = previous
-                            .get(index)
-                            .and_then(|old| crate::line_diff::patch(old, &lines[index]))
+                        output.push_str(&text);
+                    } else {
+                        output.push_str(&lines[index]);
+                        if old.is_some_and(|old| visible_width(&lines[index]) < visible_width(old))
                         {
-                            if column > 0 {
-                                output.push_str(&format!("\x1b[{column}C"));
-                            }
-                            output.push_str(&text);
-                        } else {
-                            output.push_str(&lines[index]);
-                            if index < previous.len()
-                                && visible_width(&lines[index]) < visible_width(&previous[index])
-                            {
-                                output.push_str("\x1b[K");
-                            }
+                            output.push_str("\x1b[K");
                         }
                     }
                 }
-                let mut final_row = render_end;
-                if previous.len() > lines.len() {
-                    let extra_lines = previous.len() - lines.len();
-                    let clear_start_offset = usize::from(!lines.is_empty());
-                    if clear_start_offset > 0 {
-                        output.push_str("\x1b[1B");
-                    }
-                    for index in 0..extra_lines {
-                        output.push_str("\r\x1b[2K");
-                        if index + 1 < extra_lines {
-                            output.push_str("\x1b[1B");
-                        }
-                    }
-                    let move_back = extra_lines.saturating_sub(1) + clear_start_offset;
-                    if move_back > 0 {
-                        output.push_str(&format!("\x1b[{move_back}A"));
-                    }
-                    if extra_lines > 0 {
-                        final_row = lines.len().saturating_sub(1);
-                    }
-                }
+                let final_row = render_end;
                 output.push_str("\x1b[?2026l");
                 terminal.write(&output);
                 let advanced = final_row.saturating_sub(viewport_top + height.saturating_sub(1));
@@ -905,29 +1329,11 @@ impl TuiAltScreen {
                 terminal.write(&output);
                 viewport_top += scroll;
             } else if row < viewport_top {
-                // The editor row is above the visible window. Scroll up so it
-                // becomes the top row, then repaint the revealed viewport — SD
-                // leaves the scrolled-off bottom rows blank otherwise.
-                let scroll = viewport_top - row;
-                terminal.write(&format!("\x1b[H\x1b[{scroll}T"));
-                viewport_top = row;
-                let mut output = String::from("\x1b[?2026h");
-                for i in 0..height {
-                    let line = lines
-                        .get(viewport_top + i)
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    if i > 0 {
-                        output.push_str("\r\n");
-                    }
-                    output.push_str("\x1b[2K");
-                    output.push_str(line);
-                }
-                // Return the cursor to the top row (the editor row) so the
-                // column move below lands on it.
-                output.push_str(&format!("\x1b[{}A", height.saturating_sub(1)));
-                output.push_str("\x1b[?2026l");
-                terminal.write(&output);
+                // Saved rows are not addressable: CSI T inserts blanks in the
+                // live screen, it never retrieves scrollback. Keep the real
+                // cursor/viewport ledger and hide the off-screen logical cursor.
+                // It will be restored when a later layout puts it on screen.
+                terminal.write("\x1b[?25l");
             } else {
                 // Within the window: a relative move is enough (and never
                 // scrolls, so it cannot drift the viewport bookkeeping).
@@ -942,10 +1348,19 @@ impl TuiAltScreen {
                 }
             }
 
-            terminal.write(&format!("\r\x1b[{}C", col));
-            terminal.write("\x1b[?25h");
-            *self.main_hardware_row.lock().unwrap() = row;
-            *self.main_viewport_top.lock().unwrap() = viewport_top;
+            if row >= viewport_top {
+                terminal.write("\r");
+                if col > 0 {
+                    terminal.write(&format!("\x1b[{col}C"));
+                }
+                if self.get_show_hardware_cursor() {
+                    terminal.write("\x1b[?25h");
+                } else {
+                    terminal.write("\x1b[?25l");
+                }
+                *self.main_hardware_row.lock().unwrap() = row;
+                *self.main_viewport_top.lock().unwrap() = viewport_top;
+            }
         } else {
             terminal.write("\x1b[?25l");
         }
@@ -955,6 +1370,7 @@ impl TuiAltScreen {
         if let Ok(mut painted) = self.painted_size.lock() {
             *painted = (width, height);
         }
+        *self.painted_cells.lock().unwrap() = cells;
     }
 
     /// Perform a differential render with constrained layout.
@@ -988,28 +1404,72 @@ impl TuiAltScreen {
             return;
         };
 
+        // Re-poll the cell geometry before laying the frame out, for the same
+        // reason as the character size above: an image's row count is derived
+        // from it, so a frame laid out for a stale cell size is wrong even when
+        // the columns did not move. Doing it here (not only in `ensure_size`)
+        // covers a host that renders without a periodic tick.
+        let cells = self.poll_cell_dimensions();
+        // A full redraw clears the terminal. Decide that before components
+        // choose a=T vs a=p, not afterwards in the write loop: invalidating
+        // only there cannot turn an already-rendered placement back into data.
+        let previous = self
+            .previous_screen
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
+        let painted = *self.painted_size.lock().unwrap();
+        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
+        let cells_changed = *self.painted_cells.lock().unwrap() != cells;
+        let full_redraw =
+            previous.is_empty() || painted != (width, height) || resize_dirty || cells_changed;
+        if full_redraw {
+            self.invalidate_kitty_uploads();
+        }
+
         // Get layout root or use container
         let root = self.get_layout_root();
         let root_component: Arc<dyn Component> =
             root.unwrap_or_else(|| Arc::new(self.container.clone()));
 
-        // Render layout frame
-        let frame = if reuse_scroll_content {
-            render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
-        } else {
-            render_layout_frame(root_component.clone(), width, height)
-        };
-
-        // Store the frame for input handling
-        if let Ok(mut current) = self.current_frame.lock() {
-            *current = Some(frame.clone());
+        // Reflow changes document row/column identities. Never reinterpret an
+        // old selection against rows wrapped for a different terminal width.
+        // Cancel before rendering so a non-dragged click can restore follow.
+        if self.current_frame.lock().ok().is_some_and(|current| {
+            current
+                .as_ref()
+                .is_some_and(|previous| previous.width != width)
+        }) {
+            self.selection.clear();
         }
 
-        // Get screen lines and composite modal overlays above the layout.
-        let mut visible = frame.lines.clone();
-        self.jump_to_end
-            .paint(&frame, &mut visible, self.has_overlay());
-        self.paint_overlays(&mut visible, width, height);
+        // Render layout frame. Components inside the frame read the geometry
+        // this renderer polled (frame-scoped), not the process-wide cache.
+        // EVERY component that can size an image renders inside this one
+        // scope, overlays included: the body frame and the overlays of the
+        // same frame must be laid out for the same cell geometry, or an
+        // overlay image keeps the old row count while the body below it has
+        // already resized.
+        let (frame, mut visible) = crate::terminal_image::with_frame_cell_geometry(cells, || {
+            let uploaded = self.uploaded_image_ids();
+            with_frame_uploaded_images(uploaded, || {
+                let frame = if reuse_scroll_content {
+                    render_layout_frame_reusing_scroll_content(
+                        root_component.clone(),
+                        width,
+                        height,
+                    )
+                } else {
+                    render_layout_frame(root_component.clone(), width, height)
+                };
+                // Get screen lines and composite modal overlays above the layout.
+                let mut visible = frame.lines.clone();
+                self.jump_to_end
+                    .paint(&frame, &mut visible, self.has_overlay());
+                self.paint_overlays(&mut visible, width, height);
+                (frame, visible)
+            })
+        });
 
         // Cursor markers are an internal layout protocol, not terminal output.
         // Extract the location first, then strip every marker before diffing or
@@ -1020,33 +1480,40 @@ impl TuiAltScreen {
             *line = line.replace(CURSOR_MARKER, "");
         }
 
+        // Thinking click regions follow the same frame-scoped protocol: scan
+        // the composited rows for region markers, record the rectangles for
+        // the input path, then strip them so they never reach the terminal.
+        // Overlays paint above the transcript and own their rows wholly, so
+        // regions behind an overlay must not resolve: the hit path checks
+        // `has_overlay()`, so no masking copy is needed here.
+        // Overlays own their rows wholly: no transcript click region may
+        // resolve while a modal is up, so don't retain any from this frame.
+        let thinking_regions = if self.has_overlay() {
+            Vec::new()
+        } else {
+            collect_thinking_regions(&visible)
+        };
+        if let Ok(mut slot) = self.thinking_regions.lock() {
+            *slot = thinking_regions;
+        }
+        strip_thinking_region_markers(&mut visible);
         // Reverse-video the selected span last, exactly where upstream applies
         // `applySelection`: after overlays so selection stays visible behind a
         // dialog, before the diff so the highlight reaches the terminal.
         crate::selection::apply_selection_highlight(&mut visible, &self.selection, &frame);
 
-        // Check for full redraw
-        let previous = self
-            .previous_screen
-            .lock()
-            .map(|p| p.clone())
-            .unwrap_or_default();
-        let painted = *self.painted_size.lock().unwrap();
-        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
-        // A resize reflows the terminal's rows, so a frame captured at another
-        // geometry (or before a resize notification) can no longer be patched
-        // cell-by-cell: the skipped "unchanged" rows would keep the terminal's
-        // reflowed leftovers (short borders, duplicated spinner rows). Repaint
-        // every row when it moved.
-        let full_redraw = previous.is_empty() || painted != (width, height) || resize_dirty;
-
-        // Build output buffer
+        // Build output buffer. Full-redraw detection and upload invalidation
+        // happened before layout so every missing image carries its pixels.
         let mut buffer = String::new();
         buffer.push_str(&crate::terminal_image::removed_kitty_placements(
             &previous, &visible,
         ));
 
         if let Ok(terminal) = self.terminal.lock() {
+            let mut uploads = self
+                .kitty_uploads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if full_redraw {
                 if let Ok(mut count) = self.full_redraw_count.lock() {
                     *count += 1;
@@ -1055,6 +1522,8 @@ impl TuiAltScreen {
                 // whole width, and a terminal that reset the mode on resize
                 // would wrap the last cell and shift every following row.
                 buffer.push_str("\x1b[2J");
+                // Upload trust was revoked before layout, so the rows below
+                // already contain payloads for every image this clear drops.
                 buffer.push_str("\x1b[?7l");
             }
 
@@ -1066,21 +1535,44 @@ impl TuiAltScreen {
                 if !full_redraw && row < previous.len() && &previous[row] == line {
                     continue; // Skip unchanged lines
                 }
-                // Overwrite before clearing any leftover tail. Clearing the
-                // whole row first blanks stationary sidebars during scroll on
-                // terminals that do not implement synchronized output.
-                if let Some((column, text)) = (!full_redraw)
-                    .then(|| crate::line_diff::patch(&previous[row], line))
-                    .flatten()
-                {
-                    buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
-                } else {
-                    buffer.push_str(&format!("\x1b[{};1H{}", row + 1, line));
-                    if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
-                        buffer.push_str("\x1b[K");
+                // A repainted image row carries the whole PNG payload. Once the
+                // data is in the terminal, the placement alone is enough, which
+                // keeps scrolling a transcript full of screenshots cheap.
+                let is_image = crate::terminal_image::is_image_line(line);
+                let placement = crate::terminal_image::kitty_placement_line(line, &uploads);
+                let rendered = placement.as_deref().unwrap_or(line.as_str());
+                // Image rows are never patched: their prefix is the escape that
+                // changes, so a partial write buys nothing and a full row keeps
+                // the placement anchored at column 1.
+                if !is_image {
+                    // Overwrite before clearing any leftover tail. Clearing the
+                    // whole row first blanks stationary sidebars during scroll on
+                    // terminals that do not implement synchronized output.
+                    if let Some((column, text)) = (!full_redraw)
+                        .then(|| crate::line_diff::patch(&previous[row], line))
+                        .flatten()
+                    {
+                        buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
+                        continue;
                     }
                 }
+                buffer.push_str(&format!("\x1b[{};1H{}", row + 1, rendered));
+                if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
+                    buffer.push_str("\x1b[K");
+                }
             }
+
+            // Every image on screen this frame is in the terminal: keep it
+            // trusted for the next frame. An image that scrolled away is
+            // forgotten, so its payload is re-sent when it comes back instead
+            // of placing an id the terminal may no longer hold. Placement-only
+            // rows count: they are the steady state after the payload frame.
+            for line in &visible {
+                if let Some(id) = kitty_image_id(line) {
+                    uploads.note_painted(id);
+                }
+            }
+            uploads.end_frame();
 
             // Position the hardware cursor using the marker location captured
             // before internal markers were stripped from `visible`.
@@ -1101,6 +1593,12 @@ impl TuiAltScreen {
             terminal.flush();
         }
 
+        // Publish input geometry only after the synchronized frame is written.
+        // Its scroll snapshots must describe the screen the user actually saw,
+        // not a frame still being assembled or an already-mutated live cache.
+        if let Ok(mut current) = self.current_frame.lock() {
+            *current = Some(Arc::new(frame));
+        }
         // Store current screen
         if let Ok(mut prev) = self.previous_screen.lock() {
             *prev = visible;
@@ -1108,6 +1606,7 @@ impl TuiAltScreen {
         if let Ok(mut painted) = self.painted_size.lock() {
             *painted = (width, height);
         }
+        *self.painted_cells.lock().unwrap() = cells;
     }
 
     fn paint_overlays(&self, lines: &mut [String], width: usize, height: usize) {
@@ -1310,7 +1809,12 @@ impl TUI for TuiAltScreen {
             return;
         }
         if force {
-            if let Ok(mut prev) = self.previous_screen.lock() {
+            if self.uses_main_screen() {
+                // Forgetting the baseline while retaining a physical cursor
+                // makes the "first frame" branch append the whole transcript at
+                // that cursor. Preserve both ledgers and repaint live rows only.
+                self.main_force_repaint.store(true, Ordering::Release);
+            } else if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
             }
         }
@@ -1502,6 +2006,10 @@ impl Terminal for TerminalProxy {
         let _ = self.with(|terminal| terminal.refresh_size());
     }
 
+    fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+        self.with(|terminal| terminal.window_size()).flatten()
+    }
+
     fn start(
         &self,
         on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
@@ -1530,7 +2038,11 @@ impl Terminal for TerminalProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Editor, Focusable, Text};
+    use crate::vstack::StackEntryOptions;
+    use crate::{
+        AssistantBlock, AssistantMessageComponent, AssistantMessageOptions, Editor, Focusable,
+        ScrollViewOptions, Text, VStack,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// A terminal whose size the test controls, so a resize can be replayed
@@ -1538,6 +2050,9 @@ mod tests {
     struct ResizableTerminal {
         output: Arc<Mutex<String>>,
         size: Arc<Mutex<(usize, usize)>>,
+        /// The pixel size this fake terminal reports for its current grid.
+        /// `None` means "cannot report pixels", the Windows / zero-ioctl case.
+        pixels: Arc<Mutex<Option<(u16, u16)>>>,
     }
 
     impl ResizableTerminal {
@@ -1545,6 +2060,7 @@ mod tests {
             Self {
                 output: Arc::new(Mutex::new(String::new())),
                 size: Arc::new(Mutex::new((columns, rows))),
+                pixels: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1554,6 +2070,16 @@ mod tests {
 
         fn size(&self) -> Arc<Mutex<(usize, usize)>> {
             self.size.clone()
+        }
+
+        /// The pixel size this terminal reports, settable per test.
+        ///
+        /// The geometry a renderer uses is a property of its terminal, so a
+        /// test drives it through the fake terminal instead of a process-wide
+        /// override: nothing another test does can move this renderer's cell
+        /// size between two frames.
+        fn pixels(&self) -> Arc<Mutex<Option<(u16, u16)>>> {
+            self.pixels.clone()
         }
     }
 
@@ -1581,6 +2107,16 @@ mod tests {
         fn enter_raw_mode(&self) {}
         fn exit_raw_mode(&self) {}
         fn refresh_size(&self) {}
+        fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+            let (columns, rows) = *self.size.lock().unwrap();
+            let (width, height) = (*self.pixels.lock().unwrap())?;
+            Some(crossterm::terminal::WindowSize {
+                columns: columns as u16,
+                rows: rows as u16,
+                width,
+                height,
+            })
+        }
         fn start(
             &self,
             _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
@@ -1659,6 +2195,180 @@ mod tests {
         let frame = output.lock().unwrap().clone();
         assert!(frame.contains("\x1b[12;1H"), "got: {frame:?}");
         assert_eq!(*tui.painted_size.lock().unwrap(), (60, 12));
+    }
+
+    #[test]
+    fn selection_burst_does_not_wait_for_terminal_output() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use std::sync::mpsc;
+
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), false, None));
+        tui.set_layout_root(Some(Arc::new(ScrollView::simple(Arc::new(Text::new(
+            "prefix TARGET suffix",
+            0,
+            0,
+        ))))));
+        tui.start_readerless();
+        tui.enable_render_coalescing();
+        let painted = tui.current_frame.lock().unwrap().clone().unwrap();
+        output.lock().unwrap().clear();
+
+        // Model the render thread holding the terminal during a slow write.
+        // Input must keep consuming events and park only the latest repaint.
+        let terminal_guard = tui.terminal.lock().unwrap();
+        let input_tui = tui.clone();
+        let (tx, rx) = mpsc::channel();
+        let input = std::thread::spawn(move || {
+            let mouse = |kind, column| MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            input_tui
+                .handle_selection_mouse_event(&mouse(MouseEventKind::Down(MouseButton::Left), 7));
+            for i in 0..200 {
+                input_tui.handle_selection_mouse_event(&mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    8 + i % 10,
+                ));
+            }
+            input_tui
+                .handle_selection_mouse_event(&mouse(MouseEventKind::Up(MouseButton::Left), 12));
+            tx.send(input_tui.selection_text()).unwrap();
+        });
+        let selected = rx.recv_timeout(Duration::from_secs(2));
+        // Release and join even on failure, so a regression cannot hang the suite.
+        drop(terminal_guard);
+        input.join().unwrap();
+        assert_eq!(
+            selected
+                .expect("mouse input must not wait for the terminal lock")
+                .as_deref(),
+            Some("TARGET")
+        );
+        assert!(output.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            &painted,
+            tui.current_frame.lock().unwrap().as_ref().unwrap()
+        ));
+        assert!(tui.flush_pending_render());
+        assert!(output.lock().unwrap().contains("\x1b[7mTARGET"));
+        assert!(!Arc::ptr_eq(
+            &painted,
+            tui.current_frame.lock().unwrap().as_ref().unwrap()
+        ));
+        assert_eq!(painted.lines[0], "prefix TARGET suffix");
+        assert!(!tui.flush_pending_render());
+    }
+
+    #[test]
+    fn selection_uses_painted_dimensions_until_resize_is_rendered() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new(
+            "header\nmiddle\nprefix TARGET suffix",
+            0,
+            0,
+        ))));
+        tui.start_readerless();
+        tui.enable_render_coalescing();
+
+        // The terminal has resized, but input still refers to the old painted
+        // frame. Mixing its layout with the live size would clamp to row 0.
+        *size.lock().unwrap() = (8, 1);
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 12),
+            (MouseEventKind::Up(MouseButton::Left), 12),
+        ] {
+            tui.handle_selection_mouse_event(&MouseEvent {
+                kind,
+                column,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(tui.selection_text().as_deref(), Some("TARGET"));
+        assert!(tui.flush_pending_render());
+        assert!(
+            tui.selection_text().is_none(),
+            "reflow clears the old selection"
+        );
+    }
+
+    #[test]
+    fn reflow_clears_old_selection_instead_of_reusing_stale_columns() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let scroll = Arc::new(ScrollView::simple(Arc::new(Text::new(
+            "prefix TARGET suffix",
+            0,
+            0,
+        ))));
+        tui.set_layout_root(Some(scroll));
+        tui.start_readerless();
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 12),
+            (MouseEventKind::Up(MouseButton::Left), 12),
+        ] {
+            tui.handle_selection_mouse_event(&MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(tui.selection_text().as_deref(), Some("TARGET"));
+        *size.lock().unwrap() = (30, 8);
+        tui.request_render(false);
+        assert!(tui.selection_text().is_none());
+        assert!(!tui.selection_dragged());
+    }
+
+    #[test]
+    fn reflow_cancels_a_plain_press_without_leaving_follow_paused() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let text = Arc::new(Text::new(
+            (0..30)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        let scroll = Arc::new(ScrollView::primary(text));
+        tui.set_layout_root(Some(scroll.clone()));
+        tui.start_readerless();
+        tui.handle_selection_mouse_event(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!scroll.is_following_end());
+        *size.lock().unwrap() = (30, 12);
+        tui.request_render(false);
+        assert!(scroll.is_following_end());
+        assert_eq!(scroll.scroll_top(), 18);
+        assert!(tui.selection_text().is_none());
+        assert!(!tui.handle_selection_mouse_event(&MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE
+        }));
     }
 
     #[test]
@@ -1747,6 +2457,51 @@ mod tests {
         }
     }
 
+    /// The character grid can stay identical while the cell geometry changes
+    /// (font zoom, a window moved to a monitor with another DPI). No resize event
+    /// has to arrive for that, so the watchdog is the only place that can notice
+    /// it — and a diff against the previous frame would keep the old image rows.
+    ///
+    /// The previous frame's geometry is faked through `painted_cells` instead of
+    /// mutating the process-wide capability cache, which other tests running in
+    /// parallel would observe.
+    #[test]
+    fn the_size_watchdog_repaints_when_only_the_cell_geometry_changed() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // The frame on screen was laid out for a cell size the terminal no
+        // longer reports, with the columns and rows unchanged.
+        let painted = *tui.painted_cells.lock().unwrap();
+        *tui.painted_cells.lock().unwrap() = CellDimensions {
+            width: painted.width.saturating_add(1).max(1),
+            height: painted.height.saturating_add(1).max(1),
+        };
+        let redraws = tui.full_redraws();
+        tui.ensure_size();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a cell geometry change must repaint every row, got: {frame:?}"
+        );
+        assert_eq!(tui.full_redraws(), redraws + 1);
+        assert_eq!(*tui.painted_cells.lock().unwrap(), painted);
+
+        // A tick that re-reads the same geometry stays free.
+        output.lock().unwrap().clear();
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "an unchanged cell geometry must not repaint, got: {:?}",
+            output.lock().unwrap()
+        );
+    }
+
     #[test]
     fn the_size_watchdog_does_not_repaint_an_unchanged_frame() {
         let terminal = ResizableTerminal::new(40, 8);
@@ -1765,6 +2520,119 @@ mod tests {
             output.lock().unwrap().is_empty(),
             "an unchanged size must not repaint, got: {:?}",
             output.lock().unwrap()
+        );
+    }
+
+    /// Two renderers with different cell geometries must not see each other.
+    ///
+    /// This is the isolation the previous head lacked: the injected pixel size
+    /// and the geometry derived from it were process-wide, so a probe running
+    /// in parallel could move another renderer's cell size between two frames.
+    /// Each renderer now polls its own terminal, so this holds with no lock at
+    /// all — the assertion is that interleaved renders keep their own geometry.
+    #[test]
+    fn two_renderers_keep_their_own_cell_geometry() {
+        let small = ResizableTerminal::new(40, 8);
+        let small_pixels = small.pixels();
+        *small_pixels.lock().unwrap() = Some((400, 160)); // 10x20 per cell
+        let small_out = small.output();
+        let small_tui = TuiAltScreen::new(Box::new(small), false, None);
+        small_tui.set_layout_root(Some(Arc::new(Text::new("small", 0, 0))));
+        small_tui.start_readerless();
+        small_out.lock().unwrap().clear();
+
+        let large = ResizableTerminal::new(40, 8);
+        let large_pixels = large.pixels();
+        *large_pixels.lock().unwrap() = Some((800, 160)); // 20x20 per cell
+        let large_out = large.output();
+        let large_tui = TuiAltScreen::new(Box::new(large), false, None);
+        large_tui.set_layout_root(Some(Arc::new(Text::new("large", 0, 0))));
+        large_tui.start_readerless();
+        large_out.lock().unwrap().clear();
+
+        assert_eq!(
+            *small_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            })
+        );
+        assert_eq!(
+            *large_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            })
+        );
+
+        // Interleave the watchdogs: each renderer re-polls its own terminal and
+        // neither adopts the other's geometry.
+        for _ in 0..3 {
+            small_tui.ensure_size();
+            large_tui.ensure_size();
+        }
+        assert_eq!(
+            *small_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            }),
+            "the smaller-cell renderer must keep its own geometry"
+        );
+        assert_eq!(
+            *large_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            }),
+            "the larger-cell renderer must keep its own geometry"
+        );
+    }
+
+    /// A font zoom the terminal reports on its own must reach the watchdog.
+    ///
+    /// The previous probes faked the *cached* geometry, so they never proved
+    /// the poll: this one changes what the terminal answers and asserts the
+    /// repaint follows, which is the path a real font zoom takes.
+    #[test]
+    fn the_watchdog_follows_a_geometry_the_terminal_starts_reporting() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let pixels = terminal.pixels();
+        *pixels.lock().unwrap() = Some((400, 160)); // 10x20 per cell
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // A steady tick stays free.
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "an unchanged geometry must not repaint, got: {:?}",
+            output.lock().unwrap()
+        );
+
+        // Font zoom: same 40x8 grid, half the pixels per cell. No resize event
+        // arrives for this, so the watchdog poll is the only thing that can
+        // notice.
+        *pixels.lock().unwrap() = Some((400, 80));
+        let redraws = tui.full_redraws();
+        tui.ensure_size();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a geometry-only change the terminal reports must repaint every row, got: {frame:?}"
+        );
+        assert_eq!(tui.full_redraws(), redraws + 1);
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 10
+            }),
+            "the watchdog must adopt the geometry the terminal now reports"
         );
     }
 
@@ -1960,6 +2828,162 @@ mod tests {
     }
 
     #[test]
+    fn component_updates_publish_between_complete_frames() {
+        use std::sync::mpsc;
+        for main_screen in [false, true] {
+            let terminal = ResizableTerminal::new(40, 8);
+            let output = terminal.output();
+            let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), true, None));
+            tui.set_main_screen_mode(main_screen);
+            let root = Arc::new(Container::new());
+            let history = (0..4)
+                .map(|row| format!("history-{row:03}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            root.add_child(Arc::new(Text::new(&history, 0, 0)));
+            tui.set_layout_root(Some(root.clone()));
+            tui.start_readerless();
+            output.lock().unwrap().clear();
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let (painted_tx, painted_rx) = mpsc::channel();
+            let mut painter = None;
+            tui.update_components(|| {
+                assert!(matches!(
+                    tui.render_lock.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                root.clear();
+                let painting_tui = tui.clone();
+                painter = Some(std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    painting_tui.render_now(false);
+                    painted_tx.send(()).unwrap();
+                }));
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(painted_rx.try_recv().is_err());
+                assert!(output.lock().unwrap().is_empty());
+                root.add_child(Arc::new(Text::new(&history, 0, 0)));
+                root.add_child(Arc::new(Text::new("complete reply", 0, 0)));
+            });
+            // The queued renderer can only paint the completed tree, after the
+            // publisher releases the frame gate; neither mode may deadlock.
+            painted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            painter.unwrap().join().unwrap();
+            assert!(tui.render_lock.try_lock().is_ok());
+            let rendered = output.lock().unwrap().clone();
+            assert!(rendered.contains("complete reply"));
+            assert!(
+                !rendered.contains("\x1b[3J"),
+                "transient empty tree painted"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_live_text_cannot_alias_an_earlier_saved_block() {
+        let previous = ["a", "b", "c", "old-middle", "a", "b", "c", "old-tail"].map(str::to_string);
+        let current = ["a", "b", "c", "new-output-0", "new-output-1"].map(str::to_string);
+        // The sole remaining ABC is the saved copy, not an identity for the
+        // removed second ABC. Only the independently unique saved cutoff maps.
+        assert_eq!(main_screen_live_anchor(&previous, &current, 4), None);
+        assert_eq!(main_screen_saved_anchor(&previous, &current, 4), Some(3));
+    }
+
+    #[test]
+    fn main_screen_geometry_and_zero_size_never_replay_saved_rows() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let size = terminal.size();
+        let pixels = terminal.pixels();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_main_screen_mode(true);
+        let text = Arc::new(Text::new(
+            (0..80)
+                .map(|i| format!("saved-message-{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        tui.set_layout_root(Some(text));
+        tui.start_readerless();
+        for dimensions in [(52, 12), (32, 6), (40, 8)] {
+            output.lock().unwrap().clear();
+            *size.lock().unwrap() = dimensions;
+            tui.request_render(false);
+            let frame = output.lock().unwrap().clone();
+            assert_eq!(frame.matches("\x1b[2K").count(), dimensions.1);
+            assert!(!frame.contains("\x1b[2J"));
+            assert!(!frame.contains("\x1b[3J"));
+            assert!(!frame.contains("saved-message-000"));
+            assert!(frame.contains("saved-message-079"));
+            assert_eq!(*tui.painted_size.lock().unwrap(), dimensions);
+        }
+        output.lock().unwrap().clear();
+        *pixels.lock().unwrap() = Some((400, 160));
+        tui.request_render(false);
+        let frame = output.lock().unwrap().clone();
+        assert_eq!(frame.matches("\x1b[2K").count(), 8);
+        assert!(!frame.contains("\x1b[2J"));
+        assert!(!frame.contains("\x1b[3J"));
+        assert!(!frame.contains("saved-message-000"));
+        output.lock().unwrap().clear();
+        let baseline = tui.previous_screen.lock().unwrap().clone();
+        *size.lock().unwrap() = (0, 0);
+        tui.main_force_repaint.store(true, Ordering::Release);
+        tui.note_resize();
+        assert!(output.lock().unwrap().is_empty());
+        assert_eq!(*tui.previous_screen.lock().unwrap(), baseline);
+        assert!(tui.main_force_repaint.load(Ordering::Acquire));
+        assert!(tui.resize_dirty.load(Ordering::Acquire));
+        *size.lock().unwrap() = (40, 8);
+        tui.request_render(false);
+        let frame = output.lock().unwrap().clone();
+        assert_eq!(frame.matches("\x1b[2K").count(), 8);
+        assert!(!frame.contains("\x1b[2J"));
+        assert!(!frame.contains("\x1b[3J"));
+        assert!(!frame.contains("saved-message-000"));
+        assert!(!tui.resize_dirty.load(Ordering::Acquire));
+        assert!(!tui.main_force_repaint.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn main_screen_page_removal_preserves_saved_images_but_deletes_live_placements() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_main_screen_mode(true);
+        let placement = |id| {
+            crate::terminal_image::encode_kitty(
+                b"image-payload",
+                &crate::terminal_image::ImageRenderOptions {
+                    id: Some(id),
+                    width: Some(1),
+                    height: Some(1),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut lines = vec![placement(9903)];
+        lines.extend((1..40).map(|i| format!("image-row-{i:03}")));
+        lines.push(placement(9904));
+        tui.set_layout_root(Some(Arc::new(ImageTranscript {
+            lines: lines.clone(),
+        })));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+        lines.remove(0); // Archived image disappears from the logical page.
+        lines.pop(); // Current live image must still be removed.
+        tui.set_layout_root(Some(Arc::new(ImageTranscript { lines })));
+        tui.request_render(false);
+        let frame = output.lock().unwrap().clone();
+        assert!(!frame.contains(&crate::terminal_image::delete_kitty_placement(9903)));
+        assert!(frame.contains(&crate::terminal_image::delete_kitty_placement(9904)));
+        assert!(!frame.contains("\x1b[3J"));
+    }
+
+    #[test]
     fn regular_start_never_switches_to_the_alternate_screen() {
         let output = Arc::new(Mutex::new(String::new()));
         let tui = TuiAltScreen::new(
@@ -2087,6 +3111,71 @@ mod tests {
         assert!(output.lock().unwrap().is_empty());
     }
 
+    /// The main-screen renderer must poll the cell geometry before it lays the
+    /// document out, not just inherit whatever `ensure_size` last wrote.
+    ///
+    /// The alt-screen path already re-polls right before layout; the main
+    /// screen returned to `do_render_main_screen()` first, so a host that
+    /// renders without a periodic watchdog would keep the geometry from
+    /// startup.
+    ///
+    /// The pixel size comes from the fake terminal's own `window_size()`, so
+    /// this test shares no mutable state with the rest of the binary: nothing
+    /// it does can move another renderer's geometry, and nothing another test
+    /// does can move this one's. The assertions read the renderer's polled
+    /// geometry rather than the process-wide cache for the same reason.
+    #[test]
+    fn the_main_screen_polls_the_cell_geometry_before_laying_out() {
+        // The grid is 40x8; 400x160 pixels means one cell is 10x20.
+        let terminal = ResizableTerminal::new(40, 8);
+        let pixels = terminal.pixels();
+        *pixels.lock().unwrap() = Some((400, 160));
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(Arc::new(Text::new("main screen frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // `start_readerless` paints the first frame; the renderer must have
+        // polled the pixel size instead of trusting the 8x16 default.
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            }),
+            "the main-screen renderer must poll the cell geometry before layout"
+        );
+
+        // A later font zoom (new pixel size, same grid) must be picked up by a
+        // plain render too, without waiting for `ensure_size`.
+        *pixels.lock().unwrap() = Some((800, 160));
+        tui.do_render(false);
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            }),
+            "a direct main-screen render must re-poll the cell geometry"
+        );
+
+        // The Windows / zero-pixel fallback: a terminal that cannot report a
+        // pixel size must leave the last known geometry in place instead of
+        // resetting it to the 8x16 default mid-session.
+        *pixels.lock().unwrap() = None;
+        tui.do_render(false);
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            }),
+            "an unsupported pixel query must keep the polled geometry"
+        );
+    }
+
     #[test]
     fn merge_pending_render_never_downgrades_a_full_render() {
         // Nothing parked: the request's own variant wins.
@@ -2185,5 +3274,349 @@ mod tests {
             "200 requests in ~250 ms must coalesce into ~16 ms frames, painted {frames}"
         );
         tui.stop(TuiStopOptions::default());
+    }
+
+    /// A transcript row that holds a Kitty placement, plus enough rows around
+    /// it to scroll it in and out of the viewport.
+    struct ImageTranscript {
+        lines: Vec<String>,
+    }
+
+    impl Component for ImageTranscript {
+        fn render(&self, _width: usize) -> Vec<String> {
+            self.lines.clone()
+        }
+        fn invalidate(&self) {}
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    const IMAGE_ID: u32 = 9_902;
+
+    /// A transcript whose row 2 carries a 4-row Kitty placement with a payload
+    /// large enough that re-sending it would be obvious in the frame bytes.
+    fn image_screen() -> (TuiAltScreen, Arc<Mutex<String>>, Arc<ScrollView>) {
+        let mut payload = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        payload.resize(44_181, 0);
+        let placement = crate::terminal_image::encode_kitty(
+            &payload,
+            &crate::terminal_image::ImageRenderOptions {
+                id: Some(IMAGE_ID),
+                width: Some(20),
+                height: Some(4),
+                ..Default::default()
+            },
+        );
+        crate::terminal_image::register_kitty_image(crate::terminal_image::KittyImageMetadata {
+            id: IMAGE_ID,
+            columns: 20,
+            rows: 4,
+            width_px: 400,
+            height_px: 320,
+        });
+
+        let mut lines: Vec<String> = (0..40).map(|row| format!("row {row}")).collect();
+        lines[2] = placement;
+        for row in &mut lines[3..6] {
+            row.clear();
+        }
+
+        let scroll = Arc::new(ScrollView::new(
+            Arc::new(ImageTranscript { lines }),
+            ScrollViewOptions {
+                follow: crate::FollowMode::None,
+                ..Default::default()
+            },
+        ));
+        let stack = VStack::new();
+        stack.add_child_with_options(scroll.clone(), StackEntryOptions::with_basis(8));
+
+        let output = Arc::new(Mutex::new(String::new()));
+        let tui = TuiAltScreen::new(
+            Box::new(RecordingTerminal {
+                output: output.clone(),
+            }),
+            false,
+            None,
+        );
+        tui.set_layout_root(Some(Arc::new(stack)));
+        tui.start_readerless();
+        (tui, output, scroll)
+    }
+
+    /// Scrolling an image repaints its row. The row must move the placement by
+    /// id instead of re-sending the payload, and it must not delete the image
+    /// data the placement-only rewrite depends on.
+    #[test]
+    fn scrolling_an_image_moves_its_placement_without_resending_the_payload() {
+        let (tui, output, scroll) = image_screen();
+        let first = output.lock().unwrap().clone();
+        assert!(
+            first.contains("\x1b_Ga=T,") && first.contains("i=9902,p=1"),
+            "the first frame must transmit the payload, got {} bytes",
+            first.len()
+        );
+
+        output.lock().unwrap().clear();
+        scroll.scroll_to(1);
+        tui.do_render(false);
+        let frame = output.lock().unwrap().clone();
+
+        assert!(
+            frame.contains("\x1b_Ga=p,") && frame.contains("i=9902,p=1"),
+            "the moved image must be placed by id, got {frame:?}"
+        );
+        assert!(
+            !frame.contains("iVBORw0KGgo"),
+            "the payload must not be re-sent, got {} bytes",
+            frame.len()
+        );
+        assert!(
+            !frame.contains("\x1b_Ga=d,"),
+            "an image that is still on screen must be moved, not deleted: {frame:?}"
+        );
+    }
+
+    /// An image that scrolls out of the viewport is deleted by placement only:
+    /// the stored data has to survive for a later re-place of the same id.
+    #[test]
+    fn an_image_that_scrolls_off_screen_is_deleted_by_placement_only() {
+        let (tui, output, scroll) = image_screen();
+        output.lock().unwrap().clear();
+
+        // The placement covers rows 2..6; a viewport starting at row 8 no
+        // longer contains it.
+        scroll.scroll_to(8);
+        tui.do_render(false);
+        let frame = output.lock().unwrap().clone();
+
+        assert!(
+            frame.contains("\x1b_Ga=d,d=i,i=9902,p=1"),
+            "the off-screen placement must be deleted, got {frame:?}"
+        );
+        assert!(
+            !frame.contains("d=I"),
+            "deleting the image data would blank a later re-place: {frame:?}"
+        );
+    }
+
+    // ---- Thinking click-region integration probes ----
+
+    fn thinking_tui() -> (
+        Arc<TuiAltScreen>,
+        Arc<AssistantMessageComponent>,
+        Arc<Mutex<String>>,
+        Arc<Mutex<(usize, usize)>>,
+    ) {
+        let terminal = ResizableTerminal::new(80, 10);
+        let output = terminal.output();
+        let size = terminal.size();
+        let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), false, None));
+        let doc = Arc::new(crate::container::Container::new());
+        let msg = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions {
+            hide_thinking: true,
+            ..Default::default()
+        }));
+        msg.set_message_id("t1");
+        msg.update_blocks(&[
+            AssistantBlock::Thinking("deep reasoning".to_string()),
+            AssistantBlock::Text("visible answer".to_string()),
+        ]);
+        // Enough filler above the message to make the transcript scrollable —
+        // a region can only follow a scroll if the document overflows.
+        doc.add_child(Arc::new(Text::new(
+            (1..=20)
+                .map(|n| format!("filler {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        )) as Arc<dyn Component>);
+        doc.add_child(msg.clone() as Arc<dyn Component>);
+        let scroll = Arc::new(ScrollView::new(
+            doc.clone() as Arc<dyn Component>,
+            ScrollViewOptions {
+                primary: true,
+                ..Default::default()
+            },
+        ));
+        tui.set_layout_root(Some(scroll as Arc<dyn Component>));
+        tui.start_readerless();
+        (tui, msg, output, size)
+    }
+
+    fn mouse(
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn thinking_label_resolves_to_a_click_region_on_the_painted_frame() {
+        // Axis: frame-scoped geometry. After a real render the collapsed
+        // label row must resolve to a region; a marker-free row must not.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let rows = tui.current_frame.lock().unwrap().clone().unwrap().height;
+        let mut hit_row = None;
+        for row in 0..rows {
+            if tui
+                .thinking_region_hit(&mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    2,
+                    row as u16,
+                ))
+                .as_deref()
+                == Some("t1")
+            {
+                hit_row = Some(row);
+                break;
+            }
+        }
+        let hit_row = hit_row.expect("collapsed label row must carry a region");
+        // Adjacent rows without a marker must not resolve.
+        for row in 0..rows {
+            if row == hit_row {
+                continue;
+            }
+            assert_ne!(
+                tui.thinking_region_hit(&mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    2,
+                    row as u16
+                ))
+                .as_deref(),
+                Some("t1"),
+                "row {row} resolved to a region without a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_markers_never_reach_the_terminal_output() {
+        // Axis: output purity. The painted frame must strip every region
+        // marker before diffing — the raw terminal bytes must not contain the
+        // APC introducer.
+        let (tui, _msg, output, _size) = thinking_tui();
+        let _ = tui;
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            !frame.contains("\x1b_pi:z"),
+            "region marker leaked into the terminal stream: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn drag_and_release_do_not_hit_thinking_regions() {
+        // Axis: event shape. Only a Down press resolves; Drag/Up never do, so
+        // a text-selection drag across a label row cannot toggle it.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let rows = tui.current_frame.lock().unwrap().clone().unwrap().height;
+        let mut found = false;
+        for row in 0..rows {
+            for (kind, name) in [
+                (MouseEventKind::Drag(MouseButton::Left), "drag"),
+                (MouseEventKind::Up(MouseButton::Left), "up"),
+                (MouseEventKind::Down(MouseButton::Right), "right"),
+            ] {
+                assert!(
+                    tui.thinking_region_hit(&mouse(kind, 2, row as u16))
+                        .is_none(),
+                    "{name} event must never resolve a region"
+                );
+            }
+            found = found
+                || tui
+                    .thinking_region_hit(&mouse(
+                        MouseEventKind::Down(MouseButton::Left),
+                        2,
+                        row as u16,
+                    ))
+                    .is_some();
+        }
+        assert!(found, "probe fixture lost its label row");
+    }
+
+    #[test]
+    fn regions_follow_the_painted_frame_across_scroll() {
+        // Axis: scroll/clip. Regions are frame-scoped: after scrolling, a
+        // click resolves against the NEW painted frame (the region moves with
+        // the content, and rows the content left never resolve again).
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let scroll = tui.get_primary_scroll_view().expect("primary scroll");
+        let rows = tui.current_frame.lock().unwrap().clone().unwrap().height;
+        let before: Vec<Option<String>> = (0..rows as u16)
+            .map(|row| {
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+            })
+            .collect();
+        assert!(
+            before.iter().any(|hit| hit.as_deref() == Some("t1")),
+            "no region on initial frame"
+        );
+
+        scroll.scroll_by(-3);
+        tui.request_render(false);
+        let mid: Vec<Option<String>> = (0..rows as u16)
+            .map(|row| {
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+            })
+            .collect();
+        scroll.scroll_by(2);
+        tui.request_render(false);
+        let after: Vec<Option<String>> = (0..rows as u16)
+            .map(|row| {
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+            })
+            .collect();
+        // The region must still exist somewhere (content scrolled, not
+        // destroyed) and a stale rectangle from the previous frame must not
+        // resolve at its old row.
+        assert!(after.iter().any(|hit| hit.as_deref() == Some("t1")));
+        let row_before = before.iter().position(|hit| hit.is_some()).unwrap();
+        // Frame-scoped invariant: the mid frame's regions differ from the
+        // end-followed frame (the label moved or left the viewport), and a
+        // stale rectangle from BEFORE must not resolve after the scroll.
+        assert_ne!(
+            mid.iter().position(|hit| hit.is_some()),
+            Some(row_before),
+            "region row must follow the scroll, not stay frozen"
+        );
+        assert!(after.iter().any(|hit| hit.as_deref() == Some("t1")));
+    }
+
+    #[test]
+    fn overlay_rows_never_resolve_thinking_regions() {
+        // Self-review probe: a modal overlay paints OVER the transcript. Its
+        // rows must not inherit the underlying region markers (`slice` keeps
+        // APC markers from the base row, so this is a real hazard).
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let overlay = Arc::new(Text::new("modal content", 0, 0));
+        let _handle = tui.show_overlay(
+            overlay,
+            Some(crate::tui::OverlayOptions {
+                anchor: crate::tui::OverlayAnchor::Center,
+                width: Some(crate::tui::SizeValue::Absolute(40)),
+                ..Default::default()
+            }),
+        );
+        for row in 0..10u16 {
+            assert!(
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+                    .is_none(),
+                "row {row} resolved a thinking region while an overlay was open"
+            );
+        }
     }
 }

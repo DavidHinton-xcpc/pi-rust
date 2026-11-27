@@ -114,7 +114,7 @@ impl AgentEmitter for AppendDuringEvent {
                     proceed.notified().await;
                 }
             }
-            if let AgentEvent::MessageEnd { message } = event {
+            if let AgentEvent::MessageEnd { message, .. } = event {
                 if message != context_message() {
                     return;
                 }
@@ -139,7 +139,7 @@ fn on_tool(event: &AgentEvent) -> bool {
     matches!(event, AgentEvent::ToolExecutionEnd { .. })
 }
 fn on_final(event: &AgentEvent) -> bool {
-    matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) }
+    matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a), .. }
         if !a.content.iter().any(|c| matches!(c, Content::ToolCall(_))))
 }
 fn on_start(event: &AgentEvent) -> bool {
@@ -213,6 +213,7 @@ async fn harness_with_compaction(
         drive: Default::default(),
         session,
         allow_existing_session: restore,
+        require_native_durable: false,
         models: vec![provider.clone() as Arc<dyn Provider>],
         to_provider_messages: None,
         entry_projectors: Default::default(),
@@ -316,7 +317,8 @@ async fn tool_callback_append_waits_for_the_whole_batch_and_reaches_the_next_req
             matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::ToolResult(_)
+                    message: AgentMessage::ToolResult(_),
+                    ..
                 }
             )
         })
@@ -327,7 +329,8 @@ async fn tool_callback_append_waits_for_the_whole_batch_and_reaches_the_next_req
             matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::Custom(_)
+                    message: AgentMessage::Custom(_),
+                    ..
                 }
             )
         })
@@ -1081,7 +1084,7 @@ async fn compaction_then_retry_preserves_the_recovered_final_message() {
 async fn retry_success_with_silent_context_must_not_schedule_another_resume() {
     for failed_attempts in [1, 2] {
         let mut emitter = AppendDuringEvent::new(
-            |event| matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } if a.stop_reason == StopReason::Stop),
+            |event| matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a), .. } if a.stop_reason == StopReason::Stop),
         );
         emitter.send = Some(SendMessageOptions {
             trigger_turn: Some(false),
@@ -1744,8 +1747,8 @@ mod resume_admission {
     use super::*;
     use rpi_harness::error::SessionResult;
     use rpi_harness::session::types::{
-        BranchBounds, LanePointer, LaneRecord, LogItem, LogOptions, OperationIntent,
-        OperationStartedRecord, ProvisionedEntry, SessionStats, SessionStorage,
+        BranchBounds, HistoryIdentity, LanePointer, LaneRecord, LogItem, LogOptions,
+        OperationIntent, OperationStartedRecord, ProvisionedEntry, SessionStats, SessionStorage,
     };
 
     struct PausedStorage {
@@ -1757,11 +1760,30 @@ mod resume_admission {
 
     #[async_trait::async_trait]
     impl SessionStorage for PausedStorage {
+        async fn prune_completed_progress(&self) -> SessionResult<usize> {
+            self.inner.prune_completed_progress().await
+        }
+
+        async fn append_progress(
+            &self,
+            records: Vec<rpi_harness::session::types::AssistantFrameRecord>,
+        ) -> SessionResult<Vec<rpi_harness::session::types::AssistantFrameRecord>> {
+            self.inner.append_progress(records).await
+        }
+        async fn read_progress(
+            &self,
+            run_id: &str,
+        ) -> SessionResult<Vec<rpi_harness::session::types::AssistantFrameRecord>> {
+            self.inner.read_progress(run_id).await
+        }
         fn metadata(&self) -> SessionMetadata {
             self.inner.metadata()
         }
         async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
             self.inner.get_lanes().await
+        }
+        async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+            self.inner.history_identity().await
         }
         async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
             self.inner.create_lane(lane, at).await
@@ -1799,6 +1821,12 @@ mod resume_admission {
         }
         async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
             self.inner.find_records(query).await
+        }
+        async fn record_page(
+            &self,
+            query: &rpi_harness::session::types::RecordPageQuery,
+        ) -> SessionResult<rpi_harness::session::types::RecordPage> {
+            self.inner.record_page(query).await
         }
         async fn find_open_operations(
             &self,
@@ -2169,6 +2197,7 @@ async fn restored_legacy_run_bound_queues_can_be_cancelled_after_their_run_finis
                     run_id: "legacy-run".into(),
                     outcome: OperationOutcome::Completed,
                     error: None,
+                    result: None,
                 }))
                 .await
                 .unwrap();

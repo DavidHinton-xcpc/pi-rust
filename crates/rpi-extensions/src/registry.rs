@@ -15,8 +15,10 @@ use std::sync::Arc;
 use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn,
-    ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, EVENT_TAG_COUNT,
+    ArgumentSuggesterFn, AutocompleteProviderFn, BeforeAgentStartFn, CommandArgumentCompletionFn,
+    CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestControlFn,
+    OAuthRequestFn, ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn,
+    ToolResultFn, EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -42,6 +44,35 @@ fn requires_auth_default() -> bool {
 // Registered-item records
 // ---------------------------------------------------------------------------
 
+/// Explicit system-prompt contributions, separate from the provider-facing
+/// schema. No snippet means the tool remains callable but is not listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolPromptMetadata {
+    pub prompt_snippet: Option<String>,
+    pub prompt_guidelines: Vec<String>,
+}
+
+impl ToolPromptMetadata {
+    /// Match pi's whitespace handling; cross-tool deduplication happens when
+    /// the CLI renders the active tool set.
+    pub fn normalized(self) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        Self {
+            prompt_snippet: self
+                .prompt_snippet
+                .map(|snippet| snippet.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|snippet| !snippet.is_empty()),
+            prompt_guidelines: self
+                .prompt_guidelines
+                .into_iter()
+                .map(|rule| rule.trim().to_owned())
+                .filter(|rule| !rule.is_empty() && seen.insert(rule.clone()))
+                .collect(),
+        }
+    }
+}
+
 /// A tool an extension registered: the provider-facing [`Tool`] schema + the
 /// plugin's 4-function handle ([`PluginToolHandle`]) the host drives via
 /// [`PluginToolAdapter`](crate::PluginToolAdapter).
@@ -53,12 +84,18 @@ fn requires_auth_default() -> bool {
 pub struct ExtensionTool {
     /// The provider-facing tool definition (name/description/parameters).
     pub tool: Tool,
+    /// Optional prompt contributions owned by the same registration as the tool.
+    pub prompt: ToolPromptMetadata,
     pub(crate) handle: PluginToolHandle,
 }
 
 impl ExtensionTool {
     pub fn new(tool: Tool, handle: PluginToolHandle) -> Self {
-        Self { tool, handle }
+        Self {
+            tool,
+            prompt: ToolPromptMetadata::default(),
+            handle,
+        }
     }
 
     /// The plugin-side function handles backing this tool. `Copy` (fn pointers
@@ -78,6 +115,27 @@ pub struct RegisteredCommand {
     pub name: String,
     pub description: String,
     pub handler: CommandHandlerFn,
+    pub user_data: *mut std::ffi::c_void,
+    /// Argument completions for this command, when the plugin attached them
+    /// (pi's `getArgumentCompletions`). `None` — the common case — means the
+    /// editor keeps its default behavior after the command name.
+    pub completions: Option<RegisteredCommandCompletions>,
+}
+
+/// A plugin's argument-completion callback for one slash command.
+#[derive(Clone, Copy)]
+pub struct RegisteredCommandCompletions {
+    pub handler: CommandArgumentCompletionFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+
+/// A plugin autocomplete provider stacked ahead of the host's built-in ones
+/// (pi's `ui.addAutocompleteProvider`).
+#[derive(Clone, Copy)]
+pub struct RegisteredAutocompleteProvider {
+    pub handler: AutocompleteProviderFn,
+    pub plugin_free_string: FreeStringFn,
     pub user_data: *mut std::ffi::c_void,
 }
 
@@ -99,6 +157,17 @@ pub struct RegisteredShortcut {
 // and plugin callbacks support invocation from any host thread.
 unsafe impl Send for RegisteredCommand {}
 unsafe impl Sync for RegisteredCommand {}
+
+// SAFETY: same contract as `RegisteredCommand` — the handler only reads
+// `plugin_free_string` + its opaque `user_data`, and the plugin makes the
+// callback safe to invoke from any host thread.
+unsafe impl Send for RegisteredCommandCompletions {}
+unsafe impl Sync for RegisteredCommandCompletions {}
+
+// SAFETY: same contract as `RegisteredCommand`; the TUI invokes the provider
+// from its own thread, so the plugin-side handler must be thread-safe.
+unsafe impl Send for RegisteredAutocompleteProvider {}
+unsafe impl Sync for RegisteredAutocompleteProvider {}
 
 /// A CLI flag declared by a native extension. Values are supplied by the
 /// host's parsed `Args::unknown_flags` map and read by the plugin through the
@@ -180,6 +249,37 @@ pub struct BeforeAgentStartHandler {
 unsafe impl Send for BeforeAgentStartHandler {}
 unsafe impl Sync for BeforeAgentStartHandler {}
 
+/// A registered `tool_result` transform. Same ownership shape as
+/// [`BeforeAgentStartHandler`]: the plugin-owned `out` is reclaimed through the
+/// plugin's own `plugin_free_string`.
+///
+/// SAFETY: same as [`RegisteredHandler`].
+#[derive(Clone, Copy)]
+pub struct ToolResultHandler {
+    pub handler: ToolResultFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: fn pointers + an opaque plugin pointer the plugin warrants is
+// thread-safe; the host only reads `user_data` through `handler`.
+unsafe impl Send for ToolResultHandler {}
+unsafe impl Sync for ToolResultHandler {}
+
+/// One argument suggester: command token it answers for + the JSON callback.
+/// The TUI picks the suggester whose command matches the draft's command token.
+#[derive(Clone)]
+pub struct ArgumentSuggester {
+    /// Command token WITHOUT the leading slash, lowercased (`msg`, `use`).
+    pub command: String,
+    pub handler: ArgumentSuggesterFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: same contract as ToolResultHandler — the plugin warrants its
+// `user_data` is valid and the handler callable from any thread.
+unsafe impl Send for ArgumentSuggester {}
+unsafe impl Sync for ArgumentSuggester {}
+
 /// A registered custom provider (B5c). The host wraps `request_fn` in a
 /// [`PluggableProvider`](crate::PluggableProvider) impl of `rpi_ai::Provider`;
 /// its `stream_simple` drives `request_fn` on `spawn_blocking` (the sync fn
@@ -231,7 +331,12 @@ pub struct RegisteredOAuthProvider {
     /// plugin.
     pub plugin: String,
     pub manifest_json: String,
+    /// Legacy action callback. Used only when `control_fn` is `None`.
     pub request_fn: OAuthRequestFn,
+    /// Cancellable action callback (registered through
+    /// `register_oauth_provider_cancellable`). When present the host calls it
+    /// instead of `request_fn`, with a control that reflects cancellation.
+    pub control_fn: Option<OAuthRequestControlFn>,
     pub plugin_free_string: FreeStringFn,
     pub user_data: *mut std::ffi::c_void,
 }
@@ -352,6 +457,17 @@ pub struct ExtensionRegistry {
     /// returns the prompt to install), not a fire-and-forget event subscription,
     /// so it is not indexed by a tag. Chained in registration order.
     before_agent_start: Vec<BeforeAgentStartHandler>,
+    /// `tool_result` transforms, chained in registration order.
+    tool_result: Vec<ToolResultHandler>,
+    /// Autocomplete providers registered by plugins (pi's
+    /// `ui.addAutocompleteProvider`). Consulted ahead of the built-in
+    /// file/slash providers, in registration order.
+    autocomplete: Vec<RegisteredAutocompleteProvider>,
+    /// Extension argument suggesters for the TUI autocomplete pipeline. Keyed
+    /// by the command token (`/msg`) so the TUI asks exactly the plugin that
+    /// registered the command. A bare list mirrors `tool_result`: the TUI
+    /// resolves the matching suggester by command name at call time.
+    argument_suggesters: Vec<ArgumentSuggester>,
     /// Registered custom providers (B5c). The host wraps each in a
     /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
     /// `provider_id`.
@@ -399,6 +515,9 @@ impl ExtensionRegistry {
             handlers,
             resources_discover: Vec::new(),
             before_agent_start: Vec::new(),
+            tool_result: Vec::new(),
+            autocomplete: Vec::new(),
+            argument_suggesters: Vec::new(),
             providers: Vec::new(),
             provider_manifests: std::collections::BTreeMap::new(),
             oauth_providers: Vec::new(),
@@ -426,6 +545,16 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Attach prompt metadata only to a tool in this plugin-local registry.
+    /// Metadata follows the tool through first-wins merge and snapshot/reload.
+    pub fn register_tool_prompt(&mut self, name: &str, prompt: ToolPromptMetadata) -> bool {
+        let Some(tool) = self.tools.iter_mut().find(|tool| tool.tool.name == name) else {
+            return false;
+        };
+        tool.prompt = prompt.normalized();
+        true
+    }
+
     /// Register a slash command (first-wins by name). `true` if a prior was kept.
     pub fn register_command(
         &mut self,
@@ -442,8 +571,53 @@ impl ExtensionRegistry {
             description,
             handler,
             user_data,
+            completions: None,
         });
         false
+    }
+
+    /// Attach argument completions to a command this plugin registered.
+    ///
+    /// Attaches to the command already in the registry, so it never creates a
+    /// command that does not exist. Returns `false` when no command of that
+    /// name is registered (including the case where a different plugin won the
+    /// name first-wins, whose command therefore has no such callback).
+    pub fn set_command_completions(
+        &mut self,
+        name: &str,
+        handler: CommandArgumentCompletionFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        let Some(command) = self.commands.iter_mut().find(|c| c.name == name) else {
+            return false;
+        };
+        command.completions = Some(RegisteredCommandCompletions {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+        true
+    }
+
+    /// Register an autocomplete provider for the editor (append order).
+    pub fn register_autocomplete_provider(
+        &mut self,
+        handler: AutocompleteProviderFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) {
+        self.autocomplete.push(RegisteredAutocompleteProvider {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+    }
+
+    /// Autocomplete providers in registration order (empty when no plugin
+    /// registered one — the TUI then keeps its built-in providers only).
+    pub fn autocomplete_providers(&self) -> &[RegisteredAutocompleteProvider] {
+        &self.autocomplete
     }
 
     /// Register a CLI flag (first-wins by name). Returns `true` when an
@@ -616,6 +790,65 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Register a `tool_result` transform. Multiple handlers are kept and
+    /// chained in registration order. Always inserts; returns `false`.
+    pub fn register_tool_result(
+        &mut self,
+        handler: ToolResultFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        self.tool_result.push(ToolResultHandler {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+        false
+    }
+
+    /// Register an argument suggester for `command` (token without the slash).
+    /// Last-registration-wins per command token: re-registering `/msg`
+    /// replaces the previous suggester (mirrors command re-registration).
+    /// Returns `true` if a prior suggester for the same command was replaced.
+    pub fn register_argument_suggester(
+        &mut self,
+        command: &str,
+        handler: ArgumentSuggesterFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        let command = command.trim_start_matches('/').to_ascii_lowercase();
+        let prior = self
+            .argument_suggesters
+            .iter()
+            .position(|s| s.command == command);
+        let replaced = prior.is_some();
+        if let Some(index) = prior {
+            self.argument_suggesters[index] = ArgumentSuggester {
+                command,
+                handler,
+                plugin_free_string,
+                user_data,
+            };
+        } else {
+            self.argument_suggesters.push(ArgumentSuggester {
+                command,
+                handler,
+                plugin_free_string,
+                user_data,
+            });
+        }
+        replaced
+    }
+
+    /// The suggester registered for `command` (token without the slash), if any.
+    pub fn argument_suggester(&self, command: &str) -> Option<&ArgumentSuggester> {
+        let command = command.trim_start_matches('/').to_ascii_lowercase();
+        self.argument_suggesters
+            .iter()
+            .find(|s| s.command == command)
+    }
+
     /// Register a custom provider (B5c). First-registration-wins on `provider_id`
     /// (a later registration for an existing id is dropped, mirroring tool/command
     /// first-wins). Returns `true` if a prior provider of the same id was kept.
@@ -730,20 +963,16 @@ impl ExtensionRegistry {
             tag_handlers.sort_by_key(|h| h.priority);
         }
         RegistrySnapshot {
-            tools: self
-                .tools
-                .iter()
-                .map(|t| ExtensionTool {
-                    tool: t.tool.clone(),
-                    handle: t.handle,
-                })
-                .collect(),
+            tools: self.tools.clone(),
             commands: self.commands.clone(),
             flags: self.flags.clone(),
             shortcuts: self.shortcuts.clone(),
             handlers,
             resources_discover: self.resources_discover.clone(),
             before_agent_start: self.before_agent_start.clone(),
+            tool_result: self.tool_result.clone(),
+            autocomplete: self.autocomplete.clone(),
+            argument_suggesters: self.argument_suggesters.clone(),
             providers: self.providers.clone(),
             provider_manifests: self.provider_manifests.clone(),
             oauth_providers: self.oauth_providers.clone(),
@@ -824,6 +1053,19 @@ impl ExtensionRegistry {
             .append(&mut other.resources_discover);
         self.before_agent_start
             .append(&mut other.before_agent_start);
+        self.tool_result.append(&mut other.tool_result);
+        self.autocomplete.append(&mut other.autocomplete);
+        for suggester in other.argument_suggesters.drain(..) {
+            if let Some(existing) = self
+                .argument_suggesters
+                .iter()
+                .position(|s| s.command == suggester.command)
+            {
+                self.argument_suggesters[existing] = suggester;
+            } else {
+                self.argument_suggesters.push(suggester);
+            }
+        }
         for p in other.providers.drain(..) {
             if self
                 .providers
@@ -899,6 +1141,9 @@ pub struct RegistrySnapshot {
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     resources_discover: Vec<ResourcesDiscoverHandler>,
     before_agent_start: Vec<BeforeAgentStartHandler>,
+    tool_result: Vec<ToolResultHandler>,
+    autocomplete: Vec<RegisteredAutocompleteProvider>,
+    argument_suggesters: Vec<ArgumentSuggester>,
     providers: Vec<RegisteredProvider>,
     provider_manifests: std::collections::BTreeMap<String, ProviderManifest>,
     oauth_providers: Vec<RegisteredOAuthProvider>,
@@ -924,6 +1169,17 @@ impl RegistrySnapshot {
     /// The registered slash commands.
     pub fn commands(&self) -> &[RegisteredCommand] {
         &self.commands
+    }
+
+    /// The argument suggester registered for `command` (token without the
+    /// slash), if any. The TUI asks exactly the plugin that registered the
+    /// command; a snapshot holds at most one suggester per token (absorb is
+    /// last-wins).
+    pub fn argument_suggester(&self, command: &str) -> Option<&ArgumentSuggester> {
+        let command = command.trim_start_matches('/').to_ascii_lowercase();
+        self.argument_suggesters
+            .iter()
+            .find(|s| s.command == command)
     }
 
     /// The registered CLI flags, insertion order.
@@ -970,6 +1226,19 @@ impl RegistrySnapshot {
     /// the one callers treat as "leave the prompt alone".
     pub fn before_agent_start(&self) -> &[BeforeAgentStartHandler] {
         &self.before_agent_start
+    }
+
+    /// The `tool_result` transforms, registration order. Empty when no plugin
+    /// registered one, in which case tools are not wrapped at all.
+    pub fn tool_result(&self) -> &[ToolResultHandler] {
+        &self.tool_result
+    }
+
+    /// The plugin autocomplete providers, registration order. The TUI stacks
+    /// them ahead of its built-in file/slash providers; empty when no plugin
+    /// asked to contribute candidates.
+    pub fn autocomplete_providers(&self) -> &[RegisteredAutocompleteProvider] {
+        &self.autocomplete
     }
 
     /// The registered custom providers (B5c), registration order. The host wraps
@@ -1029,10 +1298,7 @@ impl RegistrySnapshot {
     pub fn entries(&self) -> Vec<RegistryEntry> {
         let mut v: Vec<RegistryEntry> = Vec::new();
         for t in &self.tools {
-            v.push(RegistryEntry::Tool(ExtensionTool {
-                tool: t.tool.clone(),
-                handle: t.handle,
-            }));
+            v.push(RegistryEntry::Tool(t.clone()));
         }
         for c in &self.commands {
             v.push(RegistryEntry::Command(c.clone()));
@@ -1256,6 +1522,7 @@ mod tests {
             plugin: "test-plugin".to_string(),
             manifest_json: manifest.to_string(),
             request_fn: noop_oauth,
+            control_fn: None,
             plugin_free_string: noop_free,
             user_data: std::ptr::null_mut(),
         };

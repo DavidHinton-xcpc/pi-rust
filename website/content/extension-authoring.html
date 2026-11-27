@@ -38,6 +38,11 @@
 </tr>
 </tbody>
 </table>
+<p>推荐用 <code>rpi extension update [name]</code> 更新扩展：省略名称时更新全部项目链接扩展和
+全局 registry/prebuilt 扩展，指定名称时只更新匹配项。更新保留原来的 Cargo 构建
+后端或显式 GitHub 来源；全局通过 <code>--path</code> 安装的开发扩展不参与更新。
+旧命令 <code>rpi package update [name]</code> 仍兼容；项目链接管理命令仍为
+<code>rpi package link</code>、<code>rpi package list</code>、<code>rpi package unlink</code>，不改名。</p>
 <p>扩展应遵循能力检测：只调用宿主明确提供的 capability，检查 <code>PluginApi</code>
 对应注册槽位是否为 <code>Some</code>。缺少能力时返回清晰错误并优雅降级，不要 panic、
 空指针或依赖 <code>undefined</code> 语义。</p>
@@ -164,9 +169,9 @@ fan-out 到所有已注册 handler，合并返回的 <code>{skillPaths, promptPa
 注册时给的 <code>plugin_free_string</code> 回收。</p>
 <h3 id="provider">Provider 与渲染器</h3>
 <p>Provider 接入遵循 <a href="https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md">Provider 接入规范</a>，
-完整模板见 <a href="https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers">rpi-providers</a>。
+完整模板见 <a href="https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers">rpi-providers</a>。
 只改已有协议的端点和模型时优先使用 <code>models.json</code>；需要目录、认证策略或协议适配时使用独立 package。
-生产实现统一维护在 <a href="https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers">rpi-providers</a>，
+生产实现统一维护在 <a href="https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers">rpi-providers</a>，
 一个安装入口提供多个独立 provider；新增供应商在包内加模块，根模块只导出一次插件入口。</p>
 <p>单 provider 示例可使用 <code>rpi_plugin_sdk::export_provider!</code>（需开启 SDK 默认关闭的 <code>provider</code> feature）：通过 <code>declare</code> 声明完整模型目录、
 <code>apiKeyEnv</code> 与 <code>requiresAuth</code>，优先注册 <code>register_streaming_provider</code>，旧宿主降级

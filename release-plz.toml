@@ -1,5 +1,6 @@
 # Contributors do not bump versions. Release-plz prepares one workspace PR;
-# release.yml publishes it only after a maintainer merges that PR into main.
+# the scheduled release workflow requests Auto-merge after validation, and
+# release.yml publishes it only after that PR merges into main.
 [workspace]
 release = false
 release_always = false
@@ -47,6 +48,11 @@ release = true
 version_group = "rpi"
 
 [[package]]
+name = "rpi-durable"
+release = true
+version_group = "rpi"
+
+[[package]]
 name = "rpi-harness"
 release = true
 version_group = "rpi"
@@ -62,7 +68,7 @@ release = true
 version_group = "rpi"
 changelog_update = true
 changelog_path = "CHANGELOG.md"
-changelog_include = ["rpi-telemetry", "rpi-ai", "rpi-runtime", "rpi-agent", "rpi-plugin-sdk", "rpi-extensions", "rpi-tools", "rpi-harness", "rpi-tui"]
+changelog_include = ["rpi-telemetry", "rpi-ai", "rpi-runtime", "rpi-agent", "rpi-plugin-sdk", "rpi-extensions", "rpi-tools", "rpi-durable", "rpi-harness", "rpi-tui"]
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true

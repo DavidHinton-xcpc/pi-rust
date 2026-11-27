@@ -39,6 +39,7 @@ mod line_diff;
 pub mod loader;
 pub mod markdown;
 pub mod mermaid;
+pub mod oklab;
 pub mod overlay;
 pub mod render;
 pub mod scroll_view;
@@ -56,6 +57,8 @@ pub mod terminal_colors;
 pub mod terminal_image;
 pub mod text;
 pub mod theme;
+pub mod theme_json;
+pub mod thinking_region;
 pub mod tool_execution;
 mod tool_panel;
 pub mod truncated_text;
@@ -106,7 +109,10 @@ pub use keys::{
     set_kitty_protocol_active, Key, KeyEventType, KeyHelper, KeyId,
 };
 pub use kill_ring::{KillRing, PushOptions};
-pub use latex::{is_latex, render_latex, strip_latex, RenderLatexOptions};
+pub use latex::{
+    is_latex, is_math_environment, render_latex, render_latex_block, strip_latex,
+    RenderLatexOptions,
+};
 pub use layout::{
     composite_tui_line, extract_cursor_position, hit_test, render_layout_frame, LayoutBox,
     LayoutFrame, LayoutRect,
@@ -138,14 +144,19 @@ pub use terminal_image::{
     allocate_image_id, calculate_image_rows, delete_all_kitty_images, delete_kitty_image,
     detect_capabilities, encode_iterm2, encode_kitty, get_capabilities, get_cell_dimensions,
     get_gif_dimensions, get_image_dimensions, get_jpeg_dimensions, get_png_dimensions,
-    get_webp_dimensions, hyperlink, image_fallback, render_image, reset_capabilities_cache,
-    set_capabilities, set_cell_dimensions, CellDimensions, ImageDimensions, ImageProtocol,
-    ImageRenderOptions, TerminalCapabilities,
+    get_webp_dimensions, hyperlink, image_fallback, query_cell_dimensions, refresh_cell_dimensions,
+    render_image, reset_capabilities_cache, set_capabilities, set_cell_dimensions, CellDimensions,
+    ImageDimensions, ImageProtocol, ImageRenderOptions, TerminalCapabilities, DEFAULT_CELL_HEIGHT,
+    DEFAULT_CELL_WIDTH,
 };
 pub use text::Text;
 pub use theme::{
     apply_theme_preset, global_theme_manager, theme, theme_revision, Color, Theme, ThemeColors,
     ThemeManager, ThemePreset, ThemeSpacing,
+};
+pub use thinking_region::{
+    collect_regions as collect_thinking_regions, hit as hit_thinking_region,
+    strip_markers as strip_thinking_region_markers, ThinkingRegion,
 };
 pub use tool_execution::{ToolExecutionComponent, ToolStatus};
 pub use truncated_text::TruncatedText;

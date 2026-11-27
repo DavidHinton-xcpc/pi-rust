@@ -16,6 +16,14 @@
 | 运行环境 | 本机动态库，当前用户权限 |
 | 适用场景 | 本地工具、系统集成、性能敏感或纯 Rust 项目 |
 
+推荐用 `rpi extension update [name]` 更新扩展：省略名称时更新全部项目链接扩展和
+全局 registry/prebuilt 扩展，指定名称时只更新匹配项。预编译扩展可追加
+`--cdn <URL>` 通过 HTTPS CDN 下载归档；清单仍从 GitHub 获取，CDN 失败会回退到
+GitHub。该选项不影响项目链接扩展或 Cargo 构建扩展。更新保留原来的 Cargo 构建
+后端或显式 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+旧命令 `rpi package update [name]` 仍兼容；项目链接管理命令仍为
+`rpi package link`、`rpi package list`、`rpi package unlink`，不改名。
+
 扩展应遵循能力检测：只调用宿主明确提供的 capability，检查 `PluginApi`
 对应注册槽位是否为 `Some`。缺少能力时返回清晰错误并优雅降级，不要 panic、
 空指针或依赖 `undefined` 语义。
@@ -132,6 +140,28 @@ rpi_plugin_sdk::export_plugin!(|api| {
 返回结构化错误，不会进入分发。runtime action 使用 SDK 的 `RuntimeActionId`
 定义（含 `GetCliFlag`、`UiDialog`），不要自行假定数字范围。
 
+### 不写 unsafe 也能写插件
+
+ABI 里的字符串与步骤返回都是裸指针，SDK 因此提供了一组宏把这些契约收在自己这一侧。
+工具、命令、事件、渲染器和 runtime action 的插件代码可以用它们整体开成
+`#![deny(unsafe_code)]`：
+
+| 形状 | 宏 |
+| --- | --- |
+| 事件回调 | `event_handler!`（`EventView`，访问器返回自有字符串） |
+| 命令 / 提示 / 资源发现回调 | `string_handler!`（`&str` 输入 + `&mut Output`） |
+| 工具 `execute` | `execute_handler!`（借用 call id，`OwnedString` 参数自动回收） |
+| 调用 runtime action | `call_action!(api, id, args)` → `(rc, body)` |
+| 读 ABI 字符串（不释放） | `stb_text!(value)`（`StbString` / `StbStringRef` 都可） |
+| 读并回收 ABI 字符串 | `stb_take!(value, free)` |
+| 回收工具步骤结果 | `take_step!(result)` / `take_step_with!(result, free)` |
+
+它们不改 C ABI，只是把 `unsafe` 收敛到 SDK 内部。仍需自己写 `unsafe` 的只有三种：
+手写 trampoline；`ProviderRequestFn` / `ProviderStreamRequestFn`（读请求、写 `out`，见
+`examples/plugin-stub/src/lib.rs`）；以及需要每次调用堆分配状态的工具 handle
+（`Box::into_raw` / `from_raw`）。`crates/rpi-plugin-sdk/tests/safe_macros.rs` 在
+`#![deny(unsafe_code)]` 下覆盖了宏能覆盖的路径。
+
 ### 独立子任务
 
 `GetExecutionContext`（23）返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
@@ -207,6 +237,94 @@ steering/follow-up 不会重入正在执行的工具，`nextTurn` 也不会被�
 默认空闲发送现在与 Pi 一致，不再自动请求模型。原来依赖默认发送立即回复的
 调用，应显式传 `triggerTurn: true`。
 
+### 工具提示词摘要与规则（与 Pi 一致）
+
+工具 schema 决定模型是否能调用工具；系统提示词只选择性展示摘要，两者独立。
+先注册工具，再通过可选 `api.register_tool_prompt` 注册显式元数据：
+
+```rust
+if let Some(register_prompt) = api.register_tool_prompt {
+    let status = register_prompt(
+        rpi_plugin_sdk::StbStringRef::from_str("my_tool"),
+        rpi_plugin_sdk::StbStringRef::from_str(
+            r#"{"promptSnippet":"工具的简短摘要","promptGuidelines":["该工具的具体使用规则"]}"#,
+        ),
+    );
+    if status != 0 { return status; }
+}
+```
+
+- 只能为当前插件已经注册的工具设置元数据。返回值：`0` 成功、`1` 未知工具、
+  `2` 元数据不是合法对象或字段类型错误、`-1` 不在注册阶段；参数字符串由宿主立即复制。
+- `promptSnippet` 可省略；trim 后非空且工具已启用，才出现在提示词工具列表。
+  无摘要的工具仍通过 schema 正常可用，不自动把 description 当摘要。
+- `promptGuidelines` 可省略；只收集启用工具的规则，trim、去空白，并按启用工具顺序
+  与其他工具及核心规则去重。有规则不要求有摘要；宿主不再为外部 todo 工具硬编码规则。
+- 元数据随工具定义参与 first-wins 合并及 reload。同名扩展替换内置工具时，不继承
+  原内置摘要；卸载或停用工具后，不残留其摘要和规则。空对象清除元数据。
+- registrar 只追加到 ABI vtable 尾部，不改变 `StableToolSchema` 或 ABI 版本。
+  旧插件仍可加载；旧宿主槽位为 `None` 时跳过元数据注册，不能因此跳过工具注册。
+- 自定义 `SYSTEM.md` / `--system-prompt` 仍替换默认提示词；上述自动贡献只用于默认提示词。
+
+### 输入框草稿与补全（与 Pi 一致）
+
+Pi 通过 `ui.getEditorText()` 读取草稿、通过 `ui.addAutocompleteProvider()` 和
+`RegisteredCommand.getArgumentCompletions` 贡献候选。rpi 提供等价的三条通道。
+
+**读草稿：`GetEditorText`（32）**。`{}` → `{"text": "...", "cursor": N}`，
+`cursor` 是 `text` 内的字节偏移。永不报错：RPC/print/无界面宿主返回 `{"text":"", "cursor":0}`，
+插件应据此退化，而不是把空草稿当成失败。TUI 每个 tick 发布一次草稿（含仅移动光标），
+所以「调用时现在的草稿」是准确的；不要用 `EditorChange` 事件攒本地副本——
+该事件的 payload 只有 `{"chars","empty","source"}`，按设计不携带文本。
+
+**草稿候选：`api.register_autocomplete_provider`。**
+
+```rust
+use rpi_plugin_sdk::{AutocompleteProviderFn, StbString, StbStringRef, StbStringRef as Ref};
+
+extern "C" fn suggest(query: Ref, out: *mut StbString, _ud: *mut c_void) -> i32 {
+    let query = unsafe { query.as_str() };           // {"text","cursor","line","linePrefix"}
+    if !query.contains('#') { return 1; }            // 1 = 没有意见，回落内置 provider
+    unsafe { *out = StbString::from_string(
+        r##"{"items":[{"text":"#Budget.xlsx","label":"Budget.xlsx","description":"Excel","insertSpace":false}]}"##.into()) };
+    0
+}
+// 注册期：
+let _ = rpi_plugin_sdk::register_autocomplete_provider(&api, suggest, api.user_data);
+```
+
+- 查询信封：`text`（整段草稿）、`cursor`（字节偏移）、`line`（当前行）、`linePrefix`（该行光标前文本）。
+- 返回 `0` + `{"items":[...]}`；返回 `1`、空 `items` 或非法 JSON 都表示「没有意见」，
+  宿主继续问下一个插件，最后回落内置的 file/slash provider。任何非 0 返回值都不算错误。
+- 候选字段：`text`（插入文本，必填；兼容 `insertText`）、`label`、`description`、
+  `insertSpace`（默认 `true`；`#文档` 这类插入应为 `false`）、`isDirectory`（仅显示用）。
+  单次最多取 50 条。
+- `out` 是**插件**所有，宿主用注册时传入的 `plugin_free_string` 回收（与工具结果同一约定）。
+- 插件 provider 排在宿主内置 provider **之前**，所以它赢的是自己认得的那一段；
+  别的输入交给内置补全。
+
+**命令参数候选：`api.register_command_completions`。**
+
+```rust
+extern "C" fn office_args(args: Ref, out: *mut StbString, _ud: *mut c_void) -> i32 {
+    let args = unsafe { args.as_str() };             // {"argumentPrefix":"con"}
+    let _ = args;
+    unsafe { *out = StbString::from_string(
+        r#"{"items":[{"text":"connect","description":"Connect the bridge"}]}"#.into()) };
+    0
+}
+// 必须先注册命令，再挂补全：
+let rc = rpi_plugin_sdk::register_command_completions(&api, "office", office_args, api.user_data);
+```
+
+- `argumentPrefix` 是命令名与首个空格之后的全部文本（`/office con` → `"con"`）。
+- 返回 `0` 成功、`1` 该命令不属于本插件（或未注册）、`-1` 不在注册期/旧宿主无该槽位。
+- 同一次 Tab 里宿主先问命令参数（`/office con`），再问草稿 provider，最后才是内置 provider；
+  没有补全的命令保持原行为，`/office` 仍能按命令名补全。
+
+两个槽位都追加在 vtable 尾部，不改 ABI 版本：旧宿主给 `None` 时跳过即可，不能因此中止注册。
+补全在 TUI 线程调用，插件必须线程安全、快速返回（它是每帧询问的），不要在 handler 里阻塞等待网络。
+
 ## 4. 工具生命周期：execute → poll → cancel → destroy
 
 工具导出四个 `extern "C"` 函数，宿主按固定协议驱动：
@@ -261,7 +379,10 @@ steering/follow-up 不会重入正在执行的工具，`nextTurn` 也不会被�
 通过 `api.register_event_handler` 按 `EventTag`（36 类）订阅：
 
 - **会话生命周期**：`SessionStart`、`SessionBeforeSwitch`、`SessionBeforeFork`、
-  `SessionBeforeCompact`、`SessionCompact`、`SessionShutdown` 等。
+  `SessionBeforeCompact`、`SessionCompact`、`SessionBeforeTree`、`SessionTree`、
+  `SessionShutdown` 等。这些标签在 rpi 里都不带 payload（`data_text()` 为空串），
+  能用它们判断“分支变了”，但拿不到是新建、fork 还是导航。
+  `SessionTree`/`SessionCompact` 只在分支真的变了之后才发。
 - **Agent 循环**：`BeforeAgentStart`、`AgentStart`、`AgentEnd`、`AgentSettled`、
   `TurnStart`、`TurnEnd`、`MessageStart`/`MessageUpdate`/`MessageEnd`、
   `ToolExecutionStart`/`Update`/`End`、`ToolCall`、`ToolResult`、`UserBash`、`Input`。
@@ -326,6 +447,50 @@ extern "C" fn on_before_agent_start(
 该槽位在结构体末尾新增且可为 `None`：面向旧宿主的插件应检测后再注册（见 §3
 能力检测），宿主则在没有插件注册时完全不进入这条路径。
 
+### 改写工具结果
+
+`rpi_plugin_sdk::register_tool_result(api, handler, user_data)` 注册工具结果变换器，
+对应 pi 的 `tool_result` handler 返回 `content` / `details`。工具调用结束后（成功或失败，
+包括参数校验失败、找不到工具等在执行前产生的错误）、结果进入会话之前，宿主把 `{"toolCallId", "toolName", "input", "content", "details", "isError"}`
+交给 handler（`content` 与插件工具返回值同形：`text` 块和带 base64 `data`、`mimeType` 的
+`image` 块）；handler 在 `out` 里只写要替换的字段，例如把截图重新编码后返回新的
+`content`：
+
+```rust
+extern "C" fn on_tool_result(
+    event_json: StbStringRef,
+    out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        let env: serde_json::Value =
+            serde_json::from_str(unsafe { event_json.as_str() }).unwrap_or_default();
+        let Some(content) = shrink_images(&env["content"]) else {
+            return 0; // 不写 out = 不变
+        };
+        unsafe { *out = StbString::from_string(json!({ "content": content }).to_string()); }
+        0
+    })
+}
+```
+
+- **按注册顺序串联**，后一个 handler 看到前一个的结果；返回非零或 panic 时保持原样，
+  fan-out 继续。
+- **只改返回的字段。** `terminate`、usage 等仍是工具自己的；变换器不改变调用是否失败。
+- **失败的结果也会经过变换器**（`"isError": true`），例如 bash 非零退出时的命令输出。
+  被 `ToolCall` handler 否决（`EVENT_HANDLER_ABORT`）的调用，其宿主原因文本也以
+  `isError: true`、`details: {"blocked": true}` 交给变换器；返回结果中第一个非空 `text`
+  块会成为模型看到的原因，否决插件借此说明为什么拦截。
+- **变换器无法运行时宿主不放行原结果**（例如阻塞线程意外 panic，或 `/reload` 在派生前
+  使快照失效），改为一条 “tool result withheld” 错误文本，因为插件可能依赖变换器去掉
+  不该给模型看的内容。
+- **在阻塞线程上运行**，重新编码图片这类慢活不会卡住运行时；结果按变换后的样子写进
+  会话，以后每轮原样重发，提示词缓存不受影响。
+- 宿主在 agent 循环的 `after_tool_call` 钩子中按调用读取当前会话，所以 `/reload` 后新加的
+  变换器立即生效，子 harness 也继承；没有变换器时直接跳过。已记录的调用沿用原有结果，
+  不重复执行工具或钩子；被否决的调用也只交给变换器一次。旧宿主的 `struct_size` 够不到这个槽，
+  `register_tool_result` 返回 `-1`。
+
 ### Provider 与渲染器
 
 推理 provider 的目录、认证、执行绑定与验收要求见本文末尾的「Provider 接入规范」。
@@ -333,6 +498,48 @@ extern "C" fn on_before_agent_start(
 `api.register_provider` 注入自定义 LLM Provider（`provider_id`/`base_url`/
 `api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
 `register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
+
+渲染器的 JSON 契约是：markdown transformer 接收并返回 `{"markdown":"..."}`；message
+renderer 接收消息或自定义消息 envelope（例如
+`{"customType":"token-usage","usage":{...}}`）；entry renderer 接收
+`{"customType":"...","data":...}`。message/entry renderer 返回
+`{"text":"...","markdown":true|false}` 或 `{"lines":["..."]}`。输出是一个
+transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿主通过注册时提供的
+`plugin_free_string` 回收。
+
+渲染器**只在交互式 TUI 中调用**：`--mode rpc` 和 `-p` 不调用任何渲染器，渲染结果也不进入
+事件流，所以远程客户端要自己渲染 transcript。会话建立时 stderr 上的
+`renderers: N markdown-transform, N message-render, N entry-render (active)` 只报告
+注册数量，不代表当前模式会用到它们。
+
+三个槽位的合并语义不同，不要混用：
+
+- `register_message_renderer` / `register_entry_renderer`：按注册顺序逐个尝试，
+  **第一个返回 `rc == 0` 且 JSON 可解析的响应胜出**，其余不再调用；返回非 0 或响应不可
+  解析表示「这个类型我不处理」，宿主继续问下一个 renderer。所以「不处理」要用非 0 返回码
+  表达，返回空对象不算弃权。
+- `register_markdown_transformer`：**链式**，每个 transformer 的输出是下一个的输入，最后
+  一个的输出交给 Markdown 渲染。返回非 0 或 panic 会**终止整条链**并保留当前文本；响应里
+  没有字符串 `markdown` 字段时只跳过这一个 transformer，链继续。
+
+其余固定行为：
+
+- entry renderer 的 `data` 可能为 `null`（自定义条目没带 `data` 时），不要假定它是对象。
+- TUI 在调用 entry renderer **之前**就跳过 `plan-mode`、`todo`、`todo-state`，为这三个
+  type 注册渲染器不会被调用。
+- `{"lines":[…]}` 会以 `\n` 拼成**一个**纯文本行，不是每行一个组件；需要多行时自己在
+  `text` 里带换行。
+- entry renderer 可返回 `rc == 0` 与 `{"display":false}`，明确表示「已处理但隐藏」：
+  不添加组件或空行，不执行原始条目兜底，也不再询问后续 renderer。仅布尔值 `false`
+  生效，且优先于 `text`/`lines`；缺省、`true`、字符串 `"false"`、`null` 等保持旧行为。
+  非 0 返回码仍是「不处理」，不能用来隐藏。此字段仅适用于 entry renderer，不改变
+  message renderer、Markdown transformer、持久化或模型上下文。旧宿主可能忽略该字段
+  并显示兜底文本；插件未加载时也维持原有兜底。该能力不新增实时 entry 事件。
+- message renderer 的响应既没有 `text` 也没有 `lines` 时，TUI 降级显示 `[customType]`；
+  entry renderer 除显式 `display:false` 外，响应缺这两个字段时改由宿主自己的条目文案显示。
+- message renderer 除渲染自定义消息外，还会以
+  `{"customType":"token-usage","usage":{...}}` 被调用一次以生成用量文本，因此要能容忍这个
+  payload（没有匹配的 type 时返回非 0）。
 
 `api.register_streaming_provider` 注入**流式** Provider。注册时同样提供 provider ID、
 端点、API style 和字符串释放回调；流式 request fn 另有逐块回调 `emit`、
@@ -350,6 +557,43 @@ extern "C" fn on_before_agent_start(
 可用的 `type`：`start`、`text_start`/`text_delta`/`text_end`、
 `thinking_start`/`thinking_delta`/`thinking_end`、
 `toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 忽略（向前兼容）。
+
+`toolcall_end` 可以带一个可选的 `recorded` 字段，表示这次工具调用**已经在远端执行过**
+（例如远程 agent 自己跑了工具，再把调用和结果一起流回来）。宿主把 `recorded` 当作已完成的
+工具结果，**绝不会在本地再次执行这个调用**，包括审批钩子和工具 `execute` 在内都不会被触发。
+`recorded` 的形状与 Cursor replay worker 发出的一致：
+`{"version":1,"isError":false,"result":{"content":[{"type":"text","text":"..."}],"details":{},"terminate":true}}`。
+`result.content` 只允许 `text` 和 `image` 块；`result.details` 与 `result.terminate` 可省略。
+`terminate: true` 会像实时工具结果一样结束这一批工具调用。`{"version":1}` 这类残缺记录
+（崩溃前写入）、版本不是 `1` 的记录、字段为 `null`、含未知顶层字段或形状不合法的记录，都会被
+宿主当作错误工具结果返回，同样不执行。只有在调用确实已经发生
+过时才能带 `recorded`；不带该字段的调用行为与以前完全一致。
+
+**先检查宿主能力。** 不认识 `recorded` 的旧宿主会忽略这个字段，在本地执行调用；C ABI
+没有变化也挡不住这一点。请求信封顶层的 `capabilities` 对象说明宿主支持什么：
+`capabilities.recordedToolCalls` 是宿主能解码的最高 `recorded` 版本，宣告 `n` 表示能解码
+`1` 到 `n` 的每个版本。插件只有在该值 `>= 1`（且不小于自己发送的 `version`）时才可以发送
+`recorded`。没有这个键就是旧宿主，插件不得发送 `recorded`，应让这一轮以错误结束，而不是把
+已经执行过的调用当普通调用交给宿主。
+
+用 SDK 桥接（`export_provider!`、`provider::drive`、`provider::drive_with_context`）写的
+provider 由桥接执行这条检查：宿主没有宣告 `recordedToolCalls >= 1` 时，含 `recorded` 调用、
+本可执行的最终消息会变成 `Error` 终态（文本为 `host does not support recorded tool calls`，
+不带内容，保留用量）。工厂在桥接调用期间可以用 `provider::host_capabilities()` 读取本次请求的
+`capabilities`（旧宿主为 `null`），再交给它构造的 provider。它只在请求线程上有值，其他线程
+（包括 `drive_with_context` 下 provider 自己 spawn 的任务）都读到 `null`，所以要在工厂里读取并保存。
+桥接自己的检查直接读请求，不受影响。桥接会把 `recorded` 同时放进
+`toolcall_end` 块和 `out`。
+
+**`recorded` 与最终 `out`。** 宿主执行的是 `out` 里的调用，所以终态之前会用 `out` 核对每个在
+`toolcall_end` 上带过 `recorded` 的调用：按 `id` 找到 `out` 中的同一调用，并要求 `name` 与
+`arguments` 相同（按 JSON 值比较：对象键顺序无关，但 `1` 与 `1.0` 不同）。该调用在 `out`
+中没有 `recorded` 键时，宿主补上流中的记录（显式 `null` 也照样补上，仍是错误结果、不执行）；
+两边记录相同则不变。以下任一情况都会让这一轮以 `Error` 终态结束，本地不执行任何调用：`out`
+中没有该 `id`、同一 `id` 出现多次、`name` 或 `arguments` 不同、记录不同，或带 `recorded` 的
+`toolcall_end` 没有 `id`。错误文本是固定的，不含调用 `id`，以免被当作可重试的瞬时错误。只在 `out` 中带
+`recorded` 同样有效。插件返回非零、`out` 为空或无法解析、请求被取消时，终态本来就是
+`Error`/`Aborted`，不会执行任何调用。建议在 `toolcall_end` 和 `out` 中带同一份 `recorded`。
 
 约定：
 
@@ -542,7 +786,7 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 provider ID、目录与凭据继续独立。单 provider 教学样例才使用 `export_provider!`。
 
 完整规范：[Provider 接入规范](https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md)。创建推理扩展时优先复制
-正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
+正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
 
 ### 方式与目录
 
@@ -582,12 +826,14 @@ provider / API / model ID 恢复；修改公开描述不能重定向绑定的凭
 
 默认凭据由宿主按 provider ID 解析：选中 provider 的 `--api-key` → `auth.json`
 有效 key / OAuth → `models.json` → 声明的 `apiKeyEnv` → 显式允许的匿名。
-协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和过期 token 不算可用。
+协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和无法刷新的过期 token 不算可用。
 目录不得含凭据；请求参数、token 与私密请求头不得进入日志、普通事件或错误文本。
 OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负责通用命令与存储。
 
-`auth check`、`/provider` 与实际请求使用同一认证解析。`auth check` 只检查本地状态，
-不访问服务端或刷新 token；退出码为就绪 0、缺少凭据 1、配置错误 2。
+加载匹配 OAuth 扩展且存储项含 refresh token 时，宿主可选择过期登录对应的 provider，
+并在每次请求前自动刷新已过期或 60 秒内到期的 token，先保存再使用；刷新失败不发送旧 token。
+`auth check` 只检查本地未过期凭据，不访问服务端或刷新 token，可能在请求仍可自动刷新时报告缺少凭据；
+退出码为就绪 0、缺少凭据 1、配置错误 2。
 `/provider <id>` 与列表选择会即时切换当前会话并保存默认模型；缺少认证或切换失败时
 保留原会话与默认值。`/model` 选择具体模型；`/provider remove` 删除配置，
 卸载 package 使用 `rpi package unlink`。API-key logout 不会清除环境变量或 models.json。
@@ -606,13 +852,13 @@ OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负�
 UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
 覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
 真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
-正式统一包位于独立的 [rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+正式统一包位于独立的 [rpi-extension 项目](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，
 保留 `deepseek` ID，声明 `DEEPSEEK_API_KEY`，并通过 `requiresReasoningContent` 支持工具续轮。
 
-在 rpi-package 仓库运行正式 package 的离线验证：
+在 rpi-extension 仓库运行正式 package 的离线验证：
 
 ```sh
-cd /path/to/rpi-package
+cd /path/to/rpi-extension
 cargo build -p rpi-providers
 cargo test -p rpi-providers --test streaming
 cargo test -p rpi-providers --test host

@@ -71,13 +71,12 @@ pub(super) async fn restore_queued_messages_to_editor(
 ) -> usize {
     match lane.clear_queue().await {
         Ok(queued) => {
-            state.restore_pending_images(queued.images.clone());
-            let all: Vec<String> = queued
-                .steering
-                .iter()
-                .chain(queued.follow_up.iter())
-                .cloned()
-                .collect();
+            // The editor holds **one** draft, so its attachments are one strip.
+            // (The per-message pairing matters only for consumers that restore
+            // a *list* of queued entries — see `QueuedMessageView`.)
+            let images: Vec<_> = queued.iter().flat_map(|m| m.images.clone()).collect();
+            state.restore_pending_images(images);
+            let all: Vec<String> = queued.iter().map(|m| m.text.clone()).collect();
             if !all.is_empty() {
                 let queued_text = all.join("\n\n");
                 // Read the EXPANDED draft: `set_text` below clears the folded
@@ -95,7 +94,7 @@ pub(super) async fn restore_queued_messages_to_editor(
         }
         Err(error) => {
             add_error_message(
-                &state.chat_container,
+                &state.notice_container(),
                 &format!("Could not restore queued messages: {error}"),
             );
             tui.request_render(false);
@@ -117,11 +116,11 @@ pub(super) async fn handle_dequeue(
     let restored =
         restore_queued_messages_to_editor(lane, editor, state.clone(), tui.clone()).await;
     if restored == 0 {
-        add_note_message(&state.chat_container, "No queued messages to restore");
+        add_note_message(&state.notice_container(), "No queued messages to restore");
     } else {
         let plural = if restored > 1 { "s" } else { "" };
         add_note_message(
-            &state.chat_container,
+            &state.notice_container(),
             &format!("Restored {restored} queued message{plural} to editor"),
         );
     }
@@ -140,7 +139,7 @@ pub(super) fn abort_run_restoring_queue(
     state: Arc<TuiState>,
     tui: Arc<TuiAltScreen>,
 ) {
-    tokio::spawn(async move {
+    state.session_write_tasks.clone().spawn(async move {
         let _ = restore_queued_messages_to_editor(lane.clone(), editor, state, tui.clone()).await;
         let _ = lane.abort().await;
         tui.request_render(false);
@@ -157,9 +156,21 @@ pub(super) async fn drain_agent_events(
     loop {
         match rx.recv().await {
             Ok(event) => handle_agent_event(event, &tui, &state, &chat, &lane).await,
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                // We dropped some intermediate deltas; the next MessageUpdate/
-                // MessageEnd carries a full partial snapshot so the UI re-syncs.
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                // `MessageUpdate` carries a full snapshot of the block list, so
+                // the transcript re-syncs on its own. `MessageEnd` does NOT —
+                // it is a terminal event with no later carrier, so the footer
+                // counters accumulated from it (usage totals, cache-hit rate)
+                // would stay frozen. Record the gap so the run's end-of-turn
+                // reconciliation knows to rebuild from the durable log instead
+                // of trusting what the drain managed to observe.
+                tracing::debug!(
+                    skipped,
+                    "agent event broadcast lagged; run-end footer reconciliation required"
+                );
+                state
+                    .events_lagged
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -193,12 +204,48 @@ pub(super) async fn handle_agent_event(
                 std::mem::take(&mut *state.pending_bash_messages.lock().unwrap());
             for message in pending {
                 if let Err(error) = lane.append_message(message).await {
-                    add_error_message(chat, &format!("Could not record bash result: {error}"));
+                    state
+                        .history_page
+                        .unsaved
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    add_error_message(
+                        &state.notice_container(),
+                        &format!("Could not record bash result: {error}"),
+                    );
                 }
             }
             // The run drained the queue; refresh so consumed entries drop out
             // of the pending-messages display.
             refresh_pending_messages(state, lane).await;
+            // A write that failed mid-run is not a run failure, so it cannot ride
+            // the run outcome. Report it here: inside the alternate screen a
+            // `tracing::warn!` reaches nobody, and the user must know before
+            // exiting that the conversation stopped being saved.
+            if report_write_failures(&state.notice_container(), lane) {
+                state
+                    .history_page
+                    .unsaved
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // Authoritative footer reconciliation when the broadcast dropped
+            // events (`Lagged`). `AgentEnd` is the barrier that makes a rebuild
+            // here safe: the broadcast preserves order, so at this point every
+            // event queued before it — including every `MessageEnd` this run
+            // emitted — has already been through this handler, and no event of
+            // this run can arrive after it to be counted twice. Rebuilding only
+            // on the lagged path keeps an ordinary turn off the whole-branch
+            // read; a dropped `MessageEnd` is terminal, so the frozen counters
+            // have no later carrier to heal them and need the durable log.
+            if state
+                .events_lagged
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                reconcile_footer_from_lane(lane, state).await;
+            }
+            // Do not reload history here. `AgentEnd` can arrive before the
+            // producer has drained its session writer; settling now may read
+            // the previous page and clear the freshly rendered reply. The
+            // prompt/skill driver settles after `drain_session()` completes.
             tui.request_render(false);
         }
 
@@ -221,6 +268,7 @@ pub(super) async fn handle_agent_event(
         AgentEvent::TurnEnd {
             message,
             tool_results,
+            ..
         } => {
             // Finalize the assistant message for this turn.
             let view = state.transcript_view();
@@ -236,7 +284,7 @@ pub(super) async fn handle_agent_event(
             tui.request_render(false);
         }
 
-        AgentEvent::MessageStart { message } => match message {
+        AgentEvent::MessageStart { message, .. } => match message {
             AgentMessage::Assistant(a) => {
                 // The shared transcript view renders this through the same
                 // component path as the remote client. It installs the live
@@ -267,7 +315,7 @@ pub(super) async fn handle_agent_event(
                     chat.add_child(Arc::new(Spacer::new(1)));
                     tui.request_render(false);
                 } else {
-                    add_note_message(chat, &custom_message_fallback(&custom));
+                    add_note_message(&state.notice_container(), &custom_message_fallback(&custom));
                     tui.request_render(false);
                 }
             }
@@ -282,7 +330,7 @@ pub(super) async fn handle_agent_event(
             // renders that bubble instead.
             AgentMessage::User(user) => {
                 state.transcript_view().add_user(&user_message_text(&user));
-                add_user_images(&state.chat_container, &user, state.images_visible());
+                add_user_images(&state.transcript_container(), &user, state.images_visible());
                 // A consumed entry must drop out of the pending display.
                 refresh_pending_messages(state, lane).await;
                 tui.request_render(false);
@@ -295,6 +343,7 @@ pub(super) async fn handle_agent_event(
         AgentEvent::MessageUpdate {
             message,
             assistant_message_event,
+            ..
         } => {
             let _ = assistant_message_event; // the snapshot is authoritative
             let a: &rpi_ai::types::AssistantMessage = &message;
@@ -315,7 +364,7 @@ pub(super) async fn handle_agent_event(
             tui.request_render(false);
         }
 
-        AgentEvent::MessageEnd { message } => {
+        AgentEvent::MessageEnd { message, .. } => {
             if let AgentMessage::Assistant(a) = &message {
                 let text = assistant_text(a);
                 state
@@ -331,7 +380,13 @@ pub(super) async fn handle_agent_event(
                 // Uses the shared cache-stats logic (noise floor, idle gap,
                 // model change) and prices the miss when known.
                 let usage = &a.usage;
-                // Footer usage totals + cache hit rate (pi footer.ts).
+                // Footer usage totals + cache hit rate (pi footer.ts). Unconditional
+                // accumulation: the duplicate-suppression problem is handled at the
+                // reconciliation site instead — reconciliation only runs inside this
+                // drain (see the `AgentEnd` arm), where the FIFO broadcast guarantees
+                // every event queued before it has already been through this handler.
+                // A rebuild that replaced the totals can therefore never be followed
+                // by a still-queued duplicate of a turn it already counted.
                 state.footer.add_usage(
                     usage.input,
                     usage.output,
@@ -365,7 +420,7 @@ pub(super) async fn handle_agent_event(
                         String::new()
                     };
                     add_note_message(
-                        &state.chat_container,
+                        &state.notice_container(),
                         &format!(
                             "Cache miss: {} tokens re-billed{}",
                             format_tokens(miss.missed_tokens),
@@ -374,14 +429,14 @@ pub(super) async fn handle_agent_event(
                     );
                 }
                 if let Some(text) = extension_usage_text(Some(&state.extension_session), usage) {
-                    add_note_message(chat, &text);
+                    add_note_message(&state.notice_container(), &text);
                 }
                 // Error assistant messages carry the provider diagnostic in
                 // `error_message`, not in text content. The assistant
                 // component is empty for these messages, so surface the
                 // diagnostic as a visible error row in the transcript.
                 if let Some(error) = assistant_error_text(a) {
-                    add_error_message(chat, &error);
+                    add_error_message(&state.notice_container(), &error);
                 }
             }
             tui.request_render(false);
@@ -439,7 +494,7 @@ pub(super) async fn handle_agent_event(
                 tui.width(),
             );
             add_tool_images(
-                &state.chat_container,
+                &state.transcript_container(),
                 &result.content,
                 state.images_visible(),
             );
@@ -471,6 +526,34 @@ pub(super) fn record_context_usage(
     let tokens = message.usage.context_tokens();
     if tokens > 0 {
         footer.set_context_tokens(Some(tokens));
+    }
+}
+
+/// Fold the session's recorded usage into the footer, replacing whatever the
+/// live `MessageEnd` path accumulated. Only called from the drain's `AgentEnd`
+/// handler: the FIFO broadcast makes that call a consumption barrier, so every
+/// event queued before it has already been applied and a rebuild here can never
+/// be followed by a delayed duplicate of a turn it counted.
+///
+/// The live path (`handle_agent_event`) can only add what it actually observed.
+/// An `AgentEvent` broadcast that overflows reports `Lagged` and drops events
+/// outright, and `MessageEnd` is terminal — unlike `MessageUpdate`, it has no
+/// later snapshot that re-delivers the same information. So a single dropped
+/// `MessageEnd` froze `↑/↓/R/W/$` and `CH%` for the rest of the session, while
+/// the context badge kept moving because it had its own fallback.
+///
+/// This rebuilds every counter from the durable log, which is the authority the
+/// replay path (`render_session_history`) reads too — so a live session and a
+/// resumed one agree on the numbers by construction. `set_*` (replace) rather
+/// than `add_usage` (accumulate) keeps it idempotent: it runs on top of a footer
+/// that usually already holds the same totals.
+///
+/// Best-effort: the footer is cosmetic, so a failed read leaves it untouched
+/// instead of failing the turn.
+pub(super) async fn reconcile_footer_from_lane(lane: &Arc<dyn AgentLane>, state: &Arc<TuiState>) {
+    match lane.session_view().branch_overview().await {
+        Ok(overview) => history::apply_overview(&state.footer, &overview),
+        Err(error) => tracing::debug!(%error, "could not read branch overview"),
     }
 }
 
@@ -515,4 +598,35 @@ pub(super) fn tool_result_requests_markdown(details: Option<&serde_json::Value>)
         .and_then(|details| details.get("markdown"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+/// Render the session writes that failed since the last call.
+///
+/// Deduplicated by (`what`, `message`) so a backend failing the same way on every
+/// turn shows one line rather than one per turn: the queue is drained every
+/// `AgentEnd`, and the same disk-full error would otherwise repeat forever.
+pub(super) fn report_write_failures(chat: &Arc<Container>, lane: &Arc<dyn AgentLane>) -> bool {
+    let failures = lane.take_write_failures();
+    if failures.is_empty() {
+        return false;
+    }
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for failure in failures {
+        let key = (failure.what.clone(), failure.message.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        add_error_message(
+            chat,
+            &format!(
+                "Session not saved: could not persist {} ({}). \\
+                 Your messages are still on screen, and /export now writes the \\
+                 unsaved ones into the exported file — do that before exiting: \\
+                 the session log cannot be repaired.",
+                failure.what, failure.message
+            ),
+        );
+    }
+    true
 }

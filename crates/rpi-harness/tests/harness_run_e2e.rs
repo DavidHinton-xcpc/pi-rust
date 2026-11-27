@@ -33,7 +33,9 @@
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage, CollectorEmitter};
-use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
+use rpi_ai::providers::faux::{
+    faux_assistant_message, FauxBlock, FauxProvider, FauxScript, FauxStep,
+};
 use rpi_ai::types::{UserContent, UserMessage};
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
@@ -52,6 +54,33 @@ use rpi_tools::{
 // overlap. The guard stays held across the async harness run, not just the
 // set/remove call, because the harness reads the variable while starting a run.
 static RUN_BUDGET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn pending_frames(session: &Session) -> Vec<LaneRecord> {
+    let runs = session
+        .find_records(&RecordQuery {
+            record_type: Some("operation_started"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    for run in runs {
+        frames.extend(
+            session
+                .read_progress(run.id())
+                .await
+                .unwrap()
+                .into_iter()
+                // CommitStream binds identity, not content. Crash gates must
+                // wait for actual streamed frames, as on main.
+                .filter(|frame| frame.op == rpi_harness::session::types::AssistantFrameOp::Append)
+                .map(LaneRecord::AssistantFrame),
+        );
+    }
+    frames
+}
+#[path = "harness_run_e2e/native_identity_blockers.rs"]
+mod native_identity_blockers;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declined_compaction_records_a_terminal_outcome() {
@@ -146,6 +175,7 @@ async fn harness_with_options(
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session: false,
     };
 
@@ -226,6 +256,21 @@ fn record_runtime_events(harness: &AgentHarness) -> Arc<Mutex<Vec<HarnessEvent>>
     // bus keeps it — but we want the listener alive for the whole test).
     std::mem::forget(watch);
     collected
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_turn_carries_the_session_id_for_prompt_caching() {
+    let script = FauxScript::new().with_tool_call("bash", serde_json::json!({ "command": "true" }));
+    script.append_responses(vec![FauxStep::text("done")]);
+    let (harness, provider, _) = harness_with(script).await;
+
+    harness
+        .prompt_text("run it", vec![])
+        .await
+        .expect("prompt completes");
+
+    let ids = provider.state().session_ids.lock().unwrap().clone();
+    assert_eq!(ids, vec![Some("e2e".to_string()); 2]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -589,6 +634,7 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
             transform_context: None,
             entry_transforms: Vec::new(),
             provider_hooks: None,
+            require_native_durable: false,
             allow_existing_session: false,
         };
         let harness = AgentHarness::create(options).await.expect("create harness");
@@ -660,8 +706,9 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
 // faux-cache-hit path, but simplest is to assert the hook FIRED with the model
 // the loop is about to call (the per-call bridge ran). We pair the hook with a
 // counter and assert call_count == hook fires (one per stream_simple call).
-// (after_response observation is wired on the emitter side in B3+; here we
-// prove before_request runs per-call, which is the load-bearing B4 fix.)
+// `after_response` is delivered by the agent loop immediately before the
+// matching assistant `MessageEnd`; the same test also proves it fires once per
+// provider call.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -671,9 +718,11 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
     // One hook fire per stream_simple call. The script has 2 turns
     // (tool-call + final text), so we expect 2 provider calls == 2 hook fires.
     let fires: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let responses: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     struct CountingHooks {
         fires: Arc<std::sync::Mutex<Vec<String>>>,
+        responses: Arc<std::sync::Mutex<Vec<String>>>,
     }
     impl ProviderHooks for CountingHooks {
         fn before_request(
@@ -686,10 +735,22 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
             // Return a no-op patch (None would also work; exercise the apply path).
             None
         }
+
+        fn after_response(
+            &self,
+            _model: &rpi_ai::Model,
+            message: &rpi_ai::types::AssistantMessage,
+        ) {
+            self.responses
+                .lock()
+                .unwrap()
+                .push(message.stop_reason.as_str().to_string());
+        }
     }
 
     let hooks: Arc<dyn ProviderHooks> = Arc::new(CountingHooks {
         fires: Arc::clone(&fires),
+        responses: Arc::clone(&responses),
     });
 
     let script = FauxScript::new()
@@ -745,6 +806,7 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
             transform_context: None,
             entry_transforms: Vec::new(),
             provider_hooks: Some(hooks),
+            require_native_durable: false,
             allow_existing_session: false,
         };
         let harness = AgentHarness::create(options).await.expect("create harness");
@@ -772,6 +834,12 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
         hook_fires.len(),
         2,
         "before_request must fire once per stream_simple call (per-call, not run-once)"
+    );
+    let response_fires = responses.lock().unwrap().clone();
+    assert_eq!(
+        response_fires.len(),
+        2,
+        "after_response must fire once for every resolved provider stream"
     );
 }
 
@@ -891,6 +959,7 @@ async fn provider_hooks_can_replace_the_system_prompt_the_model_sees() {
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: Some(Arc::new(AppendHooks) as Arc<dyn ProviderHooks>),
+        require_native_durable: false,
         allow_existing_session: false,
     };
     let harness = AgentHarness::create(options).await.expect("create harness");
@@ -945,7 +1014,8 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
             matches!(
                 event,
                 AgentEvent::MessageStart {
-                    message: rpi_agent::AgentMessage::User(_)
+                    message: rpi_agent::AgentMessage::User(_),
+                    ..
                 }
             )
         })
@@ -960,7 +1030,8 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
         events.iter().any(|event| matches!(
             event,
             AgentEvent::MessageStart {
-                message: rpi_agent::AgentMessage::Assistant(_)
+                message: rpi_agent::AgentMessage::Assistant(_),
+                ..
             }
         )),
         "assistant MessageStart must still fire"
@@ -1192,7 +1263,9 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     let script = FauxScript::new()
         .with_tokens_per_second(20.0)
         .with_text(long.clone());
-    let (harness, _provider, _env) = harness_with(script).await;
+    let (collector, live) = CollectorEmitter::new();
+    let (harness, _provider, _env) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
 
     let run = {
         let harness = harness.clone();
@@ -1203,13 +1276,7 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     let session = harness.session().clone();
     let mut committed = 0usize;
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         committed = records.len();
         if committed >= 3 {
             break;
@@ -1239,6 +1306,23 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
         "only the prompt is history at this point"
     );
 
+    let live_id = live
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::MessageStart {
+                message: AgentMessage::Assistant(_),
+                message_id,
+            } => message_id.clone(),
+            _ => None,
+        })
+        .expect("published assistant has ID");
+    let bindings = session.find_records(&RecordQuery::default()).await.unwrap();
+    assert!(bindings.iter().any(|record| matches!(record,
+        LaneRecord::AssistantFrame(frame) if frame.op == rpi_harness::session::types::AssistantFrameOp::CommitStream
+            && frame.frame.as_ref().and_then(|value| value.get("entryId")).and_then(|value| value.as_str()) == Some(live_id.as_str())
+    )));
     run.abort();
     let _ = run.await;
 
@@ -1250,13 +1334,7 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     assert!(salvaged.is_empty(), "a different run id salvages nothing");
 
     // Read the run id that actually wrote the frames.
-    let records = session
-        .find_records(&RecordQuery {
-            record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-            ..Default::default()
-        })
-        .await
-        .expect("frame records readable");
+    let records = pending_frames(&session).await;
     let run_id = records
         .iter()
         .filter_map(|record| record.run_id().map(str::to_string))
@@ -1366,6 +1444,7 @@ async fn reopen_harness(session: rpi_harness::session::session::Session) -> Agen
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session: true,
     };
     AgentHarness::create(options)
@@ -1393,13 +1472,7 @@ async fn reopening_a_crashed_session_restores_the_committed_prefix() {
     };
     let session = harness.session().clone();
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         if records.len() >= 3 {
             break;
         }
@@ -1494,13 +1567,7 @@ async fn recovering_the_same_crashed_session_twice_does_not_duplicate() {
     };
     let session = harness.session().clone();
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         if records.len() >= 3 {
             break;
         }
@@ -1635,6 +1702,7 @@ async fn harness_with_hanging_tool(script: FauxScript) -> (AgentHarness, Arc<Fau
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session: false,
     };
     let harness = AgentHarness::create(options).await.expect("create harness");
@@ -1662,29 +1730,28 @@ async fn crashing_during_a_tool_call_leaves_a_valid_transcript() {
     };
     let session = harness.session().clone();
 
-    // Wait until the tool call itself is committed in the frames.
-    let mut saw_tool_call = false;
+    // The assistant entry precedes the actual execution checkpoint. Wait for
+    // the checkpoint itself: killing between those two writes is a different
+    // (never entered execute) boundary, not this in-flight recovery scenario.
+    let mut saw_tool_start = false;
     for _ in 0..300 {
-        let records = session
+        saw_tool_start = session
             .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                record_type: Some("tool_started"),
                 ..Default::default()
             })
             .await
-            .expect("frame records readable");
-        saw_tool_call = records.iter().any(|record| {
-            matches!(record, LaneRecord::AssistantFrame(f)
-                if f.frame.as_ref().and_then(|v| v.get("type")).and_then(|v| v.as_str())
-                    == Some("toolcall_end"))
-        });
-        if saw_tool_call {
+            .unwrap()
+            .iter()
+            .any(|record| matches!(record, LaneRecord::ToolStarted(started) if started.tool_name == "slow_tool"));
+        if saw_tool_start {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(
-        saw_tool_call,
-        "the tool call must be committed before the crash for this test to mean anything"
+        saw_tool_start,
+        "the execution checkpoint must precede the crash"
     );
 
     // Kill the run inside tool execution: no tool result will ever exist.
@@ -2139,6 +2206,7 @@ async fn replayable_harness_full(
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session,
     };
     AgentHarness::create(options).await.expect("create harness")
@@ -2351,6 +2419,7 @@ fn assistant_with_one_tool_call(call_id: &str, name: &str) -> rpi_ai::types::Ass
             arguments: serde_json::json!({}),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         }));
     message
 }
@@ -2577,6 +2646,7 @@ async fn a_run_that_keeps_dying_is_not_resumed_forever() {
             run_id: "orig-run".to_string(),
             outcome: OperationOutcome::Aborted,
             error: None,
+            result: None,
         }))
         .await
         .expect("close original run");
@@ -2608,6 +2678,7 @@ async fn a_run_that_keeps_dying_is_not_resumed_forever() {
                     run_id: run_id.clone(),
                     outcome: OperationOutcome::Aborted,
                     error: None,
+                    result: None,
                 }))
                 .await
                 .expect("close resume run");
@@ -2660,21 +2731,23 @@ async fn a_crash_mid_stream_is_not_auto_resumed() {
         tokio::spawn(async move { harness.prompt_text("a long answer please", vec![]).await })
     };
     let session = harness.session().clone();
-    for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
-        if !records.is_empty() {
-            break;
+    // Wait for the durable precondition, not just a fixed number of polls:
+    // under CI load the provider may not have produced any frame after 2s.
+    // Aborting before a frame exists tests an empty run, not stream recovery.
+    // Frames now live in the progress store, not the history record list.
+    let started = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let records = pending_frames(&session).await;
+            if !records.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    })
+    .await;
     run.abort();
     let _ = run.await;
+    started.expect("provider must persist an assistant frame before simulating a stream crash");
     drop(harness);
 
     let recovered = reopen_harness(session).await;
@@ -2757,11 +2830,25 @@ async fn an_explicitly_aborted_run_is_not_resumed() {
         "the run must have started before it can be aborted"
     );
 
-    harness.lane("main").abort().await.expect("abort succeeds");
+    let reconciled = harness
+        .lane("main")
+        .abort_and_reconcile()
+        .await
+        .expect("abort and reconciliation succeed");
+    assert!(reconciled.settled);
+    assert!(!reconciled.abort.run_id.is_empty());
     let outcome = run.await.expect("the run task finished");
     assert!(
         outcome.is_ok(),
         "an aborted run settles normally: {outcome:?}"
+    );
+    assert_eq!(
+        reconciled
+            .terminal
+            .as_ref()
+            .map(|result| result.run_id.as_str()),
+        Some(reconciled.abort.run_id.as_str()),
+        "cooperative abort must expose the committed terminal result after settlement"
     );
 
     let session = harness.session().clone();
@@ -2812,13 +2899,7 @@ async fn a_completed_run_is_not_resumed() {
 /// process dies.
 async fn wait_until_streaming(session: &rpi_harness::session::Session) {
     for _ in 0..300 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(session).await;
         if !records.is_empty() {
             return;
         }
@@ -2896,8 +2977,12 @@ async fn a_steer_message_survives_a_restart() {
         .await
         .expect("queued messages readable");
     assert_eq!(
-        queued_now.steering,
-        vec!["also check the tests".to_string()],
+        queued_now
+            .steering
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["also check the tests"],
         "a steer typed before the crash must come back queued"
     );
 
@@ -3856,6 +3941,16 @@ async fn an_injected_steering_message_survives_a_crash() {
 /// the user does not need to retype what they already sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_before_the_first_request_still_continues() {
+    check_crash_before_first_request(false).await;
+}
+
+/// Extension journals are branch data, not an answer to the user's prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_entries_do_not_hide_a_crashed_user_prompt() {
+    check_crash_before_first_request(true).await;
+}
+
+async fn check_crash_before_first_request(with_custom_entries: bool) {
     use rpi_harness::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
 
     let session = replay_session();
@@ -3889,6 +3984,15 @@ async fn a_crash_before_the_first_request_still_continues() {
         .await
         .expect("append the run");
 
+    if with_custom_entries {
+        for _ in 0..2 {
+            session
+                .append_custom_entry("plugin-state", Some(serde_json::json!({"running": true})))
+                .await
+                .expect("append AgentStart journal");
+        }
+    }
+
     let recovered = replayable_harness(
         session,
         ToolReplay::Never,
@@ -3903,6 +4007,17 @@ async fn a_crash_before_the_first_request_still_continues() {
         .expect("a run that produced nothing should be continued");
     assert_eq!(pending.attempt, 0);
 
+    if with_custom_entries {
+        recovered
+            .session()
+            .append_custom_entry(
+                "plugin-state",
+                Some(serde_json::json!({"interrupted": true})),
+            )
+            .await
+            .expect("append SessionStart journal before resuming");
+    }
+
     let resumed = recovered
         .resume_pending()
         .await
@@ -3916,6 +4031,22 @@ async fn a_crash_before_the_first_request_still_continues() {
     assert!(
         joined.contains("answered on the restart"),
         "the continued run must answer, got {joined:?}"
+    );
+    assert!(recovered.pending_resume().is_none());
+    let entries = recovered
+        .session()
+        .view("main")
+        .find_entries_on_branch(&EntryQuery::default(), &BranchBounds::default())
+        .await
+        .unwrap();
+    let users = entries.iter().filter(|entry| {
+        matches!(entry, rpi_harness::session::types::Entry::Message(message)
+            if matches!(message.message, AgentMessage::User(_)))
+    });
+    assert_eq!(
+        users.count(),
+        1,
+        "resume must not duplicate the user prompt"
     );
 }
 
@@ -3939,6 +4070,11 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
         .with_tool_call("read", serde_json::json!({ "path": "a.txt" }))
         .with_text("done");
     let (harness, provider, _env) = harness_with(script).await;
+    let (collector, live) = CollectorEmitter::new();
+    harness
+        .set_agent_emitter(Some(Arc::new(collector)))
+        .await
+        .unwrap();
 
     // What the poll returns: an assistant message with a tool call. Its tools were
     // never run (they came from outside the loop), which is the case this test
@@ -3951,6 +4087,7 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
         arguments: serde_json::json!({ "path": "b.txt" }),
         thought_signature: None,
         namespace: None,
+        recorded: None,
     })];
     provider.push_deferred_poll(DeferredPoll::Message(polled));
 
@@ -4014,6 +4151,33 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
         _ => None,
     });
     let polled_result = polled_result.expect("the polled tool call must have been executed");
+    let live = live.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &live, false).await;
+    let records = harness
+        .session()
+        .find_records(&RecordQuery::default())
+        .await
+        .unwrap();
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            LaneRecord::ToolStarted(started) if started.tool_call_id == "polled-call" => {
+                Some(started)
+            }
+            _ => None,
+        })
+        .expect("polled call has a durable ToolStarted");
+    assert_eq!(started.tool_index, 0);
+    assert!(entries
+        .iter()
+        .any(|entry| entry.base().id == started.assistant_entry_id));
+    assert!(live.iter().any(|event| matches!(event,
+        AgentEvent::MessageStart { message: AgentMessage::ToolResult(result), message_id: Some(id) }
+            if result.tool_call_id == "polled-call" && id == &started.result_entry_id)));
+    assert_eq!(started.effective_args, serde_json::json!({"path":"b.txt"}));
+    assert!(entries.iter().any(|entry| matches!(entry,
+        rpi_harness::session::types::Entry::Message(entry) if entry.base.id == started.result_entry_id && matches!(&entry.message,
+            AgentMessage::ToolResult(result) if result.tool_call_id == "polled-call"))));
     assert!(
         !polled_result.is_error || !polled_result.content.is_empty(),
         "the tool must actually have run, got {polled_result:?}"
@@ -4110,5 +4274,766 @@ async fn resuming_through_a_provider_without_the_capability_is_an_error() {
     assert!(
         format!("{error:?}").contains("no provider"),
         "the error must say which provider is missing, got {error:?}"
+    );
+}
+
+/// Assert identity by event order, never by matching message content. Failed retry
+/// attempts may be deliberately absent from history, but each attempt still has
+/// its own non-reused native reservation.
+async fn assert_live_entry_ids(
+    harness: &AgentHarness,
+    events: &[AgentEvent],
+    allow_discarded: bool,
+) {
+    let mut current: Option<String> = None;
+    let mut starts = std::collections::BTreeSet::new();
+    for event in events {
+        match event {
+            AgentEvent::MessageStart { message_id, .. } => {
+                let id = message_id.clone().expect("session-backed start has ID");
+                assert!(
+                    starts.insert(id.clone()),
+                    "each message owns its reservation"
+                );
+                current = Some(id);
+            }
+            AgentEvent::MessageUpdate { message_id, .. } => {
+                assert_eq!(
+                    message_id, &current,
+                    "thinking/text/tool deltas keep start ID"
+                );
+            }
+            AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } => {
+                assert_eq!(message_id, &current, "end keeps start ID");
+                let id = message_id.as_deref().unwrap();
+                match harness.get_entry(id).await.unwrap() {
+                    Some(rpi_harness::session::types::Entry::Message(entry)) => {
+                        // JSON Option<Value> round-trips Some(Null) as None.
+                        // Compare the native durable representation, not that
+                        // in-memory-only distinction in tool-result details.
+                        let canonical = |value: &AgentMessage| {
+                            serde_json::from_value::<AgentMessage>(
+                                serde_json::to_value(value).unwrap(),
+                            )
+                            .unwrap()
+                        };
+                        assert_eq!(
+                            canonical(&entry.message),
+                            canonical(message),
+                            "live end is the same durable history entry"
+                        );
+                    }
+                    None if allow_discarded
+                        && matches!(message, AgentMessage::Assistant(a) if a.stop_reason == rpi_ai::StopReason::Error) =>
+                        {}
+                    other => panic!("missing or wrong entry for {id}: {other:?}"),
+                }
+                current = None;
+            }
+            _ => {}
+        }
+    }
+    assert!(current.is_none(), "all live messages ended");
+    let records = harness
+        .session()
+        .find_records(&RecordQuery::default())
+        .await
+        .unwrap();
+    for record in records {
+        if let LaneRecord::ToolStarted(tool) = record {
+            assert!(
+                starts.contains(&tool.result_entry_id),
+                "tool result reuses ToolStarted ID"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_live_ids_match_history_for_text_thinking_tools_and_final_persist() {
+    use rpi_ai::providers::faux::FauxBlock;
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(faux_assistant_message(
+            vec![
+                FauxBlock::thinking("private reasoning"),
+                FauxBlock::text("writing"),
+                FauxBlock::tool_call(
+                    "write",
+                    serde_json::json!({"path":"identity.txt","content":"same"}),
+                ),
+            ],
+            rpi_ai::StopReason::ToolUse,
+        )),
+        FauxStep::text("same"),
+    ]);
+    let (collector, events) = CollectorEmitter::new();
+    let (harness, _, _) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
+    harness.prompt_text("same", vec![]).await.unwrap();
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, false).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::MessageUpdate {
+            assistant_message_event: rpi_ai::AssistantMessageEvent::ThinkingDelta { .. },
+            ..
+        }
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_retry_attempt_ids_are_distinct_and_only_success_is_committed() {
+    let mut failed = faux_assistant_message("same", rpi_ai::StopReason::Error);
+    failed.error_message = Some("503 service unavailable".into());
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(failed.clone()),
+        FauxStep::message(failed),
+        FauxStep::text("same"),
+    ]);
+    let (collector, events) = CollectorEmitter::new();
+    let retry = RetryPolicy {
+        enabled: true,
+        max_retries: 2,
+        base_delay_ms: 0,
+        max_agent_delay_ms: 0,
+    };
+    let (harness, _, _) = harness_with_options(script, retry, Some(Arc::new(collector))).await;
+    harness.prompt_text("same", vec![]).await.unwrap();
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, true).await;
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageStart {
+                message: AgentMessage::Assistant(_),
+                message_id,
+            } => message_id.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert!(harness.get_entry(&ids[0]).await.unwrap().is_none());
+    assert!(harness.get_entry(&ids[1]).await.unwrap().is_none());
+    assert!(harness.get_entry(&ids[2]).await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_cancelled_assistant_keeps_its_live_entry_id() {
+    let script = FauxScript::new()
+        .with_tokens_per_second(50.0)
+        .with_abort_after(std::time::Duration::from_millis(50))
+        .with_text("cancelled response ".repeat(100));
+    let (collector, events) = CollectorEmitter::new();
+    let (harness, _, _) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
+    let result = harness.prompt_text("cancel", vec![]).await.unwrap();
+    assert!(matches!(result.outcome, HarnessRunOutcome::Aborted { .. }));
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_explicit_delivery_ids_do_not_match_identical_contents() {
+    use rpi_harness::frame_progress::FrameRecordingEmitter;
+    use rpi_harness::settle::{SettleState, SettlingEmitter};
+    let (harness, _, _) = harness_with(FauxScript::new()).await;
+    let (collector, events) = CollectorEmitter::new();
+    let recorder = Arc::new(FrameRecordingEmitter::new(
+        Arc::new(collector),
+        harness.session().clone(),
+        "main",
+        "identity-delivery",
+    ));
+    let state = Arc::new(SettleState::new(
+        "identity-delivery",
+        false,
+        0,
+        Default::default(),
+    ));
+    let emitter = SettlingEmitter::new(
+        recorder.clone(),
+        recorder,
+        state.clone(),
+        harness.clone(),
+        Default::default(),
+    );
+    let message: AgentMessage =
+        faux_assistant_message("identical", rpi_ai::StopReason::Stop).into();
+    // A generated assistant with identical bytes must NOT consume queued IDs.
+    state.push_injected("queued-1", message.clone());
+    state.push_injected("queued-2", message.clone());
+    emitter
+        .emit(AgentEvent::MessageStart {
+            message: message.clone(),
+            message_id: None,
+        })
+        .await;
+    emitter
+        .emit(AgentEvent::MessageEnd {
+            message: message.clone(),
+            message_id: None,
+        })
+        .await;
+    for _ in 0..2 {
+        emitter
+            .emit_injected(AgentEvent::MessageStart {
+                message: message.clone(),
+                message_id: None,
+            })
+            .await;
+        emitter
+            .emit(AgentEvent::MessageEnd {
+                message: message.clone(),
+                message_id: None,
+            })
+            .await;
+    }
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, false).await;
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageStart { message_id, .. } => message_id.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_ne!(ids[0], "queued-1");
+    assert_eq!(&ids[1..], &["queued-1", "queued-2"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_missing_delivery_reservation_cancels_without_publishing_a_new_id() {
+    use rpi_harness::frame_progress::FrameRecordingEmitter;
+    use rpi_harness::settle::{SettleState, SettlingEmitter};
+    let (harness, _, _) = harness_with(FauxScript::new()).await;
+    let (collector, events) = CollectorEmitter::new();
+    let recorder = Arc::new(FrameRecordingEmitter::new(
+        Arc::new(collector),
+        harness.session().clone(),
+        "main",
+        "identity-failure",
+    ));
+    let state = Arc::new(SettleState::new(
+        "identity-failure",
+        false,
+        0,
+        Default::default(),
+    ));
+    let signal = tokio_util::sync::CancellationToken::new();
+    let emitter = SettlingEmitter::new(recorder.clone(), recorder, state, harness, signal.clone());
+    let message: AgentMessage = UserMessage::new("missing", 0).into();
+    emitter
+        .emit_injected(AgentEvent::MessageStart {
+            message: message.clone(),
+            message_id: None,
+        })
+        .await;
+    emitter
+        .emit(AgentEvent::MessageStart {
+            message,
+            message_id: None,
+        })
+        .await;
+    assert!(signal.is_cancelled());
+    assert!(events.lock().unwrap().is_empty());
+}
+
+mod native_identity_bind_failure {
+    use super::*;
+    use rpi_harness::error::{SessionError, SessionResult};
+    use rpi_harness::session::types::*;
+
+    struct RefuseBindings {
+        inner: Arc<dyn SessionStorage>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStorage for RefuseBindings {
+        fn metadata(&self) -> SessionMetadata {
+            self.inner.metadata()
+        }
+        async fn append_progress(
+            &self,
+            records: Vec<AssistantFrameRecord>,
+        ) -> SessionResult<Vec<AssistantFrameRecord>> {
+            self.inner.append_progress(records).await
+        }
+        async fn read_progress(&self, run_id: &str) -> SessionResult<Vec<AssistantFrameRecord>> {
+            self.inner.read_progress(run_id).await
+        }
+        async fn prune_completed_progress(&self) -> SessionResult<usize> {
+            self.inner.prune_completed_progress().await
+        }
+        async fn record_page(&self, query: &RecordPageQuery) -> SessionResult<RecordPage> {
+            self.inner.record_page(query).await
+        }
+        async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
+            self.inner.get_lanes().await
+        }
+        async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+            self.inner.history_identity().await
+        }
+        async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
+            self.inner.create_lane(lane, at).await
+        }
+        async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
+            self.inner.move_lane(lane, to).await
+        }
+        async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+            self.inner.append_entry(entry, lane).await
+        }
+        async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+            if matches!(&record, LaneRecord::AssistantFrame(frame) if frame.op == AssistantFrameOp::CommitStream)
+            {
+                return Err(SessionError::storage("controlled identity binding failure"));
+            }
+            self.inner.append_record(record).await
+        }
+        async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
+            self.inner.get_entry(id).await
+        }
+        async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>> {
+            self.inner.find_entries(query).await
+        }
+        async fn find_entries_on_branch(
+            &self,
+            query: &EntryQuery,
+            bounds: &BranchBounds,
+            start: &str,
+        ) -> SessionResult<Vec<Entry>> {
+            self.inner
+                .find_entries_on_branch(query, bounds, start)
+                .await
+        }
+        async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
+            self.inner.find_records(query).await
+        }
+        async fn find_open_operations(
+            &self,
+            lane: &str,
+            limit: Option<usize>,
+        ) -> SessionResult<Vec<OperationStartedRecord>> {
+            self.inner.find_open_operations(lane, limit).await
+        }
+        async fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
+            self.inner.get_log(options).await
+        }
+        async fn get_name(&self) -> SessionResult<Option<String>> {
+            self.inner.get_name().await
+        }
+        async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
+            self.inner.set_name(name).await
+        }
+        async fn get_label(&self, id: &str) -> SessionResult<Option<String>> {
+            self.inner.get_label(id).await
+        }
+        async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
+            self.inner.set_label(id, label).await
+        }
+        async fn get_stats(&self) -> SessionResult<SessionStats> {
+            self.inner.get_stats().await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_failed_binding_is_propagated_before_first_live_message() {
+        let (collector, events) = CollectorEmitter::new();
+        let (harness, _, _) = harness_with_options(
+            FauxScript::new().with_text("never publish an unbound ID"),
+            RetryPolicy::default(),
+            Some(Arc::new(collector)),
+        )
+        .await;
+        let storage = Arc::new(RefuseBindings {
+            inner: harness.session().storage(),
+        });
+        harness
+            .set_session(Session::new(storage, None))
+            .await
+            .unwrap();
+        let error = harness
+            .prompt_text("bind", vec![])
+            .await
+            .expect_err("binding failure must fail the run");
+        assert!(error
+            .to_string()
+            .contains("controlled identity binding failure"));
+        assert!(
+            !events.lock().unwrap().iter().any(|event| matches!(
+                event,
+                AgentEvent::MessageStart { .. }
+                    | AgentEvent::MessageUpdate { .. }
+                    | AgentEvent::MessageEnd { .. }
+            )),
+            "no identity is published after a failed durable binding"
+        );
+    }
+}
+
+/// `abort_reclaiming(true)` must be atomic against a run starting concurrently.
+///
+/// The idle path is the one that used to leak: `abort()` returned
+/// `NoActiveRun` from inside the gate, the caller then did `clear_queue()`
+/// separately, and a run starting in between could drain the queue first — the
+/// reply said "nothing queued" for messages that were actually consumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_reclaiming_is_atomic_on_an_idle_lane() {
+    let script = FauxScript::new()
+        .with_text("slow answer")
+        .with_tokens_per_second(2.0);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    // Queue something on an idle lane.
+    harness
+        .steer(AgentMessage::User(UserMessage::new(
+            UserContent::Text("staged while idle".into()),
+            0,
+        )))
+        .await
+        .expect("steering is accepted on an idle lane");
+
+    // Idle abort still hands the queue back (idempotent stop button)…
+    let result = harness
+        .abort_reclaiming(true)
+        .await
+        .expect("idle abort with idle_is_ok must succeed");
+    assert!(
+        result.run_id.is_empty(),
+        "no run was active, so there is no run id: {:?}",
+        result.run_id
+    );
+    assert_eq!(
+        result.steer.len(),
+        1,
+        "the staged message must come back: {:?}",
+        result.steer
+    );
+    // …and it is a transfer, not a copy.
+    assert!(
+        harness.queued_messages().await.unwrap().is_empty(),
+        "the queue must be empty after the reclaim"
+    );
+
+    // The strict contract is unchanged for callers that only want to cancel.
+    let strict = harness.abort().await;
+    assert!(
+        strict.is_err(),
+        "`abort()` must keep reporting NoActiveRun on an idle lane"
+    );
+}
+
+/// rpi-web's Stop button must cancel the active run without reclaiming queued
+/// steering/follow-up messages. `abort` deliberately transfers the queue back to
+/// a remote UI; Stop must leave it pending and visible instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_preserving_queue_keeps_follow_up_pending() {
+    let script = FauxScript::new()
+        .with_text("slow answer")
+        .with_tokens_per_second(1.0);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    harness
+        .follow_up(AgentMessage::User(UserMessage::new(
+            UserContent::Text("still queued after stop".into()),
+            0,
+        )))
+        .await
+        .expect("follow-up is accepted while idle");
+
+    let run = tokio::spawn({
+        let harness = harness.clone();
+        async move { harness.prompt_text("start", vec![]).await }
+    });
+
+    // Wait until the run is admitted, then stop it through the same boundary
+    // the native RPC `stop_run` command uses.
+    let active = loop {
+        if let Some(active) = harness.active_operation().await.unwrap() {
+            break active;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert!(harness.stop_preserving_queue(&active.run_id).await.unwrap());
+    let result = run.await.expect("stopped run joins").expect("run settles");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Aborted { .. }),
+        "unexpected outcome: {:?}",
+        result.outcome
+    );
+
+    let queued = harness.queued_messages().await.expect("queue snapshot");
+    assert_eq!(queued.follow_up.len(), 1, "{queued:?}");
+    assert_eq!(queued.follow_up[0].text, "still queued after stop");
+
+    let cancelled = harness
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some("queue_cancelled"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        cancelled.is_empty(),
+        "a queue-preserving stop must not cancel the queued entry"
+    );
+}
+
+/// `turn_end.pending_messages` must report the queue depth **without draining**.
+///
+/// The two drain hooks (`get_steering_messages` / `get_follow_up_messages`)
+/// consume the queue, so they cannot answer "how many are left?" — asking would
+/// eat the messages. The harness therefore installs a separate read-only
+/// `pending_message_count` hook wired to the same queues.
+///
+/// This test pins both halves: the count is right, and asking does not disturb
+/// the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turn_end_reports_pending_count_without_draining() {
+    // One response per turn: the initial prompt plus each queued message
+    // injects another turn.
+    let script = FauxScript::new().with_text("done");
+    script.append_responses(vec![
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+    ]);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    // Park two messages in the steering queue and one in follow-up.
+    let msg =
+        |text: &str| AgentMessage::User(UserMessage::new(UserContent::Text(text.to_string()), 0));
+    for text in ["a", "b"] {
+        harness.steer(msg(text)).await.unwrap();
+    }
+    harness.follow_up(msg("c")).await.unwrap();
+
+    let queued = harness.queued_messages().await.unwrap();
+    assert_eq!(
+        queued.steering.len() + queued.follow_up.len(),
+        3,
+        "the three messages must actually be queued: {queued:?}"
+    );
+
+    let result = harness
+        .prompt_text("go", vec![])
+        .await
+        .expect("prompt completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "{:?}",
+        result.outcome
+    );
+
+    // Whatever the loop consumed, nothing may be left behind: every queued
+    // message either ran (drained) or is still accounted for.
+    let after = harness.queued_messages().await.unwrap();
+    assert!(
+        after.steering.is_empty() && after.follow_up.is_empty(),
+        "the run must have consumed the queue, got {after:?}"
+    );
+}
+
+/// `StopRound` ends the run at the turn boundary **without** truncating the
+/// answer, and is one-shot.
+///
+/// This is the gentle counterpart of abort: abort interrupts the in-flight
+/// provider call, so the answer the user is reading gets cut off. "Stop after
+/// this round" must instead let the current turn finish and only prevent the
+/// loop from starting another one.
+///
+/// The request is issued while the run is **active**, which is the only case
+/// where it has an effect (see `stop_round_while_idle_is_a_no_op`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_finishes_the_turn_then_stops() {
+    // First turn: some text **then** a tool call, streamed slowly. The text
+    // gives the test a window to issue the request while the turn is still
+    // running; without it the turn can complete before `request_stop_round()`.
+    let first = FauxStep::Message(faux_assistant_message(
+        vec![
+            FauxBlock::text("working on it"),
+            FauxBlock::tool_call("bash", serde_json::json!({ "command": "true" })),
+        ],
+        rpi_ai::types::StopReason::ToolUse,
+    ));
+    // 4 tokens/s over ~6 tokens ≈ 1.5s: long enough to inject the request,
+    // short enough to keep the suite fast.
+    let script = FauxScript::new().with_tokens_per_second(4.0);
+    script.set_responses(vec![first, FauxStep::text("second turn")]);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    let prompt = tokio::spawn({
+        let harness = harness.clone();
+        async move { harness.prompt_text("go", vec![]).await }
+    });
+
+    // 4 tokens/s ⇒ the first chunk lands well after this sleep, so the request
+    // is set while the turn is still in flight.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    harness.request_stop_round();
+
+    let result = prompt.await.unwrap().expect("the prompt still settles");
+
+    // The run completed rather than aborting: the first turn's answer is intact.
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "StopRound must complete the run, not abort it: {:?}",
+        result.outcome
+    );
+    // And the second turn never happened — only the first provider call ran.
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the loop must not start another turn after StopRound"
+    );
+}
+
+/// A `StopRound` requested while a retry is being scheduled must not be lost.
+///
+/// The request arrives on the boundary the scheduler just announced: without
+/// consuming it before the next attempt, the retry runs anyway and the one-shot
+/// request is honored a whole turn late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_requested_during_retry_backoff_is_honored() {
+    use rpi_ai::providers::faux::{faux_assistant_message, FauxBlock, FauxScript, FauxStep};
+
+    struct StopOnRetryEmitter {
+        harness: std::sync::Mutex<Option<AgentHarness>>,
+    }
+    impl AgentEmitter for StopOnRetryEmitter {
+        fn emit(&self, event: AgentEvent) -> futures::future::BoxFuture<'static, ()> {
+            self.try_emit(event);
+            Box::pin(async {})
+        }
+        fn try_emit(&self, event: AgentEvent) {
+            if matches!(event, AgentEvent::RetryScheduled { .. }) {
+                if let Some(harness) = self.harness.lock().unwrap().as_ref() {
+                    harness.request_stop_round();
+                }
+            }
+        }
+    }
+
+    // First attempt fails retryably; a second response is available so a missed
+    // StopRound shows up as an extra provider call.
+    let failing = {
+        let mut message =
+            faux_assistant_message(Vec::<FauxBlock>::new(), rpi_ai::types::StopReason::Error);
+        message.error_message = Some("overloaded_error: retryable".to_string());
+        message
+    };
+    let script = FauxScript::new();
+    script.append_responses(vec![
+        FauxStep::Message(failing),
+        FauxStep::text("second attempt"),
+    ]);
+
+    let emitter = Arc::new(StopOnRetryEmitter {
+        harness: std::sync::Mutex::new(None),
+    });
+    let retry = rpi_harness::types::RetryPolicy {
+        enabled: true,
+        max_retries: 3,
+        base_delay_ms: 50,
+        max_agent_delay_ms: 200,
+    };
+    let (harness, provider, _env) = harness_with_options(
+        script,
+        retry,
+        Some(Arc::clone(&emitter) as Arc<dyn AgentEmitter>),
+    )
+    .await;
+    *emitter.harness.lock().unwrap() = Some(harness.clone());
+
+    let _ = harness.prompt_text("one", vec![]).await;
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a StopRound requested while the retry was scheduled must stop before the next attempt"
+    );
+}
+
+/// A `StopRound` issued the instant `RunStart` is published must be honored.
+///
+/// This is the remote-client shape: a UI reacts to `RunStart` by asking the run
+/// to stop after its first round. The idle-request reset therefore has to run
+/// *before* the event is published — resetting afterwards erases exactly the
+/// request the run just announced it was ready for, and the run takes an extra
+/// provider call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_requested_at_run_start_is_honored() {
+    // A tool call needs a second turn, so a lost StopRound shows up as two
+    // provider calls instead of one.
+    let script = FauxScript::new().with_tool_call("bash", serde_json::json!({ "command": "true" }));
+    script.append_responses(vec![FauxStep::text("second turn")]);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    // React to `RunStart` on the harness bus, which fires *during*
+    // `prompt_text`, exactly where a remote UI would.
+    let reactor = harness.clone();
+    let mut watch = harness.events().watch(|| ());
+    watch.start(Arc::new(move |event: &HarnessEvent| {
+        if matches!(event, HarnessEvent::RunStart(_)) {
+            reactor.request_stop_round();
+        }
+    }));
+    std::mem::forget(watch);
+
+    let _ = harness.prompt_text("one", vec![]).await;
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a StopRound issued when RunStart was published must stop before another turn"
+    );
+}
+
+/// `StopRound` on an **idle** lane is a no-op: it must not make the next run
+/// stop after its first turn.
+///
+/// The request only means something while a run is in flight ("finish *this*
+/// round"). A leftover flag would silently turn the next prompt into a
+/// one-turn run, which is exactly what the previous implementation did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_while_idle_is_a_no_op() {
+    // Two turns would be needed for the tool call to continue, so a leaked flag
+    // would be visible as "the run stopped after turn one".
+    let script = FauxScript::new().with_tool_call("bash", serde_json::json!({ "command": "true" }));
+    script.append_responses(vec![FauxStep::text("second turn")]);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    // No run is active.
+    harness.request_stop_round();
+
+    let result = harness
+        .prompt_text("one", vec![])
+        .await
+        .expect("the prompt settles");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "an idle StopRound must not stop the next run after one turn"
     );
 }

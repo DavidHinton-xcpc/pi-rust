@@ -1,6 +1,33 @@
 //! Rendering utilities for TUI.
 
+use std::cell::Cell;
+
 use crate::ansi::visible_width;
+
+thread_local! {
+    static MAIN_SCREEN_FRAME: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Render a regular-mode frame: transcript timers are stable and mutable
+/// panels use compact live summaries. Saved main-buffer rows are snapshots;
+/// elapsed time and late update hints belong in the editor/status dock.
+/// The scope is thread-local and restored even if a nested render panics.
+/// Hosts may use this when rendering their own mode-specific components.
+pub fn with_main_screen_frame<R>(render: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MAIN_SCREEN_FRAME.with(|frame| frame.set(self.0));
+        }
+    }
+    let _restore = Restore(MAIN_SCREEN_FRAME.with(|frame| frame.replace(true)));
+    render()
+}
+
+/// Whether the current thread is rendering a regular/main-screen frame.
+pub fn is_main_screen_frame() -> bool {
+    MAIN_SCREEN_FRAME.with(Cell::get)
+}
 
 /// Render state for tracking previous output.
 #[derive(Debug, Clone, Default)]
@@ -96,6 +123,25 @@ pub fn composite_line(base: &str, overlay: &str, col: usize, width: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_screen_scope_is_nested_thread_local_and_unwind_safe() {
+        assert!(!is_main_screen_frame());
+        with_main_screen_frame(|| {
+            assert!(is_main_screen_frame());
+            with_main_screen_frame(|| assert!(is_main_screen_frame()));
+            assert!(is_main_screen_frame());
+            std::thread::spawn(|| assert!(!is_main_screen_frame()))
+                .join()
+                .unwrap();
+            let result = std::panic::catch_unwind(|| {
+                with_main_screen_frame(|| panic!("render failed"));
+            });
+            assert!(result.is_err());
+            assert!(is_main_screen_frame());
+        });
+        assert!(!is_main_screen_frame());
+    }
 
     #[test]
     fn test_composite_line() {

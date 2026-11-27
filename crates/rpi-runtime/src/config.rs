@@ -9,6 +9,10 @@ pub enum ConfigError {
     NoHomeDir { env: &'static str },
     #[error("config dir override {env}={val:?} is not an absolute path")]
     RelativeOverride { env: &'static str, val: String },
+    /// Explicit agent homes are absolute by contract; a relative value cannot
+    /// be resolved against the process working directory safely.
+    #[error("agent home {val:?} is not an absolute path")]
+    InvalidAgentHome { val: String },
     #[error("could not read {path}: {source}")]
     Read {
         path: PathBuf,
@@ -133,6 +137,10 @@ pub fn model_compat_warnings(config: &ModelsConfig) -> Vec<String> {
                 serde_json::to_value(rpi_ai::model::OpenaiResponsesCompat::default())
                     .expect("compat defaults serialize")
             }
+            _ if provider_is_anthropic_compatible(cfg) => {
+                serde_json::to_value(rpi_ai::model::AnthropicMessagesCompat::default())
+                    .expect("compat defaults serialize")
+            }
             _ => continue,
         };
         for model in &cfg.models {
@@ -162,6 +170,9 @@ pub fn model_compat_warnings(config: &ModelsConfig) -> Vec<String> {
                     normalize_completions_compat(value.clone()),
                 )
                 .map(|_| ())
+            } else if provider_is_anthropic_compatible(cfg) {
+                serde_json::from_value::<rpi_ai::model::AnthropicMessagesCompat>(value.clone())
+                    .map(|_| ())
             } else {
                 serde_json::from_value::<rpi_ai::model::OpenaiResponsesCompat>(value.clone())
                     .map(|_| ())
@@ -272,17 +283,25 @@ pub fn provider_to_models(
                 headers.insert(k, v);
             }
         }
-        if matches!(api, Api::OpenaiCompletions | Api::OpenaiResponses) {
-            if let Some(value) = def.compat.clone() {
-                if matches!(api, Api::OpenaiResponses) {
+        if let Some(value) = def.compat.clone() {
+            match api {
+                Api::OpenaiResponses => {
                     if let Ok(compat) = serde_json::from_value(value) {
                         m.compat = Some(StreamingProtocolCompat::OpenaiResponses(compat));
                     }
-                } else if let Ok(compat) =
-                    serde_json::from_value(normalize_completions_compat(value))
-                {
-                    m.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
                 }
+                Api::OpenaiCompletions => {
+                    if let Ok(compat) = serde_json::from_value(normalize_completions_compat(value))
+                    {
+                        m.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
+                    }
+                }
+                Api::AnthropicMessages => {
+                    if let Ok(compat) = serde_json::from_value(value) {
+                        m.compat = Some(StreamingProtocolCompat::AnthropicMessages(compat));
+                    }
+                }
+                _ => {}
             }
         }
         if !headers.is_empty() {

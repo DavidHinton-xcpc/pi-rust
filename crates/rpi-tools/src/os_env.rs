@@ -14,9 +14,10 @@
 //! `ExecutionError::ShellUnavailable`. Legacy WSL bash (`System32\bash.exe`)
 //! uses `bash -s` stdin transport to avoid argv parse bugs.
 //!
-//! Kill tree: Windows `taskkill /F /T /PID`; POSIX `kill -PG` (process group,
-//! since the child is spawned as its own group leader) with fallback to
-//! `kill -PID`. Best-effort, errors swallowed.
+//! Kill tree: Windows terminates the shell's job object, falling back to
+//! `taskkill /F /T /PID`; POSIX `kill -PG` (process group, since the child is
+//! spawned as its own group leader) with fallback to `kill -PID`. Best-effort,
+//! errors swallowed.
 //!
 //! `exec` abort+timeout bracketing (plan §5.4): the spawn is `tokio::select!`-ed
 //! against the cancellation token and `tokio::time::timeout`. Resolution
@@ -24,16 +25,16 @@
 //! `cleanup()` kills tracked child pids best-effort.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
     check_cancel_exec, check_cancel_file, ExecutionEnv, FileContent, FileInfo, FileKind,
-    FileSystem, Shell, ShellExecOptions, ShellOutput,
+    FileSystem, Shell, ShellExecOptions, ShellOutput, WriterLease,
 };
 use crate::error::{
     io_to_file_error, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,
@@ -47,6 +48,26 @@ const MAX_TIMEOUT_SECONDS: f64 = 2_147_483.647;
 /// Grace period after child exit for trailing stdio. Mirrors
 /// `EXIT_STDIO_GRACE_MS`.
 const EXIT_STDIO_GRACE_MS: u64 = 100;
+
+/// Non-interactive defaults for every spawned shell. A tool call has no
+/// terminal the user can answer: `git` with no credential helper opens
+/// `/dev/tty` directly for `Username for 'https://…':`, bypassing the piped
+/// stdin/stdout/stderr (and the deliberate stdin-close in `exec`). That writes
+/// over the TUI frame as text the editor never owned — so it cannot be selected
+/// or deleted — and blocks the child until the timeout. Failing fast instead
+/// turns it into an ordinary, capturable stderr error.
+///
+/// These are *defaults*, not a policy lock: they are applied before the
+/// inherit loop and before `shell_env` / per-call `env`, so an explicit host
+/// export, `with_shell_env`, or `ShellExecOptions::env` still opts back in.
+/// This is deliberately narrower than the managed-install `harden_git_env`
+/// (which also isolated git config): here the user's own git config and
+/// credential helpers must keep working.
+const NON_INTERACTIVE_SHELL_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GCM_INTERACTIVE", "Never"),
+    ("SSH_ASKPASS_REQUIRE", "never"),
+];
 
 /// How the command is fed to the shell. Mirrors `commandTransport`.
 #[derive(Clone, Copy)]
@@ -65,6 +86,44 @@ struct ShellConfig {
 }
 
 mod append;
+mod read;
+
+/// The open lock file is the storage-level ownership capability. Keeping the
+/// file handle inside this value is essential: dropping it releases the OS
+/// advisory lock without stale-lock cleanup or a second authority.
+struct OsWriterLease {
+    file: std::fs::File,
+    fence: u64,
+}
+
+impl WriterLease for OsWriterLease {
+    fn verify_fence(&self) -> Result<(), FileError> {
+        let mut probe = self
+            .file
+            .try_clone()
+            .map_err(|error| io_to_file_error(error, Some("writer lease fence")))?;
+        probe
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_to_file_error(error, Some("writer lease fence")))?;
+        let mut contents = String::new();
+        probe
+            .read_to_string(&mut contents)
+            .map_err(|error| io_to_file_error(error, Some("writer lease fence")))?;
+        let current = contents.trim().parse::<u64>().map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("invalid persisted writer lease fence: {error}"),
+            )
+        })?;
+        if current != self.fence {
+            return Err(FileError::new(
+                FileErrorCode::PermissionDenied,
+                "writer lease fence changed; reopen the session",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Environment variables the **host** sets for its own runtime plumbing, which
 /// must not be handed to a shell it spawns.
@@ -351,7 +410,8 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    // `where` prints paths in the console code page (e.g. a Chinese user name).
+    let s = crate::output_decode::decode_output(&out.stdout);
     if s.trim().is_empty() {
         None
     } else {
@@ -359,11 +419,95 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
     }
 }
 
-/// Kill a process tree. Windows: `taskkill /F /T /PID`. POSIX: `kill -PG` with
-/// fallback to `kill -PID`. Best-effort, errors swallowed.
+/// One job object per running shell, by root pid. `taskkill /T` walks parent
+/// pids, and an MSYS shell's children are not on that chain: `sleep` under Git
+/// Bash outlives it. Job membership is inherited by every descendant.
+///
+/// Kill-on-close is armed only when killing, so whatever a command leaves
+/// running on purpose keeps running after it ends normally.
+#[cfg(windows)]
+mod shell_jobs {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use win32job::{ExtendedLimitInfo, Job};
+
+    static JOBS: LazyLock<Mutex<HashMap<u32, Job>>> = LazyLock::new(Default::default);
+
+    /// Put a shell spawned with `CREATE_SUSPENDED` in its own job, then let it
+    /// run: no descendant can start outside the job. A shell that gets no job
+    /// still runs, and cancelling it falls back to `taskkill`.
+    pub fn start(pid: u32, process: std::os::windows::io::RawHandle) -> Result<(), String> {
+        if let Ok(job) = Job::create() {
+            if job.assign_process(process as isize).is_ok() {
+                JOBS.lock().unwrap().insert(pid, job);
+            }
+        }
+        rpi_plugin_sdk::process::resume_child(pid)
+    }
+
+    /// End every process in `pid`'s job: arm kill-on-close, then drop the only
+    /// handle. False when `pid` has no job or arming failed.
+    pub fn terminate(pid: u32) -> bool {
+        let Some(job) = JOBS.lock().unwrap().remove(&pid) else {
+            return false;
+        };
+        let mut info = ExtendedLimitInfo::new();
+        info.limit_kill_on_job_close();
+        job.set_extended_limit_info(&info).is_ok()
+    }
+
+    pub fn forget(pid: u32) {
+        JOBS.lock().unwrap().remove(&pid);
+    }
+}
+
+// A tool or harness can drop exec before its cancellation branch is polled.
+// Own the process group until wait() has actually reaped the shell. The guard
+// must be synchronous: Drop runs while the async execution future is unwinding.
+struct ShellProcessGuard {
+    pid: Option<u32>,
+    active: Arc<Mutex<HashSet<u32>>>,
+}
+impl ShellProcessGuard {
+    fn finish(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            #[cfg(windows)]
+            shell_jobs::forget(pid);
+            self.active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&pid);
+        }
+    }
+}
+impl Drop for ShellProcessGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                // Every shell is spawned into its own process group. No
+                // unrelated session or successful background command is killed.
+                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+            }
+            #[cfg(windows)]
+            shell_jobs::terminate(pid);
+            self.finish();
+        }
+    }
+}
+
+/// Kill a process tree. Windows: the shell's job object, else
+/// `taskkill /F /T /PID`. POSIX: `kill -PG` with fallback to `kill -PID`.
+/// Best-effort, errors swallowed.
 async fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
+        if shell_jobs::terminate(pid) {
+            return;
+        }
         use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
         let mut cmd = tokio::process::Command::new("taskkill");
         cmd.args(&["/F", "/T", "/PID", &pid.to_string()]);
@@ -395,12 +539,153 @@ async fn kill_process_tree(pid: u32) {
 
 #[async_trait]
 impl FileSystem for OsExecutionEnv {
+    async fn try_acquire_writer_lease(
+        &self,
+        path: &str,
+    ) -> Result<Option<Box<dyn WriterLease>>, FileError> {
+        let session_path = Self::resolve_path(&self.cwd, path);
+        let lock_path = PathBuf::from(format!("{}.lock", session_path.display()));
+        let display_path = session_path.to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || {
+            use fs2::FileExt;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            file.try_lock_exclusive().map_err(|error| {
+                FileError::new(
+                    FileErrorCode::PermissionDenied,
+                    format!("writer lease is already held for {display_path}"),
+                )
+                .with_path(lock_path.to_string_lossy())
+                .with_source(Box::new(error))
+            })?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            let previous = if contents.trim().is_empty() {
+                0
+            } else {
+                contents.trim().parse::<u64>().map_err(|error| {
+                    FileError::new(
+                        FileErrorCode::Unknown,
+                        format!("invalid persisted writer lease fence: {error}"),
+                    )
+                    .with_path(lock_path.to_string_lossy())
+                })?
+            };
+            let fence = previous.checked_add(1).ok_or_else(|| {
+                FileError::new(FileErrorCode::Unknown, "writer lease fence exhausted")
+                    .with_path(lock_path.to_string_lossy())
+            })?;
+            file.seek(SeekFrom::Start(0))
+                .and_then(|_| file.set_len(0))
+                .and_then(|_| file.write_all(fence.to_string().as_bytes()))
+                .and_then(|_| file.sync_all())
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            Ok(Some(
+                Box::new(OsWriterLease { file, fence }) as Box<dyn WriterLease>
+            ))
+        })
+        .await
+        .map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("writer lease task failed: {error}"),
+            )
+            .with_path(session_path.to_string_lossy())
+        })?
+    }
+
+    async fn sync_file(
+        &self,
+        path: &str,
+        data_only: bool,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        let error_path = abs.to_string_lossy().into_owned();
+        let io_path = error_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&abs)
+                .map_err(|error| io_to_file_error(error, Some(&io_path)))?;
+            if data_only {
+                file.sync_data()
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))
+            } else {
+                file.sync_all()
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))
+            }
+        })
+        .await
+        .map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("file sync task failed: {error}"),
+            )
+            .with_path(error_path)
+        })??;
+        Ok(())
+    }
+
+    async fn sync_directory(
+        &self,
+        path: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        #[cfg(unix)]
+        {
+            let error_path = abs.to_string_lossy().into_owned();
+            let io_path = error_path.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::File::open(&abs)
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))?
+                    .sync_all()
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))
+            })
+            .await
+            .map_err(|error| {
+                FileError::new(
+                    FileErrorCode::Unknown,
+                    format!("directory sync task failed: {error}"),
+                )
+                .with_path(error_path)
+            })??;
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows has no portable directory-handle fsync equivalent in
+            // this abstraction. File contents are still synced above, but
+            // rename-directory durability remains unproved on this target.
+            let _ = abs;
+        }
+        Ok(())
+    }
+
     async fn open_append_file(
         &self,
         path: &str,
     ) -> Result<Option<Box<dyn crate::env::AppendFile>>, FileError> {
         let path = Self::resolve_path(&self.cwd, path);
         Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
+    }
+
+    async fn open_read_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<Arc<dyn crate::env::ReadFile>>, FileError> {
+        let path = Self::resolve_path(&self.cwd, path);
+        Ok(Some(Arc::new(read::OsReadFile::open(path).await?)))
     }
 
     async fn truncate_file(
@@ -482,17 +767,8 @@ impl FileSystem for OsExecutionEnv {
         if max_lines.map(|m| m == 0).unwrap_or(false) {
             return Ok(Vec::new());
         }
-        let text = self.read_text_file(path, cancel).await?;
-        let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
-        if text.ends_with('\n') {
-            if lines.last().map(|s| s.is_empty()).unwrap_or(false) {
-                lines.pop();
-            }
-        }
-        if let Some(m) = max_lines {
-            lines.truncate(m);
-        }
-        Ok(lines)
+        let abs = Self::resolve_path(&self.cwd, path);
+        read::read_text_lines(&abs, max_lines, cancel).await
     }
 
     async fn read_binary_file(
@@ -784,11 +1060,20 @@ impl FileSystem for OsExecutionEnv {
     }
 
     async fn cleanup(&self) {
-        let pids: Vec<u32> = self.active_pids.lock().await.iter().copied().collect();
+        let pids: Vec<u32> = self
+            .active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
         for pid in pids {
             kill_process_tree(pid).await;
         }
-        self.active_pids.lock().await.clear();
+        self.active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -883,6 +1168,12 @@ impl Shell for OsExecutionEnv {
         let mut cmd = tokio::process::Command::new(&shell_cfg.shell);
         cmd.current_dir(&cwd);
         cmd.env_clear();
+        // Non-interactive defaults apply even when `inherit_env` is false: a
+        // caller asking for a clean environment is not asking for a prompt.
+        // They sit before the inherit loop so any explicit value wins.
+        for (k, v) in NON_INTERACTIVE_SHELL_ENV {
+            cmd.env(k, v);
+        }
         // Environment: inherit + shell_env + per-call. The host's own private
         // plumbing (`HOST_PRIVATE_ENV`) is skipped: it describes *this* process,
         // not the shell or anything the shell runs, and inheriting it makes a
@@ -908,6 +1199,7 @@ impl Shell for OsExecutionEnv {
             }
         }
         // stdio.
+        cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -917,8 +1209,9 @@ impl Shell for OsExecutionEnv {
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+            // Suspended until it is in its job (see `shell_jobs::start`).
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         }
 
         // Args: stdin transport → `bash -s` (no command argv); argv → append.
@@ -938,8 +1231,32 @@ impl Shell for OsExecutionEnv {
             }
         };
         let pid = child.id();
+        let mut process_guard = ShellProcessGuard {
+            pid,
+            active: self.active_pids.clone(),
+        };
+        #[cfg(windows)]
+        {
+            let started = match (pid, child.raw_handle()) {
+                (Some(pid), Some(process)) => shell_jobs::start(pid, process),
+                _ => Err("the shell has no process handle".to_owned()),
+            };
+            if let Err(error) = started {
+                if let Some(pid) = pid {
+                    shell_jobs::forget(pid);
+                }
+                let _ = child.start_kill();
+                return Err(ExecutionError::new(
+                    ExecutionErrorCode::SpawnError,
+                    format!("failed to start shell: {error}"),
+                ));
+            }
+        }
         if let Some(pid) = pid {
-            self.active_pids.lock().await.insert(pid);
+            self.active_pids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid);
         }
 
         // Stdin transport: write command then close. Closing happens on BOTH
@@ -962,6 +1279,7 @@ impl Shell for OsExecutionEnv {
         let mut stdout_buf = String::new();
         let mut stderr_buf = String::new();
         let cancel = options.cancel;
+        let stop_readers = CancellationToken::new();
         let mut on_stdout = options.on_stdout;
         let mut on_stderr = options.on_stderr;
 
@@ -971,22 +1289,29 @@ impl Shell for OsExecutionEnv {
         let stdout_task = async {
             if let Some(s) = stdout.as_mut() {
                 let mut buf = vec![0u8; 8192];
+                let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let read = s.read(&mut buf);
-                    let read_result = match cancel {
-                        Some(token) => tokio::select! {
-                            result = read => result,
-                            _ = token.cancelled() => break,
-                        },
-                        None => read.await,
+                    let read_result = tokio::select! {
+                        biased;
+                        _ = stop_readers.cancelled() => break,
+                        _ = async {
+                            match cancel {
+                                Some(token) => token.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => break,
+                        result = s.read(&mut buf) => result,
                     };
                     let n = match read_result {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(_) => break,
                     };
-                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let chunk = decoder.push(&buf[..n]);
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     if let Some(cb) = on_stdout.as_mut() {
                         // Callback errors are swallowed (TS sets callbackError;
                         // v1 simplifies — the callback contract is best-effort).
@@ -994,31 +1319,52 @@ impl Shell for OsExecutionEnv {
                     }
                     stdout_buf.push_str(&chunk);
                 }
+                let tail = decoder.finish();
+                if !tail.is_empty() {
+                    if let Some(cb) = on_stdout.as_mut() {
+                        cb(&tail);
+                    }
+                    stdout_buf.push_str(&tail);
+                }
             }
         };
         let stderr_task = async {
             if let Some(s) = stderr.as_mut() {
                 let mut buf = vec![0u8; 8192];
+                let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let read = s.read(&mut buf);
-                    let read_result = match cancel {
-                        Some(token) => tokio::select! {
-                            result = read => result,
-                            _ = token.cancelled() => break,
-                        },
-                        None => read.await,
+                    let read_result = tokio::select! {
+                        biased;
+                        _ = stop_readers.cancelled() => break,
+                        _ = async {
+                            match cancel {
+                                Some(token) => token.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => break,
+                        result = s.read(&mut buf) => result,
                     };
                     let n = match read_result {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(_) => break,
                     };
-                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let chunk = decoder.push(&buf[..n]);
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     if let Some(cb) = on_stderr.as_mut() {
                         cb(&chunk);
                     }
                     stderr_buf.push_str(&chunk);
+                }
+                let tail = decoder.finish();
+                if !tail.is_empty() {
+                    if let Some(cb) = on_stderr.as_mut() {
+                        cb(&tail);
+                    }
+                    stderr_buf.push_str(&tail);
                 }
             }
         };
@@ -1083,19 +1429,56 @@ impl Shell for OsExecutionEnv {
             // the inherited pipes, so reading to EOF waits for a process the
             // command no longer owns. No timeout rescues that: the timeout wraps
             // `child.wait()` and the child already exited successfully.
+            //
+            // The pipes are still read while the child runs: a command that writes
+            // more than the pipe buffer (64 KiB on Linux) blocks until someone
+            // reads, so waiting for the child first would deadlock on any broad
+            // `rg` or build log.
             tokio::pin!(status_fut, stdout_task, stderr_task);
-            let status_res = (&mut status_fut).await;
+            let (mut stdout_done, mut stderr_done) = (false, false);
+            let status_res = loop {
+                tokio::select! {
+                    status = &mut status_fut => break status,
+                    () = &mut stdout_task, if !stdout_done => stdout_done = true,
+                    () = &mut stderr_task, if !stderr_done => stderr_done = true,
+                }
+            };
+            // Disarm immediately after a successful wait, before any await:
+            // the shell has been reaped and its PID may now be reused.
+            if status_res.is_ok() {
+                process_guard.finish();
+            }
             // Drain what is already in the pipe — a completed write is already in
             // the pipe buffer, so this is not a race — then stop, without waiting
             // for an EOF that may never come. A command whose own process is gone
             // should not be able to hold the call open.
-            let _ = tokio::time::timeout(
+            let drain = async {
+                tokio::join!(
+                    async {
+                        if !stdout_done {
+                            (&mut stdout_task).await;
+                        }
+                    },
+                    async {
+                        if !stderr_done {
+                            (&mut stderr_task).await;
+                        }
+                    },
+                );
+            };
+            tokio::pin!(drain);
+            if tokio::time::timeout(
                 std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS),
-                async {
-                    let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
-                },
+                &mut drain,
             )
-            .await;
+            .await
+            .is_err()
+            {
+                // Stop reads, not their futures: both decoders must finish and
+                // deliver already-read tails to callbacks and captured output.
+                stop_readers.cancel();
+                drain.await;
+            }
             status_res
         };
 
@@ -1104,11 +1487,6 @@ impl Shell for OsExecutionEnv {
         // already capped it.
         if timed_out {
             let _ = tokio::time::sleep(std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS)).await;
-        }
-
-        // Remove from tracked pids.
-        if let Some(pid) = pid {
-            self.active_pids.lock().await.remove(&pid);
         }
 
         // Resolution priority: timedOut → cancelled → status.
@@ -1156,6 +1534,46 @@ impl MutatingEnv for OsExecutionEnv {
 }
 
 /// Validate a timeout (seconds). Mirrors `resolveTimeoutMs` semantics.
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn os_backend_syncs_staged_file_and_publication_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = OsExecutionEnv::with_cwd(temp.path().to_path_buf());
+        env.write_file("staged", FileContent::Text("durable slice".into()), None)
+            .await
+            .unwrap();
+        env.sync_file("staged", false, None).await.unwrap();
+        env.sync_directory(".", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn os_writer_lease_persists_and_verifies_a_monotonic_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = OsExecutionEnv::with_cwd(temp.path().to_path_buf());
+        let first = env
+            .try_acquire_writer_lease("journal.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        first.verify_fence().unwrap();
+        drop(first);
+        let second = env
+            .try_acquire_writer_lease("journal.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        second.verify_fence().unwrap();
+        drop(second);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("journal.jsonl.lock")).unwrap(),
+            "2"
+        );
+    }
+}
+
 fn resolve_timeout(timeout: Option<f64>) -> Result<Option<std::time::Duration>, ExecutionError> {
     match timeout {
         None => Ok(None),

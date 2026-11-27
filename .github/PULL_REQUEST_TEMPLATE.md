@@ -1,7 +1,7 @@
 <!--
 Thanks for the PR. Keep the description focused on what changed and how you know
 it works. Delete any section that does not apply.
-Do not bump crate versions for a feature/fix PR; the automated Release PR manages
+Do not bump crate versions for a feature/fix PR; a maintainer-triggered Release PR manages
 the shared workspace version and release changelog.
 -->
 
@@ -65,4 +65,9 @@ boundary described in SECURITY.md.
 
 ## Related issues
 
-<!-- "Closes #123", "Refs #456". -->
+<!--
+Required. Link the issue this PR resolves with `Closes #123` (or `Closes
+https://github.com/bigfish1913/pi-rust/issues/123`). The "Require linked issue"
+check fails when no existing issue is referenced; it re-runs when you edit this
+description. Maintainer PRs and repository automation are exempt.
+-->

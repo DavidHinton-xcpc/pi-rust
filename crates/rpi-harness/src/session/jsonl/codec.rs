@@ -13,6 +13,9 @@
 //! - **lane mutation**: `{"kind":"lane","lane","leafId"?}`.
 //! - **fact mutation**: `{"kind":"fact","fact":"name","name"?}` or
 //!   `{"kind":"fact","fact":"label","targetId","label"?}`.
+//! - **checkpoint image**: an explicit bounded `HistoryCheckpoint` may be
+//!   carried in reserved header metadata; it replaces the mutation replay base
+//!   and is absent from ordinary v4 files.
 //!
 //! ## Decode validation (mirrors `codec.ts`)
 //!
@@ -35,8 +38,10 @@
 use serde_json::Value;
 
 use crate::session::jsonl::errors::{JsonlDecodeError, JsonlDecodeErrorKind};
-use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header};
-use crate::session::types::{JsonValue, LaneRecord, SessionMutation};
+use crate::session::jsonl::types::{
+    JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header, HISTORY_CHECKPOINT_METADATA_KEY,
+};
+use crate::session::types::{HistoryCheckpoint, JsonValue, LaneRecord, SessionMutation};
 
 // ---- whitelists (mirror codec.ts ENTRY_TYPES / RECORD_TYPES / OPERATION_KINDS) ----
 
@@ -72,6 +77,32 @@ pub fn parse_header(line: &str) -> Result<JsonlV4Header, JsonlDecodeError> {
     decode_header(line)
 }
 
+/// Decode the optional explicit checkpoint embedded in reserved v4 metadata.
+/// The default path remains unchanged when the key is absent.
+pub fn history_checkpoint(
+    header: &JsonlV4Header,
+) -> Result<Option<HistoryCheckpoint>, JsonlDecodeError> {
+    let Some(value) = header
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(HISTORY_CHECKPOINT_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Err(schema("has an invalid history checkpoint"));
+    }
+    let checkpoint: HistoryCheckpoint =
+        serde_json::from_value(value.clone()).map_err(|e| schema(e.to_string()))?;
+    checkpoint.validate().map_err(|e| schema(e.to_string()))?;
+    if checkpoint.history_identity.generation != header.history_generation() {
+        return Err(schema(
+            "history checkpoint generation does not match header",
+        ));
+    }
+    Ok(Some(checkpoint))
+}
+
 /// Serialize a header to its newline-terminated JSONL line. Mirrors TS
 /// `encodeHeader`.
 pub fn encode_header(header: &JsonlV4Header) -> String {
@@ -95,6 +126,7 @@ impl JsonlV4Header {
         Self {
             kind: super::types::HeaderKind,
             version: 4,
+            progress_format: None,
             id,
             created_at,
             cwd,
@@ -138,9 +170,17 @@ fn decode_header(line: &str) -> Result<JsonlV4Header, JsonlDecodeError> {
     let created_at = require_timestamp(&value, "createdAt")?;
     let cwd = require_string(&value, "cwd")?;
 
+    let progress_format = optional_string_field(&value, "progressFormat")?;
+    if progress_format
+        .as_deref()
+        .is_some_and(|format| format != super::progress::FORMAT)
+    {
+        return Err(schema("unsupported progress format"));
+    }
     Ok(JsonlV4Header {
         kind: super::types::HeaderKind,
         version: 4,
+        progress_format,
         id,
         created_at,
         cwd,
@@ -173,14 +213,18 @@ pub fn metadata_from_header(
 
 // ============================ mutations ============================
 
+#[cfg(test)]
+#[path = "owned_decode_tests.rs"]
+mod owned_decode_tests;
+
 /// Parse a mutation line into a [`SessionMutation`]. Mirrors TS `parseMutation`
 /// -> `decodeMutation`.
 pub fn parse_mutation(line: &str) -> Result<SessionMutation, JsonlDecodeError> {
     let value = parse_object(line)?;
     let seq = require_sequence(&value)?;
     match value.get("kind").and_then(|v| v.as_str()) {
-        Some("entry") => parse_entry_mutation(&value, seq),
-        Some("record") => parse_record_mutation(&value, seq),
+        Some("entry") => parse_entry_mutation(value, seq),
+        Some("record") => parse_record_mutation(value, seq),
         Some("lane") => parse_lane_mutation(&value, seq),
         Some("fact") => parse_fact_mutation(&value, seq),
         _ => Err(schema("has unknown mutation kind")),
@@ -284,14 +328,13 @@ pub fn encode_mutation(mutation: &SessionMutation) -> String {
 // ---- per-kind decode (mirror parseEntryMutation / parseRecordMutation / ...) ----
 
 fn parse_entry_mutation(
-    value: &serde_json::Map<String, Value>,
+    mut value: serde_json::Map<String, Value>,
     seq: u64,
 ) -> Result<SessionMutation, JsonlDecodeError> {
     // `lane` is optional (absent or null on the fork path).
-    let lane = match value.get("lane") {
-        None => None,
-        Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.clone()),
+    let lane = match value.shift_remove("lane") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s),
         _ => return Err(schema("has invalid lane")),
     };
 
@@ -306,7 +349,7 @@ fn parse_entry_mutation(
     }
 
     // timestamp must be a non-negative integer (mirrors `requireTimestamp`).
-    require_timestamp_map(value, "timestamp")?;
+    require_timestamp_map(&value, "timestamp")?;
 
     // `custom` entries must carry `customType`.
     if entry_type == "custom" {
@@ -315,11 +358,12 @@ fn parse_entry_mutation(
         }
     }
 
-    // Rebuild the flat entry object (drop `kind` + `lane`) and let the Entry's
-    // manual serde do the rest. `parentId` may be null (root entry) — preserved.
-    let entry_obj = strip_wrapper_keys(value, &["kind", "lane"]);
-    let entry: crate::session::types::Entry =
-        serde_json::from_value(Value::Object(entry_obj)).map_err(|e| schema(e.to_string()))?;
+    // Move the flat object into Entry instead of cloning its message tree.
+    // Keep relative key order: serde_json's private RawValue protocol can make
+    // the first retained key significant, so swap-removal is not equivalent.
+    value.shift_remove("kind");
+    let entry =
+        crate::session::types::Entry::from_json_object(value).map_err(|e| schema(e.to_string()))?;
 
     Ok(SessionMutation::Entry {
         seq,
@@ -330,7 +374,7 @@ fn parse_entry_mutation(
 }
 
 fn parse_record_mutation(
-    value: &serde_json::Map<String, Value>,
+    mut value: serde_json::Map<String, Value>,
     seq: u64,
 ) -> Result<SessionMutation, JsonlDecodeError> {
     let record_type = value
@@ -362,10 +406,10 @@ fn parse_record_mutation(
         }
     }
 
-    // `{kind:"record", ...record}` → drop `kind`, keep the rest as the record.
-    let record_obj = strip_wrapper_keys(value, &["kind"]);
+    // Preserve the relative key order while dropping only the wrapper.
+    value.shift_remove("kind");
     let record: LaneRecord =
-        serde_json::from_value(Value::Object(record_obj)).map_err(|e| schema(e.to_string()))?;
+        serde_json::from_value(Value::Object(value)).map_err(|e| schema(e.to_string()))?;
     let _ = seq; // seq lives inside the record's base; not re-stamped by decode.
     Ok(SessionMutation::Record { record })
 }
@@ -419,6 +463,11 @@ fn parse_fact_mutation(
 // ============================ shared field helpers ============================
 
 fn parse_object(line: &str) -> Result<serde_json::Map<String, Value>, JsonlDecodeError> {
+    if let Ok(map) = super::envelope::parse(line) {
+        return Ok(map);
+    }
+    // Preserve Value's private protocols and canonical syntax/schema errors,
+    // including non-object roots. This retries only already-read bytes.
     let value: Value = serde_json::from_str(line).map_err(|_| syntax("is not valid JSON"))?;
     match value {
         Value::Object(map) => Ok(map),
@@ -484,8 +533,8 @@ fn optional_string_field(
     }
 }
 
-/// Build a new object with the `wrapper` keys removed (mirrors the TS
-/// `const { kind, lane, ...rest } = value` destructure).
+/// Frozen wrapper helper used only by the legacy decoder in parity tests.
+#[cfg(test)]
 fn strip_wrapper_keys(
     value: &serde_json::Map<String, Value>,
     wrapper: &[&str],
@@ -516,7 +565,11 @@ fn schema(message: impl Into<String>) -> JsonlDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::jsonl::types::HeaderKind;
+    use crate::session::jsonl::types::{
+        HeaderKind, HISTORY_CHECKPOINT_METADATA_KEY, HISTORY_GENERATION_METADATA_KEY,
+    };
+    use crate::session::state::SessionState;
+    use crate::session::types::HistoryIdentity;
 
     fn header() -> JsonlV4Header {
         JsonlV4Header::new(
@@ -537,6 +590,61 @@ mod tests {
         assert_eq!(parsed.version, 4);
         assert_eq!(parsed.id, "sess-1");
         assert_eq!(parsed.cwd, "/cwd");
+    }
+
+    #[test]
+    fn checkpoint_metadata_round_trips_and_binds_generation() {
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 2,
+            })
+            .unwrap();
+        let mut value = header();
+        value.metadata = Some(
+            [
+                (
+                    HISTORY_GENERATION_METADATA_KEY.to_owned(),
+                    serde_json::json!(2),
+                ),
+                (
+                    HISTORY_CHECKPOINT_METADATA_KEY.to_owned(),
+                    serde_json::to_value(checkpoint).unwrap(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let parsed = parse_header(encode_header(&value).trim_end()).unwrap();
+        let restored = history_checkpoint(&parsed).unwrap().unwrap();
+        assert_eq!(restored.history_identity.generation, 2);
+    }
+
+    #[test]
+    fn checkpoint_metadata_rejects_header_generation_mismatch() {
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 2,
+            })
+            .unwrap();
+        let mut value = header();
+        value.metadata = Some(
+            [
+                (
+                    HISTORY_GENERATION_METADATA_KEY.to_owned(),
+                    serde_json::json!(3),
+                ),
+                (
+                    HISTORY_CHECKPOINT_METADATA_KEY.to_owned(),
+                    serde_json::to_value(checkpoint).unwrap(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let parsed = parse_header(encode_header(&value).trim_end()).unwrap();
+        assert!(history_checkpoint(&parsed).is_err());
     }
 
     #[test]

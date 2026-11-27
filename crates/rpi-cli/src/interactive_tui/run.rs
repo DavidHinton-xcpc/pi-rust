@@ -149,6 +149,21 @@ pub(super) fn reconcile_streamed_assistant_completion(
 /// `AgentEvent` drain task renders the response live and the completed outcome
 /// reconciles its final snapshot. When false (no `event_rx`), this falls back
 /// to the blocking await-final-text path.
+/// The TUI message for a refused session write.
+///
+/// Refusing to save is not a provider problem: retrying fails the same way, and
+/// the messages on screen are the only copy. The advice is accurate because
+/// `export_session` appends `AgentHarness::unsaved_messages` to the file — a
+/// refused append never becomes a session entry, so an export that read only the
+/// log would silently drop exactly the turns this warning is about.
+pub(super) fn tui_session_storage_notice(error: &rpi_harness::result::HarnessError) -> String {
+    format!(
+        "The conversation could not be saved: {error}. Your messages are still on \
+         screen, and /export writes the unsaved ones into the exported file — do \
+         that before exiting."
+    )
+}
+
 pub(super) async fn run_prompt_streaming(
     lane: &Arc<dyn AgentLane>,
     prompt: &str,
@@ -201,16 +216,40 @@ pub(super) async fn run_prompt_streaming(
     }
 
     state.set_status(RunStatus::Idle);
+    // Let the run's own writes reach the disk before this function returns.
+    // A forced exit (`emergency_exit`) bypasses the shutdown sequence entirely,
+    // and it is only taken while a run is in flight — i.e. exactly when there is
+    // work that has not been persisted yet. Draining here bounds that window to
+    // one run instead of the whole session.
+    lane.drain_session().await;
     // Guarantee the pending-messages display reconciles at the end of every
     // run/prompt — covers aborts and the non-streaming path, where no
     // `AgentEnd` event necessarily reaches the drain task.
     refresh_pending_messages(state, lane).await;
+    // The blocking path has no drain task, so `AgentEnd` never runs and this is
+    // the only place its write failures can surface.
+    if super::events::report_write_failures(&state.notice_container(), lane) {
+        state
+            .history_page
+            .unsaved
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
-    // Authoritative context-badge fallback. The streaming drain normally
-    // updates it from `MessageEnd`, but a `Lagged` broadcast or the blocking
-    // path can skip that event; reconcile from the run outcome so the badge
-    // always reflects the newest real response.
+    // Footer repair for a dropped `MessageEnd` used to live here, but that call
+    // raced the drain: the final assistant message can already be in the log
+    // while its `MessageEnd` is still queued, so the rebuild counted turns the
+    // drain was about to count again — and a distinct turn with the same
+    // timestamp and usage is indistinguishable from that delayed duplicate by
+    // content alone. Reconciliation now runs inside the drain's `AgentEnd`
+    // handler, which the FIFO broadcast turns into a consumption barrier: every
+    // event queued before it has been applied, so a `set_usage` rebuild can
+    // never be followed by a delayed duplicate of what it counted.
     if let Ok(result) = &outcome {
+        // The context badge keeps its run-outcome fallback: it shows one turn's
+        // measurement (set semantics, nothing accumulated), so racing the drain
+        // costs nothing — the drain's own `MessageEnd` handling just overwrites
+        // it. On the non-streaming path there is no drain at all, and this is
+        // the only place the badge gets a value from.
         let final_message: Option<&AssistantMessage> = match &result.outcome {
             HarnessRunOutcome::Completed { final_message, .. }
             | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),
@@ -242,12 +281,12 @@ pub(super) async fn run_prompt_streaming(
                         .as_ref()
                         .and_then(|m| m.error_message.clone())
                         .unwrap_or_else(|| format!("{error:?}"));
-                    add_error_message(&state.chat_container, &msg);
+                    add_error_message(&state.notice_container(), &msg);
                 }
             }
             HarnessRunOutcome::Suspended { .. } => {
                 add_error_message(
-                    &state.chat_container,
+                    &state.notice_container(),
                     "Run suspended (deferred) — resume is not supported in v1.",
                 );
             }
@@ -255,7 +294,7 @@ pub(super) async fn run_prompt_streaming(
                 // Aborted runs render their own partial/final message via the
                 // stream; only add a note on the blocking fallback path.
                 if !streaming {
-                    add_error_message(&state.chat_container, "Request aborted.");
+                    add_error_message(&state.notice_container(), "Request aborted.");
                     let _ = final_message; // (rendered by the stream in streaming mode)
                 }
             }
@@ -263,21 +302,31 @@ pub(super) async fn run_prompt_streaming(
                 if !streaming {
                     let text = assistant_text(final_message);
                     if !text.is_empty() {
-                        add_assistant_message_blocking(
-                            &state.chat_container,
-                            &text,
-                            state.markdown_transformer(),
-                        );
+                        add_assistant_message_for_state(state, &text);
                         *state.last_assistant_text.lock().unwrap() = text;
                     }
                 }
             }
         },
         Err(e) => {
-            add_error_message(&state.chat_container, &e.to_string());
+            // A refused session write is not a provider problem: retrying will fail
+            // the same way, and the transcript on screen is the only copy left.
+            if e.tag() == rpi_harness::result::HarnessErrorTag::SessionStorage {
+                state
+                    .history_page
+                    .unsaved
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                add_error_message(&state.notice_container(), &tui_session_storage_notice(&e));
+            } else {
+                add_error_message(&state.notice_container(), &e.to_string());
+            }
         }
     }
 
+    // Settle only after the producer has drained its session writer. The
+    // AgentEnd event is delivered concurrently and may otherwise reload the
+    // previous page, clearing the just-rendered response.
+    history::settle(state, tui);
     tui.request_render(false);
 }
 
@@ -314,6 +363,9 @@ pub(super) async fn run_skill_streaming(
     }
 
     state.set_status(RunStatus::Idle);
+    // Skill runs also emit AgentEnd while their session writes may still be
+    // queued. Wait for the writer before replacing the live transcript.
+    lane.drain_session().await;
     refresh_pending_messages(state, lane).await;
 
     match outcome {
@@ -322,22 +374,18 @@ pub(super) async fn run_skill_streaming(
                 if !streaming {
                     let text = assistant_text(&final_message);
                     if !text.is_empty() {
-                        add_assistant_message_blocking(
-                            &state.chat_container,
-                            &text,
-                            state.markdown_transformer(),
-                        );
+                        add_assistant_message_for_state(state, &text);
                         *state.last_assistant_text.lock().unwrap() = text;
                     }
                 }
             }
             HarnessRunOutcome::Aborted { .. } => {
                 if !streaming {
-                    add_error_message(&state.chat_container, "Skill invocation aborted.");
+                    add_error_message(&state.notice_container(), "Skill invocation aborted.");
                 }
             }
             HarnessRunOutcome::Suspended { .. } => add_error_message(
-                &state.chat_container,
+                &state.notice_container(),
                 "Skill invocation suspended (deferred) — resume is not supported in v1.",
             ),
             HarnessRunOutcome::Failed {
@@ -350,58 +398,89 @@ pub(super) async fn run_skill_streaming(
                         .as_ref()
                         .and_then(|m| m.error_message.clone())
                         .unwrap_or_else(|| format!("{error:?}"));
-                    add_error_message(&state.chat_container, &message);
+                    add_error_message(&state.notice_container(), &message);
                 }
             }
         },
-        Err(error) => add_error_message(&state.chat_container, &error.to_string()),
+        Err(error) => add_error_message(&state.notice_container(), &error.to_string()),
     }
+    // Settle only after the producer has drained its session writer. The
+    // AgentEnd event is delivered concurrently and may otherwise reload the
+    // previous page, clearing the just-rendered response.
+    history::settle(state, tui);
     tui.request_render(false);
 }
 
 /// `/compact`: drive a compaction on the lane (mirrors TS `app.compact`).
 /// Reports the outcome as a transcript note; the harness progress watcher
 /// displays the compaction indicator while the summary is generated.
+///
+/// Returns whether a compaction entry was actually written, so the caller can
+/// report `SessionCompact` only when the branch changed (a declined or aborted
+/// compaction leaves it untouched).
 pub(super) async fn run_compact(
     lane: &Arc<dyn AgentLane>,
     tui: &Arc<TuiAltScreen>,
     state: &Arc<TuiState>,
-) {
+) -> bool {
     state.set_status(RunStatus::Working);
     tui.request_render(false);
-    match lane.compact(None).await {
-        Ok(_) => {
-            add_note_message(&state.chat_container, "Conversation compacted.");
+    let compacted = match lane.compact(None).await {
+        Ok(result) => {
+            add_note_message(&state.notice_container(), "Conversation compacted.");
             // The last assistant usage describes the pre-compaction context;
             // reset the badge to `?` until the next response reports the new
             // (much smaller) prompt size — mirrors pi's `percent: null`.
             state.footer.set_context_tokens(None);
+            matches!(
+                result.outcome,
+                rpi_harness::agent_harness::CompactionOutcome::Completed { .. }
+            )
         }
         Err(e) => {
-            add_error_message(&state.chat_container, &format!("Compact failed: {e}"));
+            add_error_message(&state.notice_container(), &format!("Compact failed: {e}"));
+            false
         }
-    }
+    };
     state.set_status(RunStatus::Idle);
+    history::settle(state, tui);
     tui.request_render(false);
+    compacted
+}
+
+/// Copy the fullscreen mouse selection, if present. `Some(false)` still
+/// means the selection handled the action: never silently copy another source
+/// when the clipboard write fails. Injection keeps tests off the OS clipboard.
+pub(super) fn copy_mouse_selection_with(
+    tui: &TuiAltScreen,
+    copy: impl FnOnce(&str) -> bool,
+) -> Option<bool> {
+    tui.selection_text().map(|text| copy(&text))
 }
 
 /// `/copy`: copy the last assistant reply to the clipboard. Best-effort —
 /// when no clipboard is available (or the `clipboard` feature is off), prints a
 /// hint instead. Mirrors the TS `/copy` (copies `this.messages.at(-1)` text).
-pub(super) fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) {
+pub(super) fn copy_last_assistant(state: &Arc<TuiState>) {
     let text = state.last_assistant_text.lock().unwrap().clone();
     if text.is_empty() {
-        add_note_message(chat, "Nothing to copy yet — no assistant reply captured.");
+        add_note_message(
+            &state.notice_container(),
+            "Nothing to copy yet — no assistant reply captured.",
+        );
         return;
     }
     if copy_to_clipboard(&text) {
-        add_note_message(chat, "Copied last reply to the clipboard.");
+        add_note_message(
+            &state.notice_container(),
+            "Copied last reply to the clipboard.",
+        );
     } else {
         // Clipboard unavailable — print the text to the transcript so the user
         // can select/copy it manually (degrades gracefully in headless envs).
         let preview: String = text.chars().take(200).collect();
         add_note_message(
-            chat,
+            &state.notice_container(),
             &format!(
                 "Clipboard unavailable. Last reply: {preview}{}",
                 if text.chars().count() > 200 {
@@ -414,15 +493,36 @@ pub(super) fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) 
     }
 }
 
+/// Run `f` against one process-lifetime clipboard instance.
+///
+/// On X11 the clipboard is served by the process that owns it: dropping the
+/// `arboard::Clipboard` instance destroys the serving window, so a
+/// create-write-drop pattern loses the data whenever no desktop clipboard
+/// manager took it over (arboard only waits 100ms for a `CLIPBOARD_MANAGER`
+/// handoff, and sessions like LXQt/Openbox run none). The instance therefore
+/// lives in a `static` and outlives every copy; Windows and macOS keep
+/// OS-owned clipboards and are immune, but sharing one handle is harmless
+/// there too, so all platforms take the same path. A failed first creation
+/// (headless machine) is retried on later calls, matching the previous
+/// per-call behavior.
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
+fn with_shared_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> {
+    static SHARED: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+    let mut slot = SHARED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = arboard::Clipboard::new().ok();
+    }
+    Some(f(slot.as_mut()?))
+}
+
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature
 /// (`arboard`) on non-Android platforms; otherwise returns `false` so the
 /// caller degrades to a hint.
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 pub(super) fn copy_to_clipboard(text: &str) -> bool {
-    match arboard::Clipboard::new() {
-        Ok(mut cb) => cb.set_text(text).is_ok(),
-        Err(_) => false,
-    }
+    with_shared_clipboard(|clipboard| clipboard.set_text(text).is_ok()).unwrap_or(false)
 }
 
 #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
@@ -435,8 +535,7 @@ pub(super) fn copy_to_clipboard(_text: &str) -> bool {
 /// on Android the OS owns clipboard access so this degrades to `None`.
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 pub(super) fn read_clipboard_text() -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    clipboard.get_text().ok()
+    with_shared_clipboard(|clipboard| clipboard.get_text().ok()).flatten()
 }
 
 #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
@@ -449,8 +548,9 @@ pub(super) fn read_clipboard_text() -> Option<String> {
 /// builds free of platform clipboard dependencies.
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 pub(super) fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    let image = match clipboard.get_image() {
+    let image = with_shared_clipboard(|clipboard| clipboard.get_image())
+        .ok_or_else(|| "clipboard unavailable".to_string())?;
+    let image = match image {
         Ok(image) => image,
         Err(_) => return Ok(None),
     };
@@ -473,7 +573,9 @@ pub(super) fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageConten
     }
     Ok(Some(rpi_ai::types::ImageContent {
         kind: rpi_ai::types::ImageContentType,
-        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        data: base64::engine::general_purpose::STANDARD
+            .encode(bytes)
+            .into(),
         mime_type: "image/png".into(),
     }))
 }
@@ -570,7 +672,7 @@ pub(super) fn attach_pasted_images(state: &Arc<TuiState>, text: &str) -> bool {
         state.queue_image(image);
     }
     add_note_message(
-        &state.chat_container,
+        &state.notice_container(),
         &format!("Attached {count} image(s) to the next prompt."),
     );
     true
@@ -708,7 +810,7 @@ pub(super) fn add_image_preview(
     image: &rpi_ai::types::ImageContent,
     show: bool,
 ) {
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) {
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&*image.data) {
         // Kitty's f=100 payload must be PNG, regardless of the model MIME type.
         let bytes = if image.mime_type == "image/png" {
             bytes
@@ -734,6 +836,17 @@ pub(super) fn add_image_preview(
 #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
 pub(super) fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
     Ok(None)
+}
+
+/// Keep the non-streaming fallback in the same live slot as streaming output.
+/// In particular, running a prompt while browsing an old page must not mutate it.
+pub(super) fn add_assistant_message_for_state(state: &TuiState, text: &str) {
+    let container = if state.history_page.is_bound() {
+        &state.history_page.active
+    } else {
+        &state.chat_container
+    };
+    add_assistant_message_blocking(container, text, state.markdown_transformer());
 }
 
 /// Blocking fallback (no `event_rx`): render the final assistant text as a

@@ -116,7 +116,7 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<UiEvent> {
             error: error.clone(),
         }),
         AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => None,
-        AgentEvent::MessageStart { message } => match message {
+        AgentEvent::MessageStart { message, .. } => match message {
             AgentMessage::Assistant(a) => Some(UiEvent::AssistantStart {
                 blocks: assistant_blocks(a),
             }),
@@ -126,7 +126,7 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<UiEvent> {
             blocks: assistant_blocks(message),
             tool_calls: assistant_tool_calls(message),
         }),
-        AgentEvent::MessageEnd { message } => match message {
+        AgentEvent::MessageEnd { message, .. } => match message {
             AgentMessage::Assistant(a) => Some(UiEvent::AssistantEnd {
                 blocks: assistant_blocks(a),
             }),
@@ -175,7 +175,7 @@ pub fn assistant_blocks(msg: &AssistantMessage) -> Vec<AssistantBlock> {
             Content::Text(t) => Some(AssistantBlock::Text(t.text.clone())),
             Content::Thinking(t) => Some(AssistantBlock::Thinking(t.thinking.clone())),
             Content::Image(image) => base64::engine::general_purpose::STANDARD
-                .decode(&image.data)
+                .decode(&*image.data)
                 .ok()
                 .filter(|data| !data.is_empty())
                 .map(AssistantBlock::Image),
@@ -244,6 +244,7 @@ impl RemoteDriver {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut session = RemoteSession::new();
+            let mut mapper = RemoteEventMapper::default();
             let mut last_error: Option<String> = None;
             while let Some(line) = lines.recv().await {
                 session.apply_line(&line);
@@ -255,7 +256,7 @@ impl RemoteDriver {
                     }
                 }
                 if let Ok(event) = serde_json::from_value::<RemoteEvent>(line) {
-                    if let Some(event) = map_remote_driver_event(&event) {
+                    if let Some(event) = mapper.map(&event) {
                         let _ = tx.send(event);
                     }
                 }
@@ -330,6 +331,19 @@ fn status_of(session: &RemoteSession) -> DriverStatus {
     }
 }
 
+/// Stateful wire-to-UI adapter used by the actual remote event pump. Keep the
+/// stateless projection below available for callers with complete snapshots.
+#[derive(Default)]
+struct RemoteEventMapper {
+    messages: crate::remote::message_accumulator::MessageAccumulator,
+}
+
+impl RemoteEventMapper {
+    fn map(&mut self, event: &RemoteEvent) -> Option<DriverEvent> {
+        map_remote_driver_event(&self.messages.apply(event))
+    }
+}
+
 /// Preserve dialog messages alongside transcript events; they are not part
 /// of the transcript and must reach the shell's modal input slot.
 fn map_remote_driver_event(event: &RemoteEvent) -> Option<DriverEvent> {
@@ -371,7 +385,7 @@ pub fn map_remote_event(event: &RemoteEvent) -> Option<UiEvent> {
             delay_ms: *delay_ms,
             error: error.clone(),
         }),
-        RemoteEvent::MessageStart { message } => {
+        RemoteEvent::MessageStart { message, .. } => {
             if message_role(message) != "assistant" {
                 return None;
             }
@@ -388,7 +402,7 @@ pub fn map_remote_event(event: &RemoteEvent) -> Option<UiEvent> {
                 tool_calls: tool_calls_from_value(message),
             })
         }
-        RemoteEvent::MessageEnd { message } => {
+        RemoteEvent::MessageEnd { message, .. } => {
             if message_role(message) != "assistant" {
                 return None;
             }
@@ -614,6 +628,10 @@ fn parse_thinking_level_name(name: &str) -> Option<ThinkingLevel> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "remote/compatibility_tests.rs"]
+mod compact_compatibility_tests;
 
 #[cfg(test)]
 mod tests {

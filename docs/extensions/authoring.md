@@ -16,6 +16,12 @@
 | 运行环境 | 本机动态库，当前用户权限 |
 | 适用场景 | 本地工具、系统集成、性能敏感或纯 Rust 项目 |
 
+推荐用 `rpi extension update [name]` 更新扩展：省略名称时更新全部项目链接扩展和
+全局 registry/prebuilt 扩展，指定名称时只更新匹配项。更新保留原来的 Cargo 构建
+后端或显式 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+旧命令 `rpi package update [name]` 仍兼容；项目链接管理命令仍为
+`rpi package link`、`rpi package list`、`rpi package unlink`，不改名。
+
 扩展应遵循能力检测：只调用宿主明确提供的 capability，检查 `PluginApi`
 对应注册槽位是否为 `Some`。缺少能力时返回清晰错误并优雅降级，不要 panic、
 空指针或依赖 `undefined` 语义。
@@ -132,6 +138,27 @@ rpi_plugin_sdk::export_plugin!(|api| {
 返回结构化错误，不会进入分发。runtime action 使用 SDK 的 `RuntimeActionId`
 定义（含 `GetCliFlag`、`UiDialog`），不要自行假定数字范围。
 
+### 不写 unsafe 也能写插件
+
+ABI 的字符串与步骤返回都是裸指针，SDK 提供一组宏把契约收在自己这一侧。用它们写出的
+工具、命令、事件、渲染器和 runtime action 代码可以整体开 `#![deny(unsafe_code)]`：
+
+| 形状 | 宏 |
+| --- | --- |
+| 事件回调 | `event_handler!` |
+| 命令 / 提示 / 资源发现回调 | `string_handler!` |
+| 工具 `execute` | `execute_handler!` |
+| 调用 runtime action | `call_action!(api, id, args)` → `(rc, body)` |
+| 读 ABI 字符串（不释放） | `stb_text!(value)` |
+| 读并回收 ABI 字符串 | `stb_take!(value, free)` |
+| 回收工具步骤结果 | `take_step!(result)` / `take_step_with!(result, free)` |
+
+它们不改 C ABI，只是把 `unsafe` 收敛到 SDK 内部。仍然需要自己写 `unsafe` 的有三种：
+手写 trampoline；`ProviderRequestFn` / `ProviderStreamRequestFn`（读请求、写 `out`，见
+`examples/plugin-stub/src/lib.rs`）；以及需要在每次调用里堆分配状态的工具 handle
+（`Box::into_raw` / `from_raw`）。`crates/rpi-plugin-sdk/tests/safe_macros.rs` 在
+`#![deny(unsafe_code)]` 下覆盖了宏能覆盖的路径。
+
 ### 独立子任务
 
 `GetExecutionContext` 返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
@@ -139,6 +166,24 @@ rpi_plugin_sdk::export_plugin!(|api| {
 在独立内存会话中继承有效 provider 绑定、项目工具和父审批 UI，不重入父 lane。
 工具范围只能缩小，预算和取消由宿主管理。旧宿主不支持时必须明确报错，
 不能静默退回重新解析默认配置的子进程。详见 [子 agent 协议](subagents.md)。
+
+### 输入框草稿与补全
+
+Pi 的 `ui.getEditorText()`、`ui.addAutocompleteProvider()` 与
+`RegisteredCommand.getArgumentCompletions` 在 rpi 侧对应三条通道：
+
+- `GetEditorText`（32）：`{}` → `{"text":"...","cursor":N}`（`cursor` 为字节偏移）。
+  永不报错：无编辑器的宿主返回空草稿，按「没有草稿」退化而不是报错。
+  `EditorChange` 事件仍按设计不携带文本，不要用它攒本地副本。
+- `api.register_autocomplete_provider`：查询 `{"text","cursor","line","linePrefix"}`，
+  返回 `{"items":[{"text","label"?,"description"?,"insertSpace"?,"isDirectory"?}]}`。
+  返回 `1` 或空列表表示「没有意见」，宿主管继续问下一个插件并最终回落内置
+  file/slash provider；插件 provider 排在内置之前。
+- `api.register_command_completions`：先注册命令，再为该命令挂参数补全。参数
+  `{"argumentPrefix":"con"}`，返回 `0`/`1`（命令不属于本插件）/`-1`（不在注册期）。
+
+两个槽位都追加在 vtable 尾部、不改 ABI 版本；旧宿主为 `None` 时跳过注册，
+不能因此中止插件注册。补全在 TUI 线程上每帧询问，handler 必须线程安全且快速返回。
 
 ## 4. 工具生命周期：execute → poll → cancel → destroy
 
@@ -193,7 +238,10 @@ rpi_plugin_sdk::export_plugin!(|api| {
 通过 `api.register_event_handler` 按 `EventTag`（36 类）订阅：
 
 - **会话生命周期**：`SessionStart`、`SessionBeforeSwitch`、`SessionBeforeFork`、
-  `SessionBeforeCompact`、`SessionCompact`、`SessionShutdown` 等。
+  `SessionBeforeCompact`、`SessionCompact`、`SessionBeforeTree`、`SessionTree`、
+  `SessionShutdown` 等。这些标签在 rpi 里都不带 payload（`data_text()` 为空串），
+  能用它们判断“分支变了”，但拿不到是新建、fork 还是导航；详见
+  [生命周期事件](lifecycle.md)。
 - **Agent 循环**：`BeforeAgentStart`、`AgentStart`、`AgentEnd`、`AgentSettled`、
   `TurnStart`、`TurnEnd`、`MessageStart`/`MessageUpdate`/`MessageEnd`、
   `ToolExecutionStart`/`Update`/`End`、`ToolCall`、`ToolResult`、`UserBash`、`Input`。
@@ -216,6 +264,10 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 单个 handler 报错不中止 fan-out。`out` 是插件拥有的 `StbString`，宿主通过插件
 注册时给的 `plugin_free_string` 回收。
 
+`themePaths` 是具体的主题 JSON 文件路径（pi 契约，与 skills 的 dir-or-file 双兼容
+不同），会按文件名（stem）并入 `/theme` 选择器，优先级在静态主题目录之后。路径
+不归属到具体扩展（v1 差异）：同名冲突时静态目录主题胜出，诊断信息只能给出路径。
+
 ### Provider 与渲染器
 
 推理 provider 的目录、认证、执行绑定与验收要求见本文末尾的「Provider 接入规范」。
@@ -223,6 +275,48 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 `api.register_provider` 注入自定义 LLM Provider（`provider_id`/`base_url`/
 `api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
 `register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
+
+渲染器的 JSON 契约是：markdown transformer 接收并返回 `{"markdown":"..."}`；message
+renderer 接收消息或自定义消息 envelope（例如
+`{"customType":"token-usage","usage":{...}}`）；entry renderer 接收
+`{"customType":"...","data":...}`。message/entry renderer 返回
+`{"text":"...","markdown":true|false}` 或 `{"lines":["..."]}`。输出是一个
+transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿主通过注册时提供的
+`plugin_free_string` 回收。
+
+渲染器**只在交互式 TUI 中调用**：`--mode rpc` 和 `-p` 不调用任何渲染器，渲染结果也不进入
+事件流，所以远程客户端要自己渲染 transcript。会话建立时 stderr 上的
+`renderers: N markdown-transform, N message-render, N entry-render (active)` 只报告
+注册数量，不代表当前模式会用到它们。
+
+三个槽位的合并语义不同，不要混用：
+
+- `register_message_renderer` / `register_entry_renderer`：按注册顺序逐个尝试，
+  **第一个返回 `rc == 0` 且 JSON 可解析的响应胜出**，其余不再调用；返回非 0 或响应不可
+  解析表示「这个类型我不处理」，宿主继续问下一个 renderer。所以「不处理」要用非 0 返回码
+  表达，返回空对象不算弃权。
+- `register_markdown_transformer`：**链式**，每个 transformer 的输出是下一个的输入，最后
+  一个的输出交给 Markdown 渲染。返回非 0 或 panic 会**终止整条链**并保留当前文本；响应里
+  没有字符串 `markdown` 字段时只跳过这一个 transformer，链继续。
+
+其余固定行为：
+
+- entry renderer 的 `data` 可能为 `null`（自定义条目没带 `data` 时），不要假定它是对象。
+- TUI 在调用 entry renderer **之前**就跳过 `plan-mode`、`todo`、`todo-state`，为这三个
+  type 注册渲染器不会被调用。
+- `{"lines":[…]}` 会以 `\n` 拼成**一个**纯文本行，不是每行一个组件；需要多行时自己在
+  `text` 里带换行。
+- entry renderer 可返回 `rc == 0` 与 `{"display":false}`，明确表示「已处理但隐藏」：
+  不添加组件或空行，不执行原始条目兜底，也不再询问后续 renderer。仅布尔值 `false`
+  生效，且优先于 `text`/`lines`；缺省、`true`、字符串 `"false"`、`null` 等保持旧行为。
+  非 0 返回码仍是「不处理」，不能用来隐藏。此字段仅适用于 entry renderer，不改变
+  message renderer、Markdown transformer、持久化或模型上下文。旧宿主可能忽略该字段
+  并显示兜底文本；插件未加载时也维持原有兜底。该能力不新增实时 entry 事件。
+- message renderer 的响应既没有 `text` 也没有 `lines` 时，TUI 降级显示 `[customType]`；
+  entry renderer 除显式 `display:false` 外，响应缺这两个字段时改由宿主自己的条目文案显示。
+- message renderer 除渲染自定义消息外，还会以
+  `{"customType":"token-usage","usage":{...}}` 被调用一次以生成用量文本，因此要能容忍这个
+  payload（没有匹配的 type 时返回非 0）。
 
 `api.register_streaming_provider` 注入**流式** Provider。注册时同样提供 provider ID、
 端点、API style 和字符串释放回调；流式 request fn 另有逐块回调 `emit`、
@@ -241,6 +335,13 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 `thinking_start`/`thinking_delta`/`thinking_end`、
 `toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 会被忽略
 （向前兼容）。
+
+`toolcall_end` 可带可选的 `recorded` 字段，表示该调用已在远端执行过：宿主把它当作已完成的
+工具结果，绝不在本地再次执行（形状与版本规则见 `docs/rpi-tool/extension-authoring.md`）。
+`capabilities.recordedToolCalls` 是宿主能解码的最高 `recorded` 版本，插件只能在它 `>= 1` 时
+发送 `recorded`；旧宿主没有这个键，会忽略 `recorded` 并执行调用。SDK 桥接会自动执行这条检查。
+流中带过 `recorded` 的调用在 `out` 中必须是同一 `id`、`name` 和 `arguments`：缺少记录时宿主
+会补上，冲突或缺失则这一轮以 `Error` 结束。
 
 两点约定：
 
@@ -517,6 +618,21 @@ rpi auth login --provider <id>
 `rpi auth logout --provider <id>` 会先调用 `revoke`，成功后才删除本地凭证。插件不得
 把 token 写入普通事件、模型消息或日志。
 
+### 取消 action（可选）
+
+插件可以用 `register_oauth_provider_cancellable` 注册 action callback。该回调额外接收
+`OAuthRequestControl`：调用方放弃等待时，宿主把 `is_cancelled` 置为非零（当前是 TUI 的
+provider 登录流程按 Esc，以及 `/logout` 的撤销）。插件应在长时间等待（网络请求、等待本地
+回调）时调用 `OAuthRequestControl::poll_cancelled` 轮询，并尽快返回非零状态码。宿主对已取消
+的调用返回取消错误，并丢弃插件已经产生的输出，因此取消之后到达的 credential 不会被保存。
+
+`OAuthRequestControl` 以 `struct_size` 开头；`poll_cancelled` 只读取宿主提供的字段，插件无需
+自行检查布局。Rust 插件用 `rpi_plugin_sdk::register_oauth_provider_cancellable` 注册：旧宿主没有
+该槽位时，它回退到 `register_oauth_provider`，兼容回调只能无法取消地运行完成。已有插件继续使用
+`register_oauth_provider`，无需重新编译。
+
+目前没有取消入口的是 `rpi auth login`（Ctrl-C 直接结束进程）和 RPC `oauth` 命令（同步执行）。
+
 ## Provider 接入规范
 
 统一生产包为 `rpi-providers`，一个安装入口包含 DeepSeek、OpenRouter、llama.cpp 和 Proxy。
@@ -524,7 +640,7 @@ rpi auth login --provider <id>
 provider ID、目录与凭据继续独立。单 provider 教学样例才使用 `export_provider!`。
 
 完整规范：[Provider 接入规范](provider-integration.md)。创建推理扩展时优先复制
-正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
+正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
 
 ### 方式与目录
 
@@ -588,13 +704,13 @@ OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负�
 UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
 覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
 真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
-正式统一包位于独立的 [rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+正式统一包位于独立的 [rpi-extension 项目](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，
 保留 `deepseek` ID，声明 `DEEPSEEK_API_KEY`，并通过 `requiresReasoningContent` 支持工具续轮。
 
-在 rpi-package 仓库运行正式 package 的离线验证：
+在 rpi-extension 仓库运行正式 package 的离线验证：
 
 ```sh
-cd /path/to/rpi-package
+cd /path/to/rpi-extension
 cargo build -p rpi-providers
 cargo test -p rpi-providers --test streaming
 cargo test -p rpi-providers --test host

@@ -127,6 +127,11 @@ pub struct Settings {
     #[serde(default)]
     pub http_proxy: Option<String>,
 
+    /// Optional HTTPS base URL for release archive downloads. GitHub manifests
+    /// remain authoritative and the CDN is only a transport accelerator.
+    #[serde(default)]
+    pub cdn_base_url: Option<String>,
+
     /// Retry policy for assistant turns. Mirrors upstream `retry`; the fields
     /// map 1:1 onto the harness's `RetryPolicy`.
     #[serde(default)]
@@ -184,6 +189,10 @@ pub struct Settings {
     /// Hide the body of thinking blocks while retaining a compact label.
     #[serde(default)]
     pub hide_thinking_block: Option<bool>,
+    /// Show `/skill:name` in command discovery (default true). Manual commands
+    /// remain available when false; unrelated to disable-model-invocation.
+    #[serde(default)]
+    pub enable_skill_commands: Option<bool>,
     /// Suppress the interactive startup header and resource summary.
     /// Update checks remain enabled, matching upstream.
     #[serde(default)]
@@ -239,6 +248,11 @@ pub struct Settings {
     /// Absent uses 300 seconds; zero disables it; the CLI flag takes priority.
     #[serde(default)]
     pub stream_idle_timeout: Option<u64>,
+    /// upstream's `thinkingBudgets`: token budgets for the minimal/low/medium/
+    /// high levels on budget-based thinking models. Levels left out keep the
+    /// built-in budgets.
+    #[serde(default)]
+    pub thinking_budgets: Option<rpi_ai::ThinkingBudgets>,
 }
 
 /// upstream's `terminal` settings block (`TerminalSettings`). Only the fields
@@ -362,7 +376,12 @@ impl Settings {
 /// (not an error). Malformed JSON ⇒ `ConfigError::Json`. Tolerates `//` line
 /// comments (a copied pi settings.json may contain them).
 pub fn load_settings() -> Result<Settings, ConfigError> {
-    let path = config::settings_path()?;
+    load_settings_at(None)
+}
+
+/// [`load_settings`] against an explicit agent home.
+pub(crate) fn load_settings_at(agent_dir: Option<&Path>) -> Result<Settings, ConfigError> {
+    let path = config::settings_path_at(agent_dir)?;
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_settings(&text).map_err(|e| ConfigError::Json {
             path: path.clone(),
@@ -413,7 +432,16 @@ pub fn load_effective_model_settings(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<Settings, ConfigError> {
-    let mut effective = load_settings()?;
+    load_effective_model_settings_at(None, cwd, project_trusted)
+}
+
+/// [`load_effective_model_settings`] against an explicit agent home.
+pub(crate) fn load_effective_model_settings_at(
+    agent_dir: Option<&Path>,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<Settings, ConfigError> {
+    let mut effective = load_settings_at(agent_dir)?;
     if project_trusted {
         if let Some((_, project)) = load_active_project_settings(cwd)? {
             if project.default_provider.is_some() {
@@ -502,8 +530,37 @@ fn parse_settings_value(text: &str) -> Result<serde_json::Value, serde_json::Err
 /// parser as [`load_settings`]. Missing file ⇒ a fresh object. Existing files
 /// that cannot be parsed safely are left untouched and reported as errors.
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
-    let path = config::settings_path().map_err(|e| e.to_string())?;
+    save_settings_at(None, settings)
+}
+
+/// [`save_settings`] against an explicit agent home.
+pub(crate) fn save_settings_at(
+    agent_dir: Option<&Path>,
+    settings: &Settings,
+) -> Result<(), String> {
+    let path = config::settings_path_at(agent_dir).map_err(|e| e.to_string())?;
     save_settings_to_path(settings, &path, None)
+}
+
+impl config::AgentHome {
+    /// Load this home's `settings.json` (missing file = defaults).
+    pub fn settings(&self) -> Result<Settings, ConfigError> {
+        load_settings_at(self.explicit_path())
+    }
+
+    /// Global -> trusted-project model-selection settings for this home.
+    pub fn effective_model_settings(
+        &self,
+        cwd: &Path,
+        project_trusted: bool,
+    ) -> Result<Settings, ConfigError> {
+        load_effective_model_settings_at(self.explicit_path(), cwd, project_trusted)
+    }
+
+    /// Persist this home's `settings.json`, preserving unknown fields.
+    pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
+        save_settings_at(self.explicit_path(), settings)
+    }
 }
 
 /// Persist project-scoped settings under `.rpi/settings.json`.
@@ -546,6 +603,7 @@ fn save_settings_to_path(
             settings.default_thinking_level.as_ref(),
         ),
         ("theme", settings.theme.as_ref()),
+        ("cdnBaseUrl", settings.cdn_base_url.as_ref()),
         (
             "lastChangelogVersion",
             settings.last_changelog_version.as_ref(),
@@ -605,6 +663,10 @@ fn save_settings_to_path(
         (
             "hideThinkingBlock",
             settings.hide_thinking_block.map(serde_json::Value::Bool),
+        ),
+        (
+            "enableSkillCommands",
+            settings.enable_skill_commands.map(serde_json::Value::Bool),
         ),
         (
             "quietStartup",
@@ -929,6 +991,28 @@ mod scoped_tests {
         );
         assert_eq!(Settings::default().http_proxy, None);
     }
+
+    #[test]
+    fn cdn_base_url_setting_round_trips() {
+        let (_tmp, _guard) = with_temp_env();
+        let mut settings = Settings::default();
+        settings.cdn_base_url = Some("https://assets.bigfisharc.cn".into());
+        save_settings(&settings).unwrap();
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config::settings_path().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["cdnBaseUrl"], "https://assets.bigfisharc.cn");
+        assert_eq!(
+            load_settings().unwrap().cdn_base_url.as_deref(),
+            Some("https://assets.bigfisharc.cn")
+        );
+
+        settings.cdn_base_url = None;
+        save_settings(&settings).unwrap();
+        assert!(load_settings().unwrap().cdn_base_url.is_none());
+    }
     #[test]
     fn harness_options_come_from_settings() {
         let settings: Settings = serde_json::from_str(
@@ -1016,6 +1100,25 @@ mod scoped_tests {
         assert_eq!(settings.branch_summary_reserve_tokens(), Some(4242));
         assert!(settings.branch_summary_skipped());
     }
+    #[test]
+    fn skill_command_discovery_setting_roundtrips_pi_key() {
+        let (_tmp, _guard) = with_temp_env();
+        let mut settings = Settings::default();
+        for enabled in [Some(false), Some(true), None] {
+            settings.enable_skill_commands = enabled;
+            save_settings(&settings).unwrap();
+            assert_eq!(load_settings().unwrap().enable_skill_commands, enabled);
+            let raw: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(config::settings_path().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                raw.get("enableSkillCommands"),
+                enabled.map(serde_json::Value::Bool).as_ref()
+            );
+        }
+    }
+
     #[test]
     fn save_load_scoped_models_roundtrip() {
         let (_tmp, _guard) = with_temp_env();
@@ -1182,6 +1285,17 @@ mod scoped_tests {
         assert_eq!(raw["piOnlyField"], "keep-me");
         assert_eq!(raw["scopedModels"][0], "m1");
         assert_eq!(raw["theme"], "dark");
+    }
+
+    #[test]
+    fn thinking_budgets_are_read_from_settings() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"thinkingBudgets":{"medium":6000,"high":24576}}"#).unwrap();
+        let budgets = settings.thinking_budgets.unwrap();
+        assert_eq!(
+            (budgets.medium, budgets.high, budgets.low),
+            (Some(6000), Some(24576), None)
+        );
     }
 
     #[test]

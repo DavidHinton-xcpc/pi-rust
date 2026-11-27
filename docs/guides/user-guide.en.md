@@ -158,6 +158,7 @@ rpi auth login|check|logout
 rpi events path|tail
 rpi install <crate>
 rpi uninstall <crate>
+rpi extension update [name] # update all eligible extensions, or select one by name
 rpi update                 # download a verified GitHub prebuilt CLI
 rpi update --build         # explicitly compile with Cargo
 rpi dev [options]
@@ -165,7 +166,47 @@ rpi dev-local [options]
 rpi package link|list|unlink
 ```
 
-The startup `Context` summary lists the effective `SYSTEM.md`, `APPEND_SYSTEM.md`, `AGENTS.md`, and `CLAUDE.md` resources. `/context` shows the full list and `/reload` refreshes it. `/changelog` displays the release notes embedded in the current binary; `/changelog all` displays the complete history.
+The startup `Context` summary lists the effective `SYSTEM.md`, `APPEND_SYSTEM.md`, `AGENTS.md`, and `CLAUDE.md` resources. `/context` opens a temporary panel with the full resource list: type to filter, use ↑/↓ to browse, and press Esc or Enter to close. Closing only dismisses the panel; it does not clear chat history, model context, or loaded files. Use `/usage` for token and cost statistics. `/reload` refreshes the startup summary and the next `/context` panel. `/changelog` displays the release notes embedded in the current binary; `/changelog all` displays the complete history.
+
+### Skill commands
+
+Use `/skill:name [instructions]`, as in pi, to explicitly invoke a discovered skill:
+
+```text
+/skill:review Check these changes, especially concurrency
+```
+
+Skills appear in slash completion, including those with `disable-model-invocation: true`
+(which only disables automatic model selection). Set `enableSkillCommands: false` to
+hide skill completions without disabling manual invocation. A successful `/reload`
+refreshes the skill command list. In normal mode, invocation reads the current skill
+file body. With `--resource-config`, exact-resource mode instead uses the validated
+startup snapshot; file changes require a restart. Additional instructions preserve
+interior spaces and newlines. The command-discovery API also lists skills with
+`source: "skill"`; `enableSkillCommands` only filters local TUI suggestions, not the
+API's skill list. Unknown skills and read/parse failures pass the original command
+through the normal input path.
+`/skills` still lists skills; `/skills name [instructions]` remains compatible.
+
+### Math rendering
+
+LaTeX in assistant replies is rendered as readable text; no image-capable
+terminal is required:
+
+- Inline math: `$e^{i\pi}+1=0$` → `e^(iπ)+1=0`.
+- Display math: `$$ … $$`, `\[ … \]`, and environments such as
+  `\begin{aligned}`, `\begin{pmatrix}`, and `\begin{cases}`. `\\` row breaks
+  and `&` alignment points survive as multiple rows/columns, and the matrix
+  family keeps its brackets (`()`, `[]`, `{}`, `|`, `‖`).
+- Supported constructs include Greek letters and common operators, `\frac`,
+  `\sqrt`, scripts, `\mathbb`/`\mathcal`, `\text`/`\operatorname`, and
+  `\hat`/`\vec`/`\overline` decorations.
+
+Rendering is a best-effort Unicode approximation: a terminal cannot typeset TeX
+(fraction bars, integral sizes), scripts Unicode cannot express degrade to
+`^(…)`/`_(…)`, and an unknown command keeps its name instead of failing. `$`
+inside code fences and code spans stays literal, and currency such as `$5` is
+not treated as math.
 
 ### Headless server and remote client
 
@@ -231,7 +272,7 @@ Global resources normally live under `~/.rpi/agent/`. Project resources take pre
 
 The shorthand keys `skills`, `prompts`, and `extensions` are also supported. Paths are relative to the project root; global settings resolve relative paths against the agent directory. Use `--package-only` or `--project-only` to load only the current project's package and resources. This is different from `--local-only`, which limits extensions to explicitly supplied local paths.
 
-Set `RPI_CODING_AGENT_DIR=/work/rpi-agent` to relocate configuration and default sessions. Use `--no-session` when a temporary, non-persistent run is required.
+Set `RPI_CODING_AGENT_DIR=/work/rpi-agent` to relocate configuration. Sessions default to `<cwd>/.rpi/sessions`; `RPI_CODING_AGENT_SESSION_DIR` overrides that root, while `--session-dir <dir>` and the `sessionDir` setting take precedence. The root is further divided into cwd-encoded subdirectories. Use `--no-session` when a temporary, non-persistent run is required.
 
 ## 6. Rust extensions
 
@@ -251,6 +292,18 @@ rpi install my-extension --path ../my-rpi-extension --force
 ```
 
 `rpi install <name>` upgrades newer versions directly and skips an already installed version. Use `--force` to reinstall the same version or allow a downgrade. This also applies to Cargo builds and local installs; local changes without a version bump require `--force`.
+
+Use `rpi extension update` to update all project-linked extensions and globally
+installed registry/prebuilt extensions, or `rpi extension update <name>` to select
+one by name. Add `--cdn <URL>` to download prebuilt archives through an HTTPS CDN;
+manifests remain on GitHub and failed CDN requests fall back to GitHub. The option
+does not affect project-linked or Cargo-built extensions. Updates preserve the
+original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old
+`rpi package update [name]` remains compatible; prefer `extension update` for
+extension updates. Project linking commands remain `rpi package link`,
+`rpi package list`, and `rpi package unlink`.
+
+A prebuilt archive may also carry files that the extension needs beside its library, such as a Node worker. The archive's `runtime-assets.json` index, written by the package's release builder, lists each file's path, size and SHA-256. The installer verifies every file before it installs anything, installs them beside the library in one transaction, and removes them on uninstall. Archives without an index install only the library. An `rpi` build without this support also installs only the library and does not reject the archive, so upgrade `rpi` before publishing a package that declares assets.
 
 For iterative development:
 
@@ -367,4 +420,6 @@ When the online site and an installed binary differ, use the documentation shipp
 
 ### CLI self-update distribution
 
-`rpi update` resolves the released version through crates.io and downloads the matching GitHub `rpi-release.json` distribution. It verifies the exact target, archive size, archive and executable SHA-256, and the executable’s version before transactional replacement. Windows applies the staged update after the running process exits. Missing manifests and failed downloads/checks do not silently invoke Cargo; use `--build` explicitly. `--force` reinstalls the resolved version and `--offline` only reports cached information. See [the CLI distribution protocol](../distribution/prebuilt-cli.md).
+`rpi update` resolves the stable release version through GitHub and downloads the matching GitHub `rpi-release.json` distribution. It verifies the exact target, archive size, archive and executable SHA-256, and the executable’s version before transactional replacement. Windows applies the staged update after the running process exits. Missing manifests and failed downloads/checks do not silently invoke Cargo; use `--build` explicitly. `--force` reinstalls the resolved version and `--offline` only reports cached information. See [the CLI distribution protocol](../distribution/prebuilt-cli.md).
+
+For Homebrew installations, use `brew upgrade rpi`. Startup update notices show that command.

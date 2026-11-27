@@ -98,6 +98,27 @@ pub fn format_skill_invocation(skill: &Skill, additional_instructions: Option<&s
     }
 }
 
+/// Parse only a leading, manually entered skill command. Like pi, the first
+/// literal space separates the name from arguments; argument interiors are
+/// deliberately not tokenized or normalized.
+pub fn parse_skill_command(text: &str) -> Option<(&str, &str)> {
+    let command = text.strip_prefix("/skill:")?;
+    Some(match command.split_once(' ') {
+        Some((name, args)) => (name, args.trim()),
+        None => (command, ""),
+    })
+}
+
+/// Read the current body using the same frontmatter parser as discovery.
+/// Metadata errors are returned so the caller can report them and pass the
+/// original command through, matching pi's skill-expansion fallback.
+pub fn format_skill_command(skill: &Skill, source: &str, args: &str) -> Result<String, String> {
+    let (_, body) = parse_frontmatter(source.trim_start_matches('\u{feff}'))?;
+    let mut fresh = skill.clone();
+    fresh.content = body.trim().to_string();
+    Ok(format_skill_invocation(&fresh, Some(args)))
+}
+
 // ---------------------------------------------------------------------------
 // System-prompt listing (XML-escaped) — invariant §9 path (1)
 // ---------------------------------------------------------------------------
@@ -168,6 +189,18 @@ pub fn escape_xml(value: &str) -> String {
 /// skill files. Missing input directories are skipped (no diagnostic, matching
 /// TS's `code !== "not_found"` guard).
 pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSkillsResult {
+    load_skills_with_source_observer(env, dirs, &|_, _| {}).await
+}
+
+/// Load with the same discovery/validation semantics as [`load_skills`], while
+/// observing the exact UTF-8 source passed to the parser. Hosts can fingerprint
+/// parsed resources without a second, potentially different filesystem read.
+/// Reads and cancellation retain the supplied environment's loader contract.
+pub async fn load_skills_with_source_observer(
+    env: &Arc<dyn ExecutionEnv>,
+    dirs: &[String],
+    observe: &(dyn Fn(&str, &str) + Send + Sync),
+) -> LoadSkillsResult {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
     for dir in dirs {
@@ -198,6 +231,7 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
                     true,
                     &IgnoreMatcher::new(),
                     &root_info.path.to_string_lossy(),
+                    observe,
                 )
                 .await;
                 skills.append(&mut result.skills);
@@ -211,9 +245,13 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
                 // the parent directory's basename.
                 let dir_path = dirname_env_path(&root_info.path.to_string_lossy());
                 let parent_dir_name = basename_of(&dir_path);
-                let mut result =
-                    load_skill_from_file(env, &root_info.path.to_string_lossy(), &parent_dir_name)
-                        .await;
+                let mut result = load_skill_from_file(
+                    env,
+                    &root_info.path.to_string_lossy(),
+                    &parent_dir_name,
+                    observe,
+                )
+                .await;
                 if let Some(skill) = result.skill.take() {
                     skills.push(skill);
                 }
@@ -299,6 +337,7 @@ async fn load_skills_from_dir_internal(
     include_root_files: bool,
     ignore_matcher: &IgnoreMatcher,
     root_dir: &str,
+    observe: &(dyn Fn(&str, &str) + Send + Sync),
 ) -> LoadSkillsResult {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
@@ -362,7 +401,7 @@ async fn load_skills_from_dir_internal(
         if matcher.ignores(&rel) {
             continue;
         }
-        let mut result = load_skill_from_file(env, &full_path, &dir_info.name).await;
+        let mut result = load_skill_from_file(env, &full_path, &dir_info.name, observe).await;
         if let Some(skill) = result.skill.take() {
             skills.push(skill);
         }
@@ -397,7 +436,7 @@ async fn load_skills_from_dir_internal(
 
         if kind == FileKind::Directory {
             let mut result = Box::pin(load_skills_from_dir_internal(
-                env, &full_path, false, &matcher, root_dir,
+                env, &full_path, false, &matcher, root_dir, observe,
             ))
             .await;
             skills.append(&mut result.skills);
@@ -408,7 +447,7 @@ async fn load_skills_from_dir_internal(
         if kind != FileKind::File || !include_root_files || !entry.name.ends_with(".md") {
             continue;
         }
-        let mut result = load_skill_from_file(env, &full_path, &dir_info.name).await;
+        let mut result = load_skill_from_file(env, &full_path, &dir_info.name, observe).await;
         if let Some(skill) = result.skill.take() {
             skills.push(skill);
         }
@@ -431,6 +470,7 @@ async fn load_skill_from_file(
     env: &Arc<dyn ExecutionEnv>,
     file_path: &str,
     parent_dir_name: &str,
+    observe: &(dyn Fn(&str, &str) + Send + Sync),
 ) -> LoadSkillFromFileResult {
     let mut diagnostics = Vec::new();
     let cancel = CancellationToken::new();
@@ -449,6 +489,7 @@ async fn load_skill_from_file(
         }
     };
 
+    observe(file_path, &raw);
     let (frontmatter, body) = match parse_frontmatter(&raw) {
         Ok(v) => v,
         Err(msg) => {

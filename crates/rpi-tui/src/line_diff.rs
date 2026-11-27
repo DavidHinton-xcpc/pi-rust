@@ -26,6 +26,23 @@ fn atoms(line: &str) -> Option<Vec<Atom<'_>>> {
                     return None;
                 }
                 end
+            } else if tail.starts_with("\x1b_") {
+                // APC (private): zero-width protocol markers — the cursor
+                // marker and the thinking-region marker live here. Zero-width
+                // atoms are skipped by `slice()` unless started, so `context`
+                // must carry them across sliced boundaries (see below).
+                let mut end = None;
+                for i in 1..bytes.len() {
+                    if bytes[i] == 7 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                    if bytes[i] == 27 && bytes.get(i + 1) == Some(&b'\\') {
+                        end = Some(i + 2);
+                        break;
+                    }
+                }
+                end?
             } else if tail.starts_with("\x1b]8;") {
                 let mut end = None;
                 for i in 4..bytes.len() {
@@ -67,7 +84,10 @@ fn context(atoms: &[Atom<'_>]) -> String {
     let mut sgr = String::new();
     let mut link = String::new();
     for atom in atoms.iter().filter(|atom| atom.width == 0) {
-        if atom.text.starts_with("\x1b[") {
+        if atom.text.starts_with("\x1b_") {
+            // APC markers are positional (they annotate the row they sit on),
+            // so they must NOT be carried into sliced continuations.
+        } else if atom.text.starts_with("\x1b[") {
             if matches!(atom.text, "\x1b[0m" | "\x1b[m") {
                 sgr.clear();
             }
@@ -160,7 +180,7 @@ fn update_sgr_context(slots: &mut Vec<(SgrSlot, String)>, sequence: &str) {
                 };
                 let component_count = match values.get(index + 1).copied() {
                     Some("5") if values.get(index + 2).is_some() => 3,
-                    Some("2") if values.get(index + 5).is_some() => 6,
+                    Some("2") if values.get(index + 4).is_some() => 5,
                     _ => 0,
                 };
                 if component_count != 0 {
@@ -200,6 +220,11 @@ fn wrapped_context(atoms: &[Atom<'_>]) -> String {
     let mut slots = Vec::new();
     let mut link = None;
     for atom in atoms.iter().filter(|atom| atom.width == 0) {
+        if atom.text.starts_with("\x1b_") {
+            // APC markers annotate their own row; never replay them onto the
+            // next wrapped row.
+            continue;
+        }
         if atom.text.starts_with("\x1b[") {
             update_sgr_context(&mut slots, atom.text);
         } else if atom.text.starts_with("\x1b]8;") {
@@ -233,6 +258,69 @@ pub(crate) fn isolate_wrapped_lines(lines: &mut [String]) {
     }
 }
 
+/// Expand a nonempty column range to whole graphemes. Selection painting and
+/// clipboard extraction must agree when a pointer lands inside a wide cell.
+pub(crate) fn snap_column_span(line: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let parsed = atoms(line)?;
+    let mut column = 0;
+    let mut bounds = None;
+    for atom in parsed {
+        let next = column + atom.width;
+        if atom.width > 0 && column < end && next > start {
+            let first = bounds.map_or(column, |(first, _)| first);
+            bounds = Some((first, next));
+        }
+        column = next;
+    }
+    bounds
+}
+
+/// Paint a selection without slicing away unselected text or splitting a
+/// grapheme. Original escape sequences stay in place, including OSC8 links.
+pub(crate) fn highlight_span(line: &str, start: usize, end: usize) -> Option<String> {
+    let parsed = atoms(line)?;
+    let mut output = String::new();
+    let mut column = 0;
+    let mut active = start == 0 && end > 0;
+    let mut sgr = Vec::new();
+    if active {
+        output.push_str("\x1b[7m");
+    }
+    let restore_inverse = |output: &mut String, sgr: &[(SgrSlot, String)]| {
+        output.push_str(if sgr.iter().any(|(slot, _)| *slot == SgrSlot::Inverse) {
+            "\x1b[7m"
+        } else {
+            "\x1b[27m"
+        });
+    };
+    for atom in parsed {
+        if atom.width == 0 {
+            output.push_str(atom.text);
+            if atom.text.starts_with("\x1b[") {
+                update_sgr_context(&mut sgr, atom.text);
+                if active {
+                    output.push_str("\x1b[7m");
+                }
+            }
+            continue;
+        }
+        let selected = column < end && column + atom.width > start;
+        if active && !selected {
+            restore_inverse(&mut output, &sgr);
+            active = false;
+        } else if !active && selected {
+            output.push_str("\x1b[7m");
+            active = true;
+        }
+        output.push_str(atom.text);
+        column += atom.width;
+    }
+    if active {
+        restore_inverse(&mut output, &sgr);
+    }
+    Some(output)
+}
+
 /// Slice terminal columns without losing SGR/OSC8 context or splitting wide graphemes.
 /// Unsupported control protocols retain their existing unsliced fallback path.
 pub(crate) fn slice(line: &str, start: usize, width: usize) -> Option<String> {
@@ -241,6 +329,13 @@ pub(crate) fn slice(line: &str, start: usize, width: usize) -> Option<String> {
     let mut column = 0usize;
     let mut started = false;
     let mut output = String::new();
+    // APC protocol markers (cursor/thinking-region) annotate the ROW, not a
+    // column range: a sliced row keeps them wherever the slice starts.
+    for atom in atoms.iter() {
+        if atom.width == 0 && atom.text.starts_with("\x1b_") {
+            output.push_str(atom.text);
+        }
+    }
     for (index, atom) in atoms.iter().enumerate() {
         if atom.width == 0 {
             if started {
@@ -308,6 +403,37 @@ pub(crate) fn patch(old: &str, new: &str) -> Option<(usize, String)> {
 mod tests {
     use super::*;
     #[test]
+    fn selection_preserves_styles_links_and_existing_inverse() {
+        assert_eq!(
+            highlight_span("a\x1b[31mb\x1b[0mcdef", 1, 3).unwrap(),
+            "a\x1b[31m\x1b[7mb\x1b[0m\x1b[7mc\x1b[27mdef"
+        );
+        assert_eq!(
+            highlight_span("\x1b[7mabcdef\x1b[27m", 1, 3).unwrap(),
+            "\x1b[7ma\x1b[7mbc\x1b[7mdef\x1b[27m"
+        );
+        let linked = "a\x1b]8;;https://example.com\x07bc\x1b]8;;\x07def";
+        assert_eq!(
+            highlight_span(linked, 1, 3).unwrap(),
+            "a\x1b]8;;https://example.com\x07\x1b[7mbc\x1b]8;;\x07\x1b[27mdef"
+        );
+        assert_eq!(snap_column_span("a中👩‍💻z", 2, 4), Some((1, 5)));
+        assert!(highlight_span("\x1b[2Junsafe", 0, 2).is_none());
+    }
+
+    #[test]
+    fn selection_restores_inverse_after_truecolor_sequences() {
+        for color in ["38", "48"] {
+            let line = format!("\x1b[7mab\x1b[{color};2;255;0;0mcd");
+            let expected = format!("\x1b[7ma\x1b[7mb\x1b[{color};2;255;0;0m\x1b[7mc\x1b[7md");
+            assert_eq!(highlight_span(&line, 1, 3).unwrap(), expected);
+            let line = format!("a\x1b[{color};2;255;0;0;7mbcd");
+            let expected = format!("a\x1b[{color};2;255;0;0;7m\x1b[7mbc\x1b[7md");
+            assert_eq!(highlight_span(&line, 1, 3).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn wrapped_style_context_keeps_only_active_sgr_state() {
         let mut lines: Vec<String> = (0..20).map(|_| "\x1b[31mA\x1b[39m".to_string()).collect();
         isolate_wrapped_lines(&mut lines);
@@ -353,5 +479,22 @@ mod tests {
         assert_eq!(column, 4);
         assert!(text.starts_with("     "));
         assert!(patch("plain", "\x1b[2Junsafe").is_none());
+    }
+
+    #[test]
+    fn slice_preserves_apc_row_markers() {
+        let marker = "\u{1b}_pi:zt1x12\u{1b}\\";
+        let line = format!("{marker} Thinking...");
+        let sliced = slice(&line, 0, 80).expect("slice");
+        assert!(
+            sliced.contains(marker),
+            "marker dropped by slice: {sliced:?}"
+        );
+        // A slice that starts past the marker's position still carries it.
+        let shifted = slice(&line, 2, 80).expect("slice");
+        assert!(
+            shifted.contains(marker),
+            "marker dropped on shifted slice: {shifted:?}"
+        );
     }
 }

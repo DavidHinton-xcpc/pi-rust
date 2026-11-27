@@ -77,22 +77,17 @@ pub(super) fn add_welcome_message_with_capabilities(
     // The mark, wordmark and language mark live in `crate::brand`. See that
     // module for why the layout is built from single-width characters only.
     container.add_child(Arc::new(crate::brand::BrandLockup::new()));
-    container.add_child(Arc::new(Spacer::new(1)));
     // The mark carries the product name, so the line under it is the tagline
     // rather than a second logotype.
     let title = c.muted.fg("interactive TUI · library-first agent runtime");
     container.add_child(Arc::new(Text::new(title, 1, 0)));
-    container.add_child(Arc::new(Spacer::new(1)));
-    container.add_child(Arc::new(Text::new(
-        c.dim.fg("Type your message and press Enter to send."),
-        1,
-        0,
-    )));
+    // No spacer rows: the header has a hard row budget (see `crate::brand::render`),
+    // and "Type your message and press Enter to send" repeated what the footer
+    // already shows, so it cost a row for nothing.
     let hint = c
         .dim
         .fg("Enter send · Shift+Enter newline · Ctrl+C clear · Esc abort · /help");
     container.add_child(Arc::new(Text::new(hint, 1, 0)));
-    container.add_child(Arc::new(Spacer::new(1)));
     let context_listing = Arc::new(Container::new());
     render_context_files(&context_listing, context_files);
     container.add_child(context_listing.clone());
@@ -140,6 +135,94 @@ pub(super) fn update_resource_listing(
         render_context_files(listing, &resources.context_files);
     }
     *shared.lock().unwrap() = resources;
+}
+
+/// One bounded live row, independent of the canonical full update cards. Native
+/// main-screen transcript snapshots cannot patch cards published after startup.
+#[derive(Default)]
+pub(super) struct RegularUpdateHint {
+    text: Mutex<Option<(String, String)>>,
+}
+
+impl RegularUpdateHint {
+    pub(super) fn update(&self, report: &crate::updates::UpdateReport) {
+        // Warnings need action first; otherwise prefer the CLI release over a
+        // package release. Derive text from typed data, never rendered cards.
+        let hint = if let Some(warning) = report.warnings.first() {
+            Some((
+                format!("Update failed: {}", warning.message),
+                warning.command.clone(),
+            ))
+        } else {
+            report
+                .notices
+                .iter()
+                .find(|notice| notice.name == "rpi")
+                .or_else(|| report.notices.first())
+                .map(|notice| {
+                    (
+                        format!("Update: {} {} available", notice.name, notice.latest),
+                        notice.command.clone(),
+                    )
+                })
+        };
+        *self.text.lock().unwrap() = hint.map(|(status, command)| {
+            (
+                update_hint_single_line(&status),
+                update_hint_single_line(&command),
+            )
+        });
+    }
+
+    pub(super) fn clear(&self) {
+        self.text.lock().unwrap().take();
+    }
+
+    fn row(&self, width: usize) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let text = self.text.lock().unwrap();
+        let Some((status, command)) = text.as_ref() else {
+            return Vec::new();
+        };
+        // Reserve space for the action before truncating a potentially verbose
+        // warning. Common update commands remain fully visible at width 100.
+        let action = rpi_tui::truncate_to_width(command, width.saturating_mul(2) / 3, "…");
+        let status_width = width.saturating_sub(rpi_tui::visible_width(&action) + 3);
+        let status = rpi_tui::truncate_to_width(status, status_width, "…");
+        vec![rpi_tui::truncate_to_width(
+            &format!("{status} | {action}"),
+            width,
+            "…",
+        )]
+    }
+}
+
+fn update_hint_single_line(text: &str) -> String {
+    rpi_tui::strip_ansi(text)
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl Component for RegularUpdateHint {
+    fn render(&self, width: usize) -> Vec<String> {
+        if !rpi_tui::render::is_main_screen_frame() {
+            return Vec::new();
+        }
+        self.row(width)
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Append update notices inside the live transcript. Fullscreen mode clears
@@ -244,6 +327,10 @@ pub(super) fn add_help_message(container: &Arc<Container>) {
         ("/exit, /quit, /q", "Exit the application"),
         ("/version, /v", "Show version information"),
         ("/changelog", "Show recent release changes"),
+        (
+            "/history",
+            "Browse older/newer/latest history (default: older)",
+        ),
         ("/model, /m", "Choose a model (live switch)"),
         (
             "/provider",
@@ -254,12 +341,14 @@ pub(super) fn add_help_message(container: &Arc<Container>) {
         ("/images", "Toggle inline image rendering"),
         ("/session", "List saved sessions"),
         ("/theme", "Choose a theme (selector)"),
+        ("/context", "Browse loaded resources (Esc to close)"),
         ("/compact", "Compact the conversation"),
         ("/copy", "Copy last reply to clipboard"),
         ("/hotkeys", "Show keyboard shortcuts"),
+        ("/skill:<name>", "Invoke a skill with optional instructions"),
         (
             "/skills",
-            "List skills or invoke one: /skills <name> [instructions]",
+            "List skills (legacy invocation: /skills <name> [instructions])",
         ),
     ];
     let cmd_w = cmds.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -389,7 +478,10 @@ pub(super) fn add_hotkeys_message(container: &Arc<Container>) {
         ("Ctrl+Y / Alt+Y", "Yank / yank-pop"),
         ("Alt+Backspace", "Kill previous word"),
         ("Ctrl+C", "Clear the editor (press twice quickly to exit)"),
-        ("Ctrl+X", "Copy the editor selection or the last reply"),
+        (
+            "Ctrl+X",
+            "Copy the mouse/editor selection or the last reply",
+        ),
         ("Esc", "Abort a running prompt"),
         ("Ctrl+L", "Open model selector"),
         ("Ctrl+P", "Cycle to the next model (live)"),
@@ -539,6 +631,33 @@ pub(super) fn add_note_message(container: &Arc<Container>, text: &str) {
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
+/// Build the theme-watcher notify closure: append the reload notice to the
+/// transcript and force a full content repaint. Appending alone never requests
+/// a frame and the scheduler only paints idle sessions on size/status changes,
+/// so without the repaint a background reload (or its parse error) stays
+/// invisible until the next interaction repaints the screen.
+pub(super) fn theme_watch_notify(
+    state: &Arc<TuiState>,
+    tui: Arc<TuiAltScreen>,
+) -> impl Fn(Result<String, String>) + Send + Sync + 'static {
+    // The watcher lives in TuiState; a weak reference avoids a cycle and lets
+    // each callback resolve the visible page after history/session navigation.
+    let state = Arc::downgrade(state);
+    move |result| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let chat = state.notice_container();
+        match result {
+            Ok(message) => add_note_message(&chat, &message),
+            Err(message) => add_error_message(&chat, &message),
+        }
+        // A full repaint (not scroll-cache reuse) so already-styled
+        // transcript rows pick up the new palette too.
+        tui.request_render(true);
+    }
+}
+
 /// Add an explicit skill activation notice to the transcript.
 pub(super) fn add_skill_activation_message(container: &Arc<Container>, name: &str) {
     let c = current_theme().colors;
@@ -578,23 +697,17 @@ pub(super) fn show_skills_panel(
                 skill.description.chars().take(72).collect::<String>()
             ));
         }
-        lines.push("  Invoke with: /skills <name> [instructions]".into());
+        lines.push("  Invoke with: /skill:<name> [instructions]".into());
+        lines.push("  Compatibility: /skills <name> [instructions]".into());
     }
     container_note_block(chat, &lines.join("\n"));
 }
 
-/// Render the `/context` panel: a transcript message listing the discovered
-/// context files, skills, and prompt templates loaded for this session
-/// (Part A resource discovery). Reads the shared resources snapshot, initialized
-/// at startup and refreshed on reload, without awaiting the harness accessor.
-///
-/// Mirrors pi's context-panel intent (pi surfaces loaded resources on startup +
-/// via `/reload`); here it's a transcript note rather than an overlay since the
-/// resource set is refreshed after successful `/reload`s.
-pub(super) fn show_context_panel(
-    chat: &Arc<Container>,
+/// Build read-only `/context` rows from the resource snapshot, initialized at
+/// startup and refreshed on reload. The selector owns these rows, not the chat.
+pub(super) fn context_panel_lines(
     resources: &rpi_harness::types::AgentHarnessResources,
-) {
+) -> Vec<String> {
     let skills = resources.skills.as_deref().unwrap_or(&[]);
     let templates = resources.prompt_templates.as_deref().unwrap_or(&[]);
     let mut lines: Vec<String> = Vec::new();
@@ -649,8 +762,7 @@ pub(super) fn show_context_panel(
         "  Use --no-skills/-ns, --no-prompt-templates/-np, --no-context-files/-nc to suppress."
             .into(),
     );
-    let body = lines.join("\n");
-    container_note_block(chat, &body);
+    lines
 }
 
 /// Append a multi-line neutral note (header line + body) to the chat container.

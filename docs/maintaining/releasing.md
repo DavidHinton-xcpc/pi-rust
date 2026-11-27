@@ -1,13 +1,32 @@
 # Releasing rpi
 
-## Normal releases: merge the Release PR
+## Normal releases: daily preparation and automatic merge
 
 Contributors, including fork contributors, submit code and tests without changing
-versions. After an ordinary PR lands on `main` and all CI checks pass,
-`release-plz` creates or updates a draft Release PR. It prepares the version and
-root changelog, synchronizes the embedded documentation, validates the core
+versions. Every day at 00:00 Asia/Shanghai (16:00 UTC), the **CI** workflow runs
+against `main`. If `release-plz` finds publishable package changes since the last
+stable release, it creates or updates a draft Release PR. It prepares the version
+and root changelog, synchronizes the embedded documentation, validates the core
 crates, and marks the PR ready. The shared workspace version and `rpi` version
 group keep the core crates together; examples are excluded.
+
+The automation requests GitHub Auto-merge **only for this upstream
+`release-plz-*` Release PR**. It never enables or requests Auto-merge for ordinary
+feature, fix, dependency, or fork PRs. `main` remains protected by its Ruleset;
+the Release PR is merged only after the required validation checks pass. No
+publishable package changes means no Release PR, tag, or release.
+
+Only same-repository `release-plz-*` draft PRs targeting `main` defer CI until
+preparation is complete; ordinary PRs (including drafts and fork PRs) still run
+all checks. Before updating an existing Release PR, automation returns it to
+draft so intermediate version/changelog commits are not checked prematurely.
+After documentation synchronization and validation succeed, marking the PR ready
+triggers full CI on its final head, even when a retry produces no new commit.
+Skipped draft jobs use distinct names, so they cannot satisfy the required
+`Cargo check` / `Cargo test` checks while the ready-event run is being scheduled.
+A failed preparation leaves the PR in draft; fix the failure and rerun preparation
+rather than marking an incomplete Release PR ready manually. The embedded-docs
+consistency check and publishing authorization remain unchanged.
 
 Automatic releases use the version proposed by release-plz without pinning a
 minor series or rewriting it to a patch release. Versions such as `0.9.0` and
@@ -15,15 +34,25 @@ minor series or rewriting it to a patch release. Versions such as `0.9.0` and
 requires a stable version newer than existing release tags, or an identical-commit
 retry. API compatibility findings remain visible in the Release PR.
 
-Merge that Release PR when ready to ship. After its main-branch CI passes:
+An ordinary merge runs CI and the next daily run prepares a Release PR. To
+prepare one immediately instead, use **Actions → CI → Run workflow**, select
+`main`, and leave `prepare_release` enabled. The manual dispatch does not request
+Auto-merge. After the automatically merged Release PR reaches `main` and its
+main-branch CI passes:
 
 1. The existing release helper publishes the core crates in dependency order.
 2. Automation creates `vX.Y.Z` at the tested main commit. Existing tags are never
    moved; retrying the same release commit is supported.
-3. A reusable workflow builds all five platforms, verifies the archives, uploads
+3. A reusable workflow builds all six platforms (including the static
+   `x86_64-unknown-linux-musl` Linux binary), verifies the archives, uploads
    their checksums and publishes `rpi-release.json` last.
-4. Homebrew and Scoop are updated independently; a new-version PR is submitted
-   to `microsoft/winget-pkgs`. Microsoft review/CLA completion remains external.
+4. npm, Homebrew and Scoop are updated independently; a new-version PR is submitted
+   to `microsoft/winget-pkgs`. npm first tests installation of its packed archive
+   and the native command, then publishes `@bigfishnpm/rpi` using OIDC.
+   Microsoft review/CLA completion remains external. The channels do not block each
+   other, so a channel can be left behind by one failed job; the scheduled
+   **Release channel drift** workflow compares every channel with the newest stable
+   release and keeps an issue open until the gap closes.
 
 No release runs in fork repositories or on PR events. Publication additionally
 requires a merged PR from an upstream `release-plz-*` branch whose merge commit
@@ -34,7 +63,7 @@ Do not use `pull_request_target` to execute contribution code with release secre
 
 A preview merge on the `preview` branch runs only the prebuilt binary workflow. It creates a
 GitHub prerelease with a `vX.Y.Z-preview.N` tag and does **not** run release-plz, publish any
-crate to crates.io, or update Homebrew/Scoop/winget channels. The preview binary is available
+crate to crates.io, publish to npm, or update Homebrew/Scoop/winget channels. The preview binary is available
 through the explicit `rpi update preview` command; normal stable update checks never select a
 prerelease. A preview binary still checks crates.io for the stable line and therefore tells the
 user to run `rpi update` when a formal release is available.
@@ -46,8 +75,8 @@ run `task publish` or merge a Release PR solely to publish documentation. Update
 the relevant `docs/rpi-tool/` sources and run `sh scripts/sync-embedded-docs.sh`
 when the bundled documentation changes.
 
-An ordinary merge runs CI and may prepare or update a Release PR; it does not
-authorize publication. If the explicit requirement is to avoid release
+The Release PR merge remains the only action that authorizes publication. If the
+explicit requirement is to avoid release
 automation entirely for a documentation-only change, maintainers can include
 `[skip ci]` in the final merge commit message (or the squash commit message).
 GitHub then skips the push/PR workflows, including the CI job that calls release
@@ -62,12 +91,14 @@ a documentation-only merge.
 ### One-time setup
 
 The repository already uses `CARGO_REGISTRY_TOKEN` for crates.io. Add one secret,
-`RELEASE_AUTOMATION_TOKEN`, for preparing PRs and writing the external channels.
+`RELEASE_AUTOMATION_TOKEN`, for preparing PRs, refreshing README image dates, and
+writing the external channels.
 Use a maintainer or dedicated bot **classic PAT with `public_repo`**, with access
 to these public repositories:
 
-- `bigfish1913/pi-rust`: create/update Release PRs. Using a user token also lets
-  those PRs and the documentation follow-up commit trigger their normal CI.
+- `bigfish1913/pi-rust`: create/update Release PRs and the restricted README image PR.
+  The token owner must be an explicit `main` ruleset bypass actor because the README
+  workflow administrator-merges that README-only PR without waiting for CI.
 - `bigfish1913/homebrew-tap` and `bigfish1913/scoop-bucket`: update channel files.
 - The token owner's fork of `microsoft/winget-pkgs`: create/sync the fork, push
   manifest branches, and submit upstream PRs. The upstream repository belongs to
@@ -79,23 +110,196 @@ Set it in repository Settings → Secrets and variables → Actions, or locally 
 input). Never put the token in a commit or PR description. The publishing jobs
 use the built-in `GITHUB_TOKEN` for this repository and the Cargo secret only in
 the crates publishing step. The automation token is only supplied to the steps
-that prepare PRs or write channels.
+that prepare PRs (including the README image refresh), request Auto-merge for the
+Release PR, or write channels.
+
+Repository Settings must have **Allow auto-merge** enabled. The `main` Ruleset
+continues to protect the branch and must require the `Release PR validation`
+check, which aggregates the complete Release PR CI. Auto-merge is requested only
+when the PR head is an upstream `release-plz-*` branch; ordinary and fork PRs
+remain manual.
 
 The binaries workflow is called directly after tag creation: a tag created with
 the built-in `GITHUB_TOKEN` does not start another push-triggered workflow.
+
+### Workflow reliability and required checks
+
+The required `Release PR validation` check aggregates every validation dependency
+for ordinary PRs as well as ready Release PRs. A resource, platform or extension
+compatibility failure must fail that check; it is not an advisory result. Only
+upstream draft Release PRs defer validation while being prepared, and their
+separate Cargo check/test names cannot satisfy the normal branch requirements.
+
+Linux x86_64 release and startup-smoke runners use `ubuntu-24.04`, keeping the
+release glibc baseline explicit. The historical resource benchmark also uses
+`ubuntu-24.04`: moving `ubuntu-latest` must not silently change the environment
+under an absolute latency budget. Normal check/test jobs retain `ubuntu-latest`
+coverage. Resource diagnostics include the OS, runner image, CPU and compiler;
+the modern/legacy budgets and complete 701000-frame workload remain enforced.
+A pinned runner reduces environment drift, not all hosted-runner contention: a
+repeatable failure on that runner still needs profiling, not a threshold bump.
+
+Both musl setup and extension native-dependency setup bound apt calls and retry
+failures. Partial index/DNS errors must fail `apt-get update` instead of allowing
+stale indexes to look successful. An existing musl compiler avoids apt access,
+but must still link and run a static probe. Release setup stays inline because
+recovery checks out an old tag that cannot contain a newly added helper script.
+
+A hosted runner can also be cancelled before it executes its first step, especially while a macOS runner is being allocated. The required `Release PR validation` check continues to reject `cancelled` validation jobs; it never treats infrastructure cancellation as a passing test. The separate `CI transient recovery` workflow watches only trusted upstream `main` CI runs from `schedule`, `push`, or explicit dispatch. If the first attempt has no failed validation family and has at least one cancelled validation job, it requests one complete rerun of the same CI run. It reruns the whole run rather than only failed jobs because the release job was skipped behind the failed aggregate. The second attempt is not automatically retried, preventing loops; maintainers must inspect and rerun a repeated runner outage manually. The recovery workflow checks job conclusions through the GitHub API and never checks out or executes the failed run source, so it cannot turn an untrusted PR into a privileged release action.
+
+The daily README image refresh updates `automation/readme-images` and creates or
+reuses a restricted upstream PR. The workflow verifies that the branch is rebuilt
+from `main` and that the only changed path is `README.md`, then administrator-merges
+that exact PR with squash without waiting for normal CI. This is intentionally a
+narrow bypass for the automated WeChat image cache-key update; ordinary and fork PRs
+remain subject to normal review and required checks. Missing token or API/push/merge
+failure fails visibly.
 
 ### Recovery and release records
 
 - Re-run failed jobs on the Release PR's original main CI run. Existing crates
   are skipped by the release helper; an existing tag must match the same commit.
+- A re-run reuses the workflow file from the original commit, so it cannot pick
+  up an automation fix. When the binaries job was blocked by infrastructure (a
+  failed apt install, for example), dispatch **Release binaries** on `main`
+  with the already-published `tag` instead: the attach step updates an existing
+  release in place, and the tag and crates.io versions are left untouched.
 - For a channel failure, run **Release install channels** from Actions on `main`
-  with the published tag. It verifies all five archives before regenerating
+  with the published tag. It verifies all six archives before regenerating
   manifests. Existing winget PRs/files are reused; closed submissions require
   maintainer inspection. Tap updates refuse to downgrade a newer version.
 - Each run saves `channel-manifests-vX.Y.Z` as an artifact. The checked-in
   `packaging/` files are the baseline; generated manifests carry the actual
   published version/checksums. No bot commits directly to protected `main`.
+- For an npm failure, run **Release npm package** from Actions on `main` with the
+  already-published stable tag. It verifies the release again, skips an existing
+  npm version, and never downgrades `latest` when backfilling an older version.
+  The publish job first asks npm to exchange this workflow's OIDC token for a
+  publish token, so a misconfigured trusted publisher fails before packaging with
+  the claims npm compared instead of a bare `404` after a signed provenance
+  statement. That preflight is skipped when the version is already published,
+  because only a new version needs the binding.
+- **Release channel drift** runs daily and on demand. It exits non-zero, creates or
+  updates one `Release channel drift` issue with the recovery command per lagging
+  channel, and closes that issue when every tracked channel matches again. winget
+  is reported but never fails the check, because it waits on an upstream review.
 - Website deployment remains the separate `task rpi-deploy` operation.
+
+## npm distribution
+
+The npm package `@bigfishnpm/rpi` installs the `rpi` command using the prebuilt GitHub
+Release for the workspace version. Node.js 20+ is required to install and launch
+it. No npm dependencies or Rust compiler are needed. The package pins
+`rpi-release.json`; the installer checks the archive size and SHA-256 as well as
+the extracted executable SHA-256 before installing it.
+
+Stable binary releases automatically call
+[Release npm package](../../.github/workflows/release-npm.yml) after uploading all
+six distributions and the manifest. The npm job runs independently of the other
+install channels. Preview releases skip it. Normal CI also runs the npm tests
+offline, including fork PRs, without publish permissions.
+
+### One-time npm trusted publisher setup
+
+In [the package settings](https://www.npmjs.com/package/@bigfishnpm/rpi/access),
+add a GitHub Actions trusted publisher with organization/user `bigfish1913`,
+repository `pi-rust`, and these workflow filenames. Each configuration is one
+connection for exactly one filename; a value that holds several filenames matches
+no workflow and every exchange fails. npm compares the OIDC claims of the
+publishing job, and a job defined by a reusable workflow reports that file as its
+`job_workflow_ref`, so `release-npm.yml` is the entry that authorizes the publish
+step itself. The calling workflows are added as separate connections because they
+are cheap (npm allows up to ten) and cover a token whose `workflow_ref` is the
+workflow that started the run:
+
+| Workflow filename | OIDC claim | Entry point |
+| --- | --- | --- |
+| `release-npm.yml` | `job_workflow_ref` (defines the publish job) | Every path |
+| `ci.yml` | `workflow_ref` | Automatic Release PR → binaries → npm publishing |
+| `release-binaries.yml` | `workflow_ref` | Direct tag builds and manual binary recovery |
+
+Select **Allow npm publish** for each configuration; configurations created after
+2026-09-03 default to allowing only staged publishing, which does not permit this
+workflow's direct `npm publish`. Leave the optional environment name empty: a
+configured environment that the job does not declare never matches. The workflows
+pass `id-token: write` through the complete call chain, while ordinary test jobs
+retain read-only permissions.
+
+This uses GitHub-hosted runners, Node.js 24 and npm 11.12.1. npm exchanges OIDC
+for a short-lived credential and publishes provenance; no `NPM_TOKEN` secret or
+interactive 2FA is needed in GitHub Actions. Create each configuration shortly
+before its first new-version publication: npm requires the first successful
+publication from each new connection within two days, and publishing an
+already-published version validates nothing. Every later release reuses the
+configuration that its own publish validated. See
+[npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
+
+`scripts/npm-oidc-preflight.mjs` prints the claims this repository actually sends
+and the registry's rejection, so a rejected binding names the mismatching values
+instead of an unexplained `404`; read it in the
+**Verify npm accepts this workflow before packaging** step of a failing run.
+
+### Automatic publication and recovery
+
+The job validates a stable `vX.Y.Z` tag, its source commit, and every distribution
+against the GitHub Release. `RPI_NPM_RELEASE_VERSION` and
+`RPI_NPM_RELEASE_MANIFEST` pin preparation to that release independently of the
+checked-out workspace version. Before publishing, it runs the npm tests, packs
+the package, installs the archive into a temporary prefix, and checks the native
+`rpi --version` output. Download or checksum failures prevent publication.
+
+Publication is serialized across versions. An already-published version is
+skipped without changing tags. A previously unpublished version older than
+`latest` is published under `backfill`, preserving `latest`. Registry connection,
+authentication and server failures stop the job rather than being treated as an
+absent version. The publisher waits for the new version endpoint when npm accepts
+a release asynchronously.
+
+Before packaging, the job looks the version up on the registry and, only when the
+version is still unpublished, runs `scripts/npm-oidc-preflight.mjs`. The preflight
+performs the same OIDC exchange as the CLI, so a trusted publisher mismatch fails
+in seconds with the claims npm compared; the CLI itself treats a rejected exchange
+as "no OIDC here" and then publishes anonymously, which the registry answers with
+`404 PUT /@scope%2Fname`. Do not remove the preflight: without it the only symptom
+is that bare 404 after a signed provenance statement, which is what left
+`@bigfishnpm/rpi` on 0.22.1 through the 0.23.0, 0.24.x and 0.25.0 releases.
+
+To retry npm alone, use **Actions → Release npm package → Run workflow**, select
+`main` and supply the existing stable tag. Tags predating npm support can be
+published this way without rebuilding their Rust binaries or changing Cargo.
+
+### Local publication
+
+After the matching GitHub Release has all six distributions and its manifest:
+
+```bash
+npm run prepare:release   # sync package.json to Cargo.toml and pin the release manifest
+npm test
+npm pack --dry-run       # inspect the package file list
+npm publish --dry-run
+npm whoami               # authenticate with npm login if necessary
+npm publish
+npm view @bigfishnpm/rpi version
+```
+
+`npm publish` runs preparation again and fails if the matching release manifest
+is unavailable or incomplete. Publishing requires npm permissions for the
+`bigfishnpm` user scope and the package, and may require browser authentication
+or a one-time password. Run `npm profile get "two-factor auth"` to confirm 2FA
+is enabled. Browser authentication requires an interactive terminal. GitHub
+Actions uses the trusted publishers above; other headless environments need their
+own supported OIDC configuration or an appropriately scoped npm token. Never
+commit authentication tokens or one-time passwords.
+
+A first publication may return HTTP 202 and report that the package is being
+processed. Do not republish or bump the version solely because `npm view` still
+returns 404. Check `npm dist-tag ls @bigfishnpm/rpi` and the registry's version
+endpoint and tarball, then wait for package metadata to become available.
+
+For an installation smoke test, run `npm pack --pack-destination .deploy`, install
+the resulting tarball into a temporary prefix, and execute that prefix's `rpi`
+command with `--version`. This installation smoke test also runs before every
+automated npm publication.
 
 ## Manual release and recovery tools
 
@@ -197,6 +401,27 @@ task publish:crates RELEASE_VERSION=0.3.4
 | `winget` | `gh` authenticated (forks `winget-pkgs`, opens the PR) |
 | `crates` | `cargo login` (a publish-scoped token) |
 | `site` | SSH to the rpi web host |
+
+## Optional RustFS/CDN mirror
+
+`release-binaries.yml` always publishes and validates GitHub Release assets
+first. If the optional RustFS secrets are configured, a final best-effort
+step mirrors the exact `rpi-release.json`, archives, and checksum sidecars to
+an S3-compatible endpoint:
+
+```text
+RPI_RUSTFS_ENDPOINT
+RPI_RUSTFS_BUCKET
+RPI_RUSTFS_ACCESS_KEY
+RPI_RUSTFS_SECRET_KEY
+RPI_CDN_BASE_URL=https://assets.bigfisharc.cn
+```
+
+Objects are versioned under `rpi/releases/<tag>/`. GitHub remains the
+canonical manifest and trust source; a mirror failure is reported in the
+workflow summary without invalidating the GitHub Release. Configure public
+read-only object access, disable listing/write/delete, and use short caching
+for the JSON manifest and immutable caching for archives/checksums.
 
 ## What no command can finish
 

@@ -191,8 +191,10 @@ ANTHROPIC_AUTH_TOKEN=token
 ```text
 rpi auth login|check|logout
 rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
+rpi session gc [path...] [--dry-run]  离线剥离已被 clear_run 退役的流式帧负载
 rpi install <crate>
 rpi uninstall <crate>
+rpi extension update [name] # 更新全部符合条件的扩展，或按名称更新
 rpi update                 # 更新 rpi CLI 自身
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
@@ -213,6 +215,8 @@ Windows 会暂存更新，等待当前进程退出后完成替换。稳定版不
 缺少 manifest、下载失败或校验不通过都会报错并保留原版本，不会自动转为编译。
 `--offline` 仅报告稳定版缓存；预览版需要联网查询 GitHub。旧 Release 没有 manifest 时，
 可等待协议资产补齐，或显式使用 `rpi update --build`。
+
+通过 Homebrew 安装时，使用 `brew upgrade rpi` 更新。启动时的更新提示也会显示这条命令。
 
 ### TUI 历史消息滚动
 
@@ -317,7 +321,7 @@ rpi --project-only
 RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 ```
 
-会话默认保存到 agent 配置目录下的 sessions；`--no-session` 可使用临时会话。
+会话默认保存到当前项目的 `<cwd>/.rpi/sessions`；`RPI_CODING_AGENT_SESSION_DIR` 可覆盖该路径，命令行 `--session-dir <dir>` 和 `settings.json` 的 `sessionDir` 优先于它。根目录内再按 cwd 编码分子目录。`--no-session` 可使用临时会话。
 
 ## 6. Rust 插件
 
@@ -355,6 +359,8 @@ rpi install my-extension --github https://github.com/owner/repo
 
 自定义仓库也须发布同一分发协议。显式仓库不依赖 crates.io；省略版本时，只在该仓库的 `<包名>-v<版本>` 标签中选择最新稳定版本。不会使用仓库的全局 latest Release。后续 `--force` 重装和启动更新检查会保留来源，并核对新版本的 manifest 是否适配当前平台。
 
+扩展目录仓库已迁移到 `pi-rust/rpi-extension`（原 `pi-rust/rpi-package`）。两个地址视为同一项目：已有安装（包括只记录 `prebuilt:<仓库>` 来源的旧记录）和 `--github pi-rust/rpi-package` 调用仍可升级，版本发现会按新仓库的 `<包名>-v<版本>` 标签跟随迁移并改写安装来源；旧仓库已发布的版本及其 CDN 前缀继续可用，因此固定旧版本的安装不会失效。
+
 发布者必须先上传所声明平台的压缩包，最后上传 manifest。manifest 尚未发布、目标平台缺失或校验不通过时安装失败，不会自动编译或选择其他版本。需要源码编译时显式使用：
 
 ```bash
@@ -364,11 +370,22 @@ rpi install rpi-todo --build --version 0.2.0 --force
 
 预编译安装记录包括版本、仓库、目标平台、源码提交、SDK ABI 和校验值；安装与卸载使用同一事务机制。加载时仍会验证实际插件入口与 API 结构大小。系统原生运行库依赖仍由操作系统提供。
 
+包可以在库文件旁附带运行所需的文件，例如 Node 工作进程 `runtime/main.mjs`。压缩包根目录的 `runtime-assets.json` 索引由包的发布构建工具生成，列出每个文件的路径、大小和 SHA-256。安装器先在内存中校验全部内容，再与库文件一起以事务方式写入扩展目录，并记录在安装注册表中。升级会替换这些文件；卸载会连同因此变空的目录一并删除。路径须为相对的 ASCII 普通路径，不得包含 `..`、隐藏组件、`node_modules`、原生库后缀、Windows 设备名（如 `CON`、`NUL`、`COM1`）、以点结尾的组件、符号链接或索引未声明的文件；单文件不超过 128 MiB，展开后的总量不超过 256 MiB，压缩包条目总数不超过 128。没有索引的压缩包只安装库文件。旧版 rpi 不支持此功能：它读取这类压缩包时只安装库文件而不会拒绝，因此发布声明了附属文件的包之前，应先升级 rpi。
+
 本地开发：
 
 ```bash
 rpi install my-extension --path ../my-rpi-extension --force
 ```
+
+推荐用 `rpi extension update` 更新全部项目链接扩展和全局 registry/prebuilt 扩展，
+或用 `rpi extension update <name>` 按名称更新。预编译扩展可以用
+`rpi extension update --cdn <URL>` 通过 HTTPS CDN 下载归档；清单仍从 GitHub
+获取，CDN 失败会回退到 GitHub。该选项不影响项目链接扩展或 Cargo 构建扩展。
+更新保留原来的 Cargo 构建后端或显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+旧命令 `rpi package update [name]` 仍兼容，但扩展更新推荐使用
+`rpi extension update [name]`。项目链接管理仍使用 `rpi package link`、
+`rpi package list`、`rpi package unlink`，这些命令名称不变。
 
 开发扩展项目时使用 watch 模式：
 
@@ -385,7 +402,7 @@ rpi dev
 
 ### 网页搜索与抓取
 
-联网工具由独立的 [rpi-package 扩展](https://github.com/pi-rust/rpi-package) 提供，
+联网工具由独立的 [rpi-extension 扩展](https://github.com/pi-rust/rpi-extension) 提供，
 不属于 CLI 默认内置工具。按需安装后重启 rpi：
 
 ```bash
@@ -493,8 +510,9 @@ rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness →
 rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 ```
 
-日常贡献无需手动修改版本号。普通改动合并 `main` 并通过 CI 后，由自动化准备
-Release PR；只有合并符合条件的 Release PR 才会发布。发布记录统一维护在根目录
+日常贡献无需手动修改版本号。普通改动合并 `main` 并通过 CI 后不会自动准备
+Release PR；维护者需要在 `Actions → CI → Run workflow` 中选择 `main` 并启用
+`prepare_release`。只有合并符合条件的 Release PR 才会发布。发布记录统一维护在根目录
 `CHANGELOG.md`，不再新建 `docs/release-vX.Y.Z.md`。完整流程与纯文档不发布的处理方式
 见仓库 `docs/maintaining/releasing.md`：
 <https://github.com/bigfish1913/pi-rust/blob/main/docs/maintaining/releasing.md>。

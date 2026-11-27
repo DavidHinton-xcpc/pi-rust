@@ -27,14 +27,17 @@ use crate::hooks::AgentLoopConfig;
 use crate::message::AgentMessage;
 use crate::stream_fn::StreamFn;
 use crate::types::{
-    AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, ToolExecutionMode,
+    AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, TextContentOrImage,
+    ToolExecutionMode,
 };
 
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use rpi_ai::types::{
-    AssistantMessage, AssistantMessageEvent, Content, Message, StopReason, ToolCall, ToolCallType,
+    AssistantMessage, AssistantMessageEvent, Content, Message, StopReason, ToolCall,
     ToolResultMessage, ToolResultRole,
 };
 use rpi_ai::validate_tool_arguments;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -96,6 +99,7 @@ pub async fn run_agent_loop(
         emit_event(
             &emit,
             AgentEvent::MessageStart {
+                message_id: None,
                 message: prompt.clone(),
             },
         )
@@ -103,6 +107,7 @@ pub async fn run_agent_loop(
         emit_event(
             &emit,
             AgentEvent::MessageEnd {
+                message_id: None,
                 message: prompt.clone(),
             },
         )
@@ -207,10 +212,10 @@ pub async fn run_agent_loop_from_assistant(
 
 /// A finalized tool call: the raw call, the merged result, and the error flag.
 #[derive(Clone)]
-struct FinalizedToolCall {
-    tool_call: ToolCall,
-    result: AgentToolResult,
-    is_error: bool,
+pub(crate) struct FinalizedToolCall {
+    pub(crate) tool_call: ToolCall,
+    pub(crate) result: AgentToolResult,
+    pub(crate) is_error: bool,
 }
 
 /// A batch of executed tool calls: the per-call `ToolResultMessage`s (in source
@@ -261,16 +266,15 @@ async fn run_loop(
                 // suffix through the incremental converter.
                 provider_cache.invalidate();
                 for message in pending_messages.drain(..) {
-                    emit_event(
-                        emit,
-                        AgentEvent::MessageStart {
-                            message: message.clone(),
-                        },
-                    )
+                    emit.emit_injected(AgentEvent::MessageStart {
+                        message_id: None,
+                        message: message.clone(),
+                    })
                     .await;
                     emit_event(
                         emit,
                         AgentEvent::MessageEnd {
+                            message_id: None,
                             message: message.clone(),
                         },
                     )
@@ -305,6 +309,7 @@ async fn run_loop(
                     AgentEvent::TurnEnd {
                         message: am,
                         tool_results: Vec::new(),
+                        pending_messages: pending_count(config),
                     },
                 )
                 .await;
@@ -370,6 +375,7 @@ async fn run_loop(
                 AgentEvent::TurnEnd {
                     message: am,
                     tool_results: tool_results.clone(),
+                    pending_messages: pending_count(config),
                 },
             )
             .await;
@@ -400,6 +406,7 @@ async fn run_loop(
                 new_messages,
             )
             .await
+                && !(config.signal.is_cancelled() && !tool_calls.is_empty())
             {
                 emit_event(
                     emit,
@@ -411,14 +418,60 @@ async fn run_loop(
                 return Ok(LoopOutcome::Completed);
             }
 
-            // Keep the upstream ordering here: steering is drained after the
-            // tool batch settles, even when the run was cancelled. This makes
-            // messages queued while a blocking tool was active part of the
-            // returned transcript/context instead of leaving them stranded in
-            // the queue. The next stream observes the cancelled signal and
-            // produces the terminal aborted assistant message.
+            // Retain steering queued during the tool batch even on abort. A
+            // cancelled tool continuation must end with a NEW terminal assistant:
+            // public callers return messages, not LoopOutcome, and the harness
+            // derives/persists its authoritative outcome from that assistant.
             pending_messages = drain_steering(config).await;
-            if config.signal.is_cancelled() && pending_messages.is_empty() {
+            if config.signal.is_cancelled() && !tool_calls.is_empty() {
+                emit_event(emit, AgentEvent::TurnStart).await;
+                let aborted = AgentMessage::Assistant(Box::new(AssistantMessage::terminal(
+                    message.api.clone(),
+                    message.provider.clone(),
+                    message.model.clone(),
+                    StopReason::Aborted,
+                    "Operation aborted",
+                    crate::clock::now_ms(),
+                )));
+                // Do not call a provider just to manufacture an abort, or mutate
+                // the original tool-call assistant and its settled tool results.
+                let queued_count = pending_messages.len();
+                for (ordinal, message) in pending_messages
+                    .drain(..)
+                    .chain(std::iter::once(aborted.clone()))
+                    .enumerate()
+                {
+                    let start = AgentEvent::MessageStart {
+                        message_id: None,
+                        message: message.clone(),
+                    };
+                    if ordinal < queued_count {
+                        emit.emit_injected(start).await;
+                    } else {
+                        emit_event(emit, start).await;
+                    }
+                    current_context.messages.push(message.clone());
+                    new_messages.push(message.clone());
+                    emit_event(
+                        emit,
+                        AgentEvent::MessageEnd {
+                            message_id: None,
+                            message,
+                        },
+                    )
+                    .await;
+                }
+                emit_event(
+                    emit,
+                    AgentEvent::TurnEnd {
+                        message: aborted,
+                        tool_results: Vec::new(),
+                        // 上游新加的 abort 收尾路径也要带上排队计数，否则
+                        // 远程 UI 在这条路径上看到的是「没有排队」。
+                        pending_messages: pending_count(config),
+                    },
+                )
+                .await;
                 emit_event(
                     emit,
                     AgentEvent::AgentEnd {
@@ -704,7 +757,13 @@ async fn stream_assistant_response(
                 context.messages.push(am.clone());
                 added_partial = true;
                 diagnostics
-                    .emit_agent_event(emit, AgentEvent::MessageStart { message: am })
+                    .emit_agent_event(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message_id: None,
+                            message: am,
+                        },
+                    )
                     .await;
             }
             AssistantMessageEvent::TextStart { partial, .. }
@@ -727,6 +786,7 @@ async fn stream_assistant_response(
                         .emit_agent_event(
                             emit,
                             AgentEvent::MessageUpdate {
+                                message_id: None,
                                 // `Arc` bump, not a deep clone: this fires once per
                                 // streaming delta, and the provider already built the
                                 // snapshot it hands us.
@@ -754,13 +814,23 @@ async fn stream_assistant_response(
                         .emit_agent_event(
                             emit,
                             AgentEvent::MessageStart {
+                                message_id: None,
                                 message: am.clone(),
                             },
                         )
                         .await;
                 }
+                if let Some(hooks) = &config.provider_hooks {
+                    hooks.after_response(&config.model, &final_message);
+                }
                 diagnostics
-                    .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+                    .emit_agent_event(
+                        emit,
+                        AgentEvent::MessageEnd {
+                            message_id: None,
+                            message: am,
+                        },
+                    )
                     .await;
                 if let Some(started) = event_started {
                     diagnostics.fold_ns += AssistantRequestDiagnostics::elapsed_ns(started);
@@ -789,13 +859,23 @@ async fn stream_assistant_response(
             .emit_agent_event(
                 emit,
                 AgentEvent::MessageStart {
+                    message_id: None,
                     message: am.clone(),
                 },
             )
             .await;
     }
+    if let Some(hooks) = &config.provider_hooks {
+        hooks.after_response(&config.model, &final_message);
+    }
     diagnostics
-        .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+        .emit_agent_event(
+            emit,
+            AgentEvent::MessageEnd {
+                message_id: None,
+                message: am,
+            },
+        )
         .await;
     Ok(final_message)
 }
@@ -803,6 +883,37 @@ async fn stream_assistant_response(
 // ----------------------------------------------------------------------------
 // Truncate-fail
 // ----------------------------------------------------------------------------
+
+/// Reject an ambiguous provider batch before ANY invocation starts. A duplicate
+/// call ID cannot safely correlate permission, execution, or durable result
+/// reservations, even if one of its calls would be rejected independently.
+async fn reject_ambiguous_tool_batch(
+    tool_calls: &[ToolCall],
+    emit: &Arc<dyn AgentEmitter>,
+) -> Option<ExecutedToolBatch> {
+    let mut ids = std::collections::BTreeSet::new();
+    if tool_calls.iter().all(|call| ids.insert(call.id.as_str())) {
+        return None;
+    }
+    let mut messages = Vec::with_capacity(tool_calls.len());
+    for call in tool_calls {
+        let finalized = FinalizedToolCall {
+            tool_call: call.clone(),
+            result: create_error_tool_result(
+                "Tool batch was rejected: provider returned duplicate tool call IDs",
+            ),
+            is_error: true,
+        };
+        emit_tool_execution_end(emit, &finalized).await;
+        let result = create_tool_result_message(call, &finalized.result, true);
+        emit_tool_result_message(emit, &result).await;
+        messages.push(result);
+    }
+    Some(ExecutedToolBatch {
+        messages,
+        terminate: false,
+    })
+}
 
 /// Fail every tool call in a truncated message. Mirrors TS
 /// `failToolCallsFromTruncatedMessage`. Each call gets a `tool_execution_start`
@@ -812,6 +923,9 @@ async fn fail_tool_calls_from_truncated_message(
     tool_calls: &[ToolCall],
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<ExecutedToolBatch, AgentError> {
+    if let Some(rejected) = reject_ambiguous_tool_batch(tool_calls, emit).await {
+        return Ok(rejected);
+    }
     let mut messages: Vec<ToolResultMessage> = Vec::new();
     for tool_call in tool_calls {
         emit_event(
@@ -862,6 +976,9 @@ async fn execute_tool_calls(
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<ExecutedToolBatch, AgentError> {
+    if let Some(rejected) = reject_ambiguous_tool_batch(tool_calls, emit).await {
+        return Ok(rejected);
+    }
     let has_sequential = tool_calls.iter().any(|tc| {
         current_context
             .tools
@@ -886,16 +1003,24 @@ async fn execute_tool_calls_sequential(
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<ExecutedToolBatch, AgentError> {
+    // One immutable snapshot per batch, shared by every capability/descendant.
+    let current_context = &Arc::new(current_context.clone());
+    let assistant_message = &Arc::new(assistant_message.clone());
     let mut finalized_calls: Vec<FinalizedToolCall> = Vec::new();
     let mut messages: Vec<ToolResultMessage> = Vec::new();
 
     for tool_call in tool_calls {
         if let Some(reason) = invalid_tool_call_reason(tool_call) {
-            let finalized = FinalizedToolCall {
-                tool_call: tool_call.clone(),
-                result: create_error_tool_result(&reason),
-                is_error: true,
-            };
+            let finalized = finalize_tool_call(
+                current_context,
+                assistant_message,
+                tool_call,
+                &tool_call.arguments,
+                create_error_tool_result(&reason),
+                true,
+                config,
+            )
+            .await;
             emit_tool_execution_end(emit, &finalized).await;
             let trm = create_tool_result_message(tool_call, &finalized.result, true);
             emit_tool_result_message(emit, &trm).await;
@@ -951,83 +1076,95 @@ async fn execute_tool_calls_parallel(
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<ExecutedToolBatch, AgentError> {
-    // An entry per tool call: either finalized immediately, or a pending future.
-    enum Entry {
-        Done(FinalizedToolCall),
-        Running(tokio::task::JoinHandle<FinalizedToolCall>),
-    }
-
-    let mut entries: Vec<Entry> = Vec::with_capacity(tool_calls.len());
-    // When an after-tool callback is installed, every parallel task observes
-    // the same immutable snapshots. Clone the expensive history once per
-    // batch, then only bump the Arcs for each task; the common no-callback
-    // path still performs no history clone at all.
-    let after_context = config.after_tool_call.as_ref().map(|_| {
-        (
-            Arc::new(current_context.clone()),
-            Arc::new(assistant_message.clone()),
-        )
-    });
+    // The loop owns these futures: dropping it drops execute/finalize too,
+    // rather than detaching live tasks that recovery could replay concurrently.
+    let mut running = RunningToolCalls::new();
+    let mut completed = VecDeque::new();
+    let mut finalized_by_index = Vec::with_capacity(tool_calls.len());
+    let execution_context = (
+        Arc::new(current_context.clone()),
+        Arc::new(assistant_message.clone()),
+    );
 
     for tool_call in tool_calls {
-        if let Some(reason) = invalid_tool_call_reason(tool_call) {
-            let finalized = FinalizedToolCall {
-                tool_call: tool_call.clone(),
-                result: create_error_tool_result(&reason),
-                is_error: true,
-            };
-            emit_tool_execution_end(emit, &finalized).await;
-            entries.push(Entry::Done(finalized));
-            continue;
-        }
-        emit_event(
-            emit,
-            AgentEvent::ToolExecutionStart {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                args: tool_call.arguments.clone(),
-            },
-        )
-        .await;
-
-        match prepare_tool_call(current_context, assistant_message, tool_call, config).await {
-            Prepared::Immediate { result, is_error } => {
-                let finalized = FinalizedToolCall {
-                    tool_call: tool_call.clone(),
-                    result,
-                    is_error,
+        let index = finalized_by_index.len();
+        finalized_by_index.push(None);
+        let preparation = async {
+            if let Some(reason) = invalid_tool_call_reason(tool_call) {
+                return Prepared::Immediate {
+                    result: create_error_tool_result(&reason),
+                    is_error: true,
+                    run_result_hooks: true,
                 };
-                emit_tool_execution_end(emit, &finalized).await;
-                entries.push(Entry::Done(finalized));
+            }
+            emit_event(
+                emit,
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.name.clone(),
+                    args: tool_call.arguments.clone(),
+                },
+            )
+            .await;
+            prepare_tool_call(current_context, assistant_message, tool_call, config).await
+        };
+        // Preparation remains sequential, but ready peers must keep running
+        // while a later authorization/preparation hook is awaiting them.
+        match drive_tool_calls_while(preparation, &mut running, &mut completed).await {
+            Prepared::Immediate {
+                result,
+                is_error,
+                run_result_hooks,
+            } => {
+                let finalized = if run_result_hooks {
+                    finalize_tool_call(
+                        current_context,
+                        assistant_message,
+                        tool_call,
+                        &tool_call.arguments,
+                        result,
+                        is_error,
+                        config,
+                    )
+                    .await
+                } else {
+                    FinalizedToolCall {
+                        tool_call: tool_call.clone(),
+                        result,
+                        is_error,
+                    }
+                };
+                drive_tool_calls_while(
+                    emit_tool_execution_end(emit, &finalized),
+                    &mut running,
+                    &mut completed,
+                )
+                .await;
+                finalized_by_index[index] = Some(finalized);
             }
             Prepared::Ready { tool, args } => {
-                // Spawn the execute + finalize so it runs concurrently with peers.
-                // The on_update closure captures an `Arc<AtomicBool>` gate so calls
-                // made after `execute` resolves are no-ops (late-update suppression).
                 let tc = tool_call.clone();
-                // The task only needs history for an after-tool callback. Most
-                // runs have no callback, so do not deep-copy the whole branch
-                // merely to finalize an already-owned tool result.
-                let after_context = after_context
-                    .as_ref()
-                    .map(|(ctx, am)| (Arc::clone(ctx), Arc::clone(am)));
+                let panic_call = tc.clone();
+                let (ctx, am) = (
+                    Arc::clone(&execution_context.0),
+                    Arc::clone(&execution_context.1),
+                );
                 let cfg = config.clone();
-                let emit2 = Arc::clone(emit);
-                let handle = tokio::spawn(async move {
+                let emit = Arc::clone(emit);
+                let execute = std::panic::AssertUnwindSafe(async move {
                     let executed =
-                        execute_prepared_tool_call(&tc, &tool, &args, &cfg, &emit2).await;
-                    match after_context {
-                        Some((ctx, am)) => {
-                            finalize_executed_tool_call(&ctx, &am, &tc, &args, executed, &cfg).await
-                        }
-                        None => FinalizedToolCall {
-                            tool_call: tc,
-                            result: executed.result,
-                            is_error: executed.is_error,
-                        },
-                    }
-                });
-                entries.push(Entry::Running(handle));
+                        execute_prepared_tool_call(&tc, &tool, &args, &cfg, &emit, &ctx, &am).await;
+                    finalize_executed_tool_call(&ctx, &am, &tc, &args, executed, &cfg).await
+                })
+                .catch_unwind();
+                running.push(Box::pin(async move {
+                    let finalized = execute.await.unwrap_or_else(|_| FinalizedToolCall {
+                        tool_call: panic_call,
+                        result: create_error_tool_result("tool task panicked"),
+                        is_error: true,
+                    });
+                    (index, finalized)
+                }));
             }
         }
         if config.signal.is_cancelled() {
@@ -1035,72 +1172,29 @@ async fn execute_tool_calls_parallel(
         }
     }
 
-    // Collect finalized outcomes into a slot per ordinal, emitting
-    // `tool_execution_end` IN COMPLETION ORDER.
-    let mut finalized_by_index: Vec<Option<FinalizedToolCall>> = vec![None; entries.len()];
-    let mut pending: Vec<(usize, tokio::task::JoinHandle<FinalizedToolCall>)> = Vec::new();
-    for (i, e) in entries.into_iter().enumerate() {
-        match e {
-            Entry::Done(f) => {
-                finalized_by_index[i] = Some(f);
-            }
-            Entry::Running(h) => pending.push((i, h)),
-        }
-    }
-
-    while !pending.is_empty() {
-        if pending.len() == 1 {
-            // Last one: just await it directly.
-            let (i, h) = pending.remove(0);
-            let finalized = h.await.unwrap_or_else(|_| FinalizedToolCall {
-                tool_call: panicked_tool_call(),
-                result: create_error_tool_result("tool task panicked"),
-                is_error: true,
-            });
-            emit_tool_execution_end(emit, &finalized).await;
-            finalized_by_index[i] = Some(finalized);
+    // Completion events retain completion order, including peers that finished
+    // during preparation or while a backpressured event was being delivered.
+    loop {
+        let next = match completed.pop_front() {
+            Some(next) => Some(next),
+            None => running.next().await,
+        };
+        let Some((index, finalized)) = next else {
             break;
-        }
-
-        // Multiple pending: await the *first to complete* by racing them.
-        // We poll each in turn until one is `is_finished()`, then resolve it and
-        // keep the rest for the next loop iteration. `yield_now()` keeps this fair.
-        let mut resolved: Option<(usize, FinalizedToolCall)> = None;
-        let mut still_pending: Vec<(usize, tokio::task::JoinHandle<FinalizedToolCall>)> =
-            Vec::with_capacity(pending.len());
-        // Find any already-finished handle without awaiting.
-        for (i, h) in pending.drain(..) {
-            if resolved.is_none() && h.is_finished() {
-                let finalized = h.await.unwrap_or_else(|_| FinalizedToolCall {
-                    tool_call: panicked_tool_call(),
-                    result: create_error_tool_result("tool task panicked"),
-                    is_error: true,
-                });
-                resolved = Some((i, finalized));
-            } else {
-                still_pending.push((i, h));
-            }
-        }
-        match resolved {
-            Some((i, finalized)) => {
-                emit_tool_execution_end(emit, &finalized).await;
-                finalized_by_index[i] = Some(finalized);
-                pending = still_pending;
-            }
-            None => {
-                // None finished yet: race them with select_all. Build a future that
-                // resolves when any handle completes, then push the rest back.
-                pending = still_pending;
-                race_one_and_collect(emit, &mut pending, &mut finalized_by_index).await;
-            }
-        }
+        };
+        drive_tool_calls_while(
+            emit_tool_execution_end(emit, &finalized),
+            &mut running,
+            &mut completed,
+        )
+        .await;
+        finalized_by_index[index] = Some(finalized);
     }
 
-    // After all settled: emit tool-result MessageStart/MessageEnd IN SOURCE
-    // (ordinal) ORDER.
-    let mut messages: Vec<ToolResultMessage> = Vec::new();
-    let mut finalized_calls: Vec<FinalizedToolCall> = Vec::new();
-    for slot in finalized_by_index.into_iter() {
+    // Tool-result messages still settle in source/ordinal order.
+    let mut messages = Vec::new();
+    let mut finalized_calls = Vec::new();
+    for slot in finalized_by_index {
         let finalized = slot.expect("every tool call finalized");
         let trm =
             create_tool_result_message(&finalized.tool_call, &finalized.result, finalized.is_error);
@@ -1108,71 +1202,77 @@ async fn execute_tool_calls_parallel(
         messages.push(trm);
         finalized_calls.push(finalized);
     }
-
     Ok(ExecutedToolBatch {
         messages,
         terminate: should_terminate_tool_batch(&finalized_calls),
     })
 }
 
-/// Race the pending tool futures and, as each completes, emit its
-/// `tool_execution_end` (completion order) and stash it into
-/// `finalized_by_index`. Loops until `pending` is empty.
-///
-/// This uses `futures::future::select_all` to await the first completion, then
-/// re-runs with the remainder — O(n²) but n is the tool-call count per turn
-/// (typically small), and it preserves exact completion order for the
-/// ordering invariant without a `JoinSet` borrow-dance.
-async fn race_one_and_collect(
-    emit: &Arc<dyn AgentEmitter>,
-    pending: &mut Vec<(usize, tokio::task::JoinHandle<FinalizedToolCall>)>,
-    finalized_by_index: &mut [Option<FinalizedToolCall>],
-) {
-    // Take ownership of the join handles and box them into a uniform future type
-    // so `select_all` can race them. Each future resolves to its ordinal + the
-    // finalized outcome; as each completes we emit `tool_execution_end` (THIS is
-    // where completion order is honored) and stash the result by ordinal.
-    let indexed: Vec<(usize, tokio::task::JoinHandle<FinalizedToolCall>)> = std::mem::take(pending);
-    let mut boxed: Vec<
-        std::pin::Pin<Box<dyn std::future::Future<Output = (usize, FinalizedToolCall)> + Send>>,
-    > = Vec::with_capacity(indexed.len());
-    for (i, h) in indexed {
-        boxed.push(Box::pin(async move {
-            let f = h.await.unwrap_or_else(|_| FinalizedToolCall {
-                tool_call: panicked_tool_call(),
-                result: create_error_tool_result("tool task panicked"),
-                is_error: true,
-            });
-            (i, f)
-        }));
-    }
+type RunningToolCalls = FuturesUnordered<BoxFuture<'static, (usize, FinalizedToolCall)>>;
 
-    while !boxed.is_empty() {
-        // select_all returns (output, index_of_completed, remaining_futures).
-        let (outcome, _idx, rest) = futures::future::select_all(boxed).await;
-        boxed = rest;
-        let (i, finalized) = outcome;
-        emit_tool_execution_end(emit, &finalized).await;
-        finalized_by_index[i] = Some(finalized);
+/// Drive owned execute futures even while preparation/event delivery waits.
+/// Completed calls queue up for ordered event delivery; no tool task detaches.
+async fn drive_tool_calls_while<F: std::future::Future>(
+    future: F,
+    running: &mut RunningToolCalls,
+    completed: &mut VecDeque<(usize, FinalizedToolCall)>,
+) -> F::Output {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return output,
+            Some(result) = running.next(), if !running.is_empty() => {
+                completed.push_back(result);
+            }
+        }
     }
 }
 
 /// Shared core for the sequential path: prepare → execute → finalize.
-async fn run_one_tool_call(
-    current_context: &AgentContext,
-    assistant_message: &AssistantMessage,
+pub(crate) async fn run_one_tool_call(
+    current_context: &Arc<AgentContext>,
+    assistant_message: &Arc<AssistantMessage>,
     tool_call: &ToolCall,
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<FinalizedToolCall, AgentError> {
     match prepare_tool_call(current_context, assistant_message, tool_call, config).await {
-        Prepared::Immediate { result, is_error } => Ok(FinalizedToolCall {
-            tool_call: tool_call.clone(),
+        Prepared::Immediate {
             result,
             is_error,
-        }),
+            run_result_hooks,
+        } => {
+            let finalized = if run_result_hooks {
+                finalize_tool_call(
+                    current_context,
+                    assistant_message,
+                    tool_call,
+                    &tool_call.arguments,
+                    result,
+                    is_error,
+                    config,
+                )
+                .await
+            } else {
+                FinalizedToolCall {
+                    tool_call: tool_call.clone(),
+                    result,
+                    is_error,
+                }
+            };
+            Ok(finalized)
+        }
         Prepared::Ready { tool, args } => {
-            let executed = execute_prepared_tool_call(tool_call, &tool, &args, config, emit).await;
+            let executed = execute_prepared_tool_call(
+                tool_call,
+                &tool,
+                &args,
+                config,
+                emit,
+                current_context,
+                assistant_message,
+            )
+            .await;
             Ok(finalize_executed_tool_call(
                 current_context,
                 assistant_message,
@@ -1190,8 +1290,13 @@ async fn run_one_tool_call(
 enum Prepared {
     /// Resolved without executing (not-found / blocked / aborted / validation error).
     Immediate {
+        /// A fresh failure produced by this run. The result transforms run
+        /// on it before it reaches the model, transcript or session.
         result: AgentToolResult,
         is_error: bool,
+        /// Recorded calls have already run upstream: never execute them,
+        /// invoke hooks on them or transform their recorded result.
+        run_result_hooks: bool,
     },
     /// Validated and ready to execute.
     Ready {
@@ -1216,6 +1321,23 @@ async fn prepare_tool_call(
         return Prepared::Immediate {
             result: create_error_tool_result(&reason),
             is_error: true,
+            run_result_hooks: true,
+        };
+    }
+
+    // A recorded call already ran upstream. Its recording is the result, and the
+    // call must never reach a tool, a hook or an approval prompt: any path to
+    // `execute` would run it a second time. An unusable recording is an error
+    // result, which is also not an execution.
+    if let Some(recording) = &tool_call.recorded {
+        let (result, is_error) = match recorded_tool_result(recording) {
+            Ok(decoded) => decoded,
+            Err(reason) => (create_error_tool_result(&reason), true),
+        };
+        return Prepared::Immediate {
+            result,
+            is_error,
+            run_result_hooks: false,
         };
     }
 
@@ -1230,6 +1352,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result(&format!("Tool {} not found", tool_call.name)),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
     };
@@ -1241,6 +1364,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result(&e.to_string()),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
     };
@@ -1253,6 +1377,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result(&e.to_string()),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
     };
@@ -1276,6 +1401,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result("Operation aborted"),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
         if let Some(br) = before_result {
@@ -1293,6 +1419,9 @@ async fn prepare_tool_call(
                 return Prepared::Immediate {
                     result,
                     is_error: true,
+                    // The CLI already offered a veto reason to the result
+                    // transforms; running them again would transform it twice.
+                    run_result_hooks: false,
                 };
             }
         }
@@ -1302,6 +1431,7 @@ async fn prepare_tool_call(
         return Prepared::Immediate {
             result: create_error_tool_result("Operation aborted"),
             is_error: true,
+            run_result_hooks: true,
         };
     }
 
@@ -1325,6 +1455,71 @@ fn invalid_tool_call_reason(tool_call: &ToolCall) -> Option<String> {
     None
 }
 
+/// Decode the `recorded` field of a streamed tool call into the tool result it
+/// stands for, plus whether that result is an error.
+///
+/// The accepted shape is
+/// `{"version":1,"isError":bool,"result":{"content":[...],"details":any,"terminate":bool}}`,
+/// which is what the Cursor replay worker emits. `result.content` holds `text`
+/// or `image` blocks. `details` and `terminate` are optional; `terminate` sets
+/// `AgentToolResult::terminate`, so a recorded batch can stop the loop the same
+/// way a live one does. Other fields inside `result` are ignored. A partial
+/// recording such as `{"version":1}` is rejected as invalid. Any other version
+/// is reported as unsupported. Callers answer a rejected recording with an error
+/// result and never execute the call.
+pub fn recorded_tool_result(
+    recording: &serde_json::Value,
+) -> Result<(AgentToolResult, bool), String> {
+    const INVALID: &str =
+        "Recorded tool result is unavailable or invalid; replay cannot execute work";
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Recording {
+        // Checked above; present here so `deny_unknown_fields` accepts it.
+        _version: u64,
+        is_error: bool,
+        result: RecordedResult,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RecordedResult {
+        content: Vec<Content>,
+        #[serde(default)]
+        details: serde_json::Value,
+        #[serde(default)]
+        terminate: bool,
+    }
+    match recording.get("version").and_then(serde_json::Value::as_u64) {
+        Some(1) => {}
+        Some(_) => {
+            return Err(
+                "Unsupported recorded tool result version; replay cannot execute work".into(),
+            );
+        }
+        None => return Err(INVALID.into()),
+    }
+    let recording: Recording =
+        serde_json::from_value(recording.clone()).map_err(|_| INVALID.to_string())?;
+    let result = recording.result;
+    let content = result
+        .content
+        .into_iter()
+        .map(|block| match block {
+            Content::Text(text) => Ok(TextContentOrImage::Text(text)),
+            Content::Image(image) => Ok(TextContentOrImage::Image(image)),
+            _ => Err(INVALID.to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = AgentToolResult {
+        content,
+        details: result.details,
+        usage: None,
+        added_tool_names: Vec::new(),
+        terminate: result.terminate,
+    };
+    Ok((result, recording.is_error))
+}
+
 #[cfg(test)]
 mod invalid_tool_call_tests {
     use super::invalid_tool_call_reason;
@@ -1338,6 +1533,7 @@ mod invalid_tool_call_tests {
             arguments: serde_json::json!({}),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         }
     }
 
@@ -1349,6 +1545,15 @@ mod invalid_tool_call_tests {
     }
 }
 
+/// Close the update gate even if execute unwinds or its owner is dropped.
+struct ToolUpdateGuard(Arc<AtomicBool>);
+
+impl Drop for ToolUpdateGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Run the tool's `execute` with late-update suppression. Mirrors TS
 /// `executePreparedToolCall`.
 async fn execute_prepared_tool_call(
@@ -1357,10 +1562,17 @@ async fn execute_prepared_tool_call(
     args: &serde_json::Value,
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
+    current_context: &Arc<AgentContext>,
+    assistant_message: &Arc<AssistantMessage>,
 ) -> ExecutedToolCallOutcome {
+    let child_token = config.signal.child_token();
+    // Retire the native invocation after execute (including adapter image
+    // postprocessing) and descendant drain, not when its program binding closes.
+    let _native_lifetime = crate::tool_program::InvocationLifetime(child_token.clone());
     // Gate for late updates: flipped false once execute resolves. on_update
     // checks it and returns early. This is the late-update-suppression invariant.
     let accepting_updates = Arc::new(AtomicBool::new(true));
+    let _update_guard = ToolUpdateGuard(Arc::clone(&accepting_updates));
     let tool_call_id = tool_call.id.clone();
     let tool_name = tool_call.name.clone();
     let diagnostic_tool_name = tool_name.clone();
@@ -1369,12 +1581,12 @@ async fn execute_prepared_tool_call(
 
     let on_update: Arc<dyn Fn(crate::types::ToolResultPartial) + Send + Sync> = {
         let gate = Arc::clone(&accepting_updates);
+        let update_signal = child_token.clone();
         Arc::new(move |partial: crate::types::ToolResultPartial| {
-            if !gate.load(Ordering::SeqCst) {
+            if !gate.load(Ordering::SeqCst) || update_signal.is_cancelled() {
                 return;
             }
-            // Cancellation during a cancelled batch: still emit for non-cancelled
-            // runs; the gate above is the real suppression.
+            // Both completion and cancellation retire the native update callback.
             let ev = AgentEvent::ToolExecutionUpdate {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
@@ -1389,25 +1601,46 @@ async fn execute_prepared_tool_call(
         })
     };
 
-    let child_token = config.signal.child_token();
+    let capability = crate::tool_program::ToolProgram::capture(
+        current_context,
+        assistant_message,
+        tool_call,
+        config,
+        child_token.clone(),
+        on_update.clone(),
+        emit,
+    );
+    let _lifetime = crate::tool_program::InvocationLifetime(capability.signal.clone());
     let execute_started = agent_diagnostics_enabled().then(Instant::now);
-    let outcome = match tool
-        .execute(&tool_call.id, args.clone(), child_token, on_update)
+    let executed = std::panic::AssertUnwindSafe(async {
+        crate::tool_program::scope(
+            capability.clone(),
+            tool.execute(&tool_call.id, args.clone(), child_token, on_update),
+        )
         .await
-    {
-        Ok(result) => {
-            accepting_updates.store(false, Ordering::SeqCst);
-            ExecutedToolCallOutcome {
-                result,
-                is_error: false,
-            }
-        }
-        Err(e) => {
-            accepting_updates.store(false, Ordering::SeqCst);
-            ExecutedToolCallOutcome {
-                result: create_error_tool_result(&e.to_string()),
-                is_error: true,
-            }
+    })
+    .catch_unwind()
+    .await;
+    accepting_updates.store(false, Ordering::SeqCst);
+    let mut outcome = match executed {
+        Ok(Ok(result)) => ExecutedToolCallOutcome {
+            result,
+            is_error: false,
+        },
+        Ok(Err(AgentError::StructuredTool(result))) => ExecutedToolCallOutcome {
+            result: *result,
+            is_error: true,
+        },
+        Ok(Err(e)) => ExecutedToolCallOutcome {
+            result: create_error_tool_result(&e.to_string()),
+            is_error: true,
+        },
+        Err(panic) => {
+            // Keep the containing request's gate/permits until every descendant
+            // has stopped, even when execute unwinds. Then let the existing
+            // outer panic handler preserve its error and hook semantics.
+            capability.finish().await;
+            std::panic::resume_unwind(panic);
         }
     };
     if let Some(started) = execute_started {
@@ -1419,7 +1652,33 @@ async fn execute_prepared_tool_call(
             started.elapsed().as_nanos().min(u64::MAX as u128),
         );
     }
+    capability.finish().await;
+    if let Err(error) = capability.merge_accounting(&mut outcome.result) {
+        outcome.is_error = true;
+        outcome.result.content.push(TextContentOrImage::text(error));
+    }
     outcome
+}
+
+/// Apply `after_tool_call` overrides to a tool's executed result.
+async fn finalize_executed_tool_call(
+    current_context: &AgentContext,
+    assistant_message: &AssistantMessage,
+    tool_call: &ToolCall,
+    args: &serde_json::Value,
+    executed: ExecutedToolCallOutcome,
+    config: &AgentLoopConfig,
+) -> FinalizedToolCall {
+    finalize_tool_call(
+        current_context,
+        assistant_message,
+        tool_call,
+        args,
+        executed.result,
+        executed.is_error,
+        config,
+    )
+    .await
 }
 
 /// Result of `execute` before `after_tool_call` overrides. Mirrors TS
@@ -1429,18 +1688,18 @@ struct ExecutedToolCallOutcome {
     is_error: bool,
 }
 
-/// Apply `after_tool_call` overrides. Mirrors TS `finalizeExecutedToolCall`.
-async fn finalize_executed_tool_call(
+/// Apply `after_tool_call` overrides to any model-visible result,
+/// whether it came from an executed tool or an immediate failure.
+/// Mirrors TS `finalizeExecutedToolCall`.
+async fn finalize_tool_call(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
     args: &serde_json::Value,
-    executed: ExecutedToolCallOutcome,
+    mut result: AgentToolResult,
+    mut is_error: bool,
     config: &AgentLoopConfig,
 ) -> FinalizedToolCall {
-    let mut result = executed.result;
-    let mut is_error = executed.is_error;
-
     if let Some(after) = &config.after_tool_call {
         let ctx = AfterToolCallContext {
             assistant_message,
@@ -1537,11 +1796,19 @@ async fn emit_tool_result_message(emit: &Arc<dyn AgentEmitter>, trm: &ToolResult
     emit_event(
         emit,
         AgentEvent::MessageStart {
+            message_id: None,
             message: am.clone(),
         },
     )
     .await;
-    emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
+    emit_event(
+        emit,
+        AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        },
+    )
+    .await;
 }
 
 /// Drain steering messages (empty vec if no hook).
@@ -1551,6 +1818,18 @@ async fn drain_steering(config: &AgentLoopConfig) -> Vec<AgentMessage> {
     } else {
         Vec::new()
     }
+}
+
+/// How many messages are still queued (steering + follow-up), **without draining**.
+///
+/// Must not use `drain_steering` / `drain_follow_up`: those consume the queue.
+/// A host that does not install the hook reports 0 — same as "nothing queued".
+fn pending_count(config: &AgentLoopConfig) -> usize {
+    config
+        .pending_message_count
+        .as_ref()
+        .map(|f| f())
+        .unwrap_or(0)
 }
 
 /// Drain follow-up messages (empty vec if no hook).
@@ -1624,16 +1903,4 @@ async fn should_stop_after_turn(
 /// Emit one event via the emitter.
 async fn emit_event(emit: &Arc<dyn AgentEmitter>, event: AgentEvent) {
     emit.emit(event).await;
-}
-
-/// A placeholder tool call for the panic-recovery path.
-fn panicked_tool_call() -> ToolCall {
-    ToolCall {
-        kind: ToolCallType,
-        id: "<panic>".to_string(),
-        name: "<panic>".to_string(),
-        arguments: serde_json::Value::Null,
-        thought_signature: None,
-        namespace: None,
-    }
 }

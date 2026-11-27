@@ -15,6 +15,13 @@ const MAX_MANIFEST: u64 = 256 * 1024;
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_LIBRARY: u64 = 128 * 1024 * 1024;
 const MAX_ENTRIES: usize = 128;
+/// Optional archive index for sidecar files beside the library. Archives
+/// without it are the legacy single-library layout.
+const RUNTIME_ASSETS_FILE: &str = "runtime-assets.json";
+/// Largest accepted `runtime-assets.json`, in bytes.
+const MAX_ASSET_INDEX: u64 = 256 * 1024;
+/// Longest accepted sidecar path, in bytes.
+const MAX_ASSET_PATH: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrebuiltRecord {
@@ -29,6 +36,58 @@ pub struct PrebuiltRecord {
     /// Explicit repository installs discover versions from package-specific tags.
     #[serde(default)]
     pub custom_repository: bool,
+    /// Sidecar files installed beside the library, as verified against the
+    /// archive index. Empty for single-library archives, so their records are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<PrebuiltAsset>,
+}
+
+/// One verified sidecar file, relative to the extension store directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrebuiltAsset {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// The sidecar index inside a package archive: `runtime-assets.json`.
+#[derive(Debug, Deserialize)]
+struct RuntimeAssetIndex {
+    schema_version: u32,
+    assets: Vec<RuntimeAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeAsset {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+/// Size caps for one archive: each file, and every expanded byte together.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArchiveLimits {
+    pub per_file: u64,
+    pub total: u64,
+}
+
+impl ArchiveLimits {
+    pub(crate) const PREBUILT: Self = Self {
+        per_file: MAX_LIBRARY,
+        total: MAX_ARCHIVE,
+    };
+}
+
+/// A sidecar whose bytes match the archive index.
+pub(crate) struct VerifiedAsset {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Verified archive contents. `assets` follow the order of the archive index.
+pub(crate) struct PrebuiltContents {
+    pub library: Vec<u8>,
+    pub assets: Vec<VerifiedAsset>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,20 +155,26 @@ struct GitReference {
     reference: String,
 }
 
-fn stable_tag_version(refs: &[GitReference], name: &str) -> Result<String, String> {
+fn best_tag_version(refs: &[GitReference], name: &str) -> Option<semver::Version> {
     let prefix = format!("refs/tags/{name}-v");
-    refs.iter().filter_map(|r| r.reference.strip_prefix(&prefix))
-        .filter_map(|v| semver::Version::parse(v).ok()).filter(|v| v.pre.is_empty())
-        .max().map(|v| v.to_string()).ok_or_else(|| format!("no stable {name}-v<version> tag exists in this repository; specify --version explicitly"))
+    refs.iter()
+        .filter_map(|reference| reference.reference.strip_prefix(&prefix))
+        .filter_map(|version| semver::Version::parse(version).ok())
+        .filter(|version| version.pre.is_empty())
+        .max()
 }
 
-async fn repository_version(
+fn tag_published(refs: &[GitReference], name: &str, version: &str) -> bool {
+    let expected = format!("refs/tags/{name}-v{version}");
+    refs.iter().any(|reference| reference.reference == expected)
+}
+
+async fn repository_tags(
     client: &reqwest::Client,
     api: &str,
     name: &str,
     repository: &str,
-) -> Result<String, String> {
-    let repository = canonical_repository(repository)?;
+) -> Result<Vec<GitReference>, String> {
     let repo = repository
         .strip_prefix("https://github.com/")
         .ok_or("invalid GitHub repository")?;
@@ -124,18 +189,64 @@ async fn repository_version(
     if !response.status().is_success() {
         return Err(format!("GitHub tag lookup returned {}", response.status()));
     }
-    let refs: Vec<GitReference> =
-        serde_json::from_slice(&body_limited(response, MAX_METADATA).await?)
-            .map_err(|e| format!("invalid GitHub tag metadata: {e}"))?;
-    stable_tag_version(&refs, name)
+    serde_json::from_slice(&body_limited(response, MAX_METADATA).await?)
+        .map_err(|e| format!("invalid GitHub tag metadata: {e}"))
 }
 
-/// The five supported triples are deliberately exact: GNU/musl and MSVC/GNU
-/// are different native-library distributions.
+/// Highest stable release across the requested repository and, after a
+/// repository move, its current home. The winning repository is returned with
+/// the version because its release assets are the ones that must be verified
+/// and recorded; this is what migrates an installed extension to the new
+/// location instead of freezing it on the old, no-longer-published tags.
+async fn repository_version(
+    client: &reqwest::Client,
+    api: &str,
+    name: &str,
+    repository: &str,
+) -> Result<(String, String), String> {
+    let requested = canonical_repository(repository)?;
+    let current = moved_repository(&requested).to_string();
+    let mut candidates = vec![requested.clone()];
+    if current != requested {
+        candidates.push(current);
+    }
+    let mut best: Option<(semver::Version, String)> = None;
+    let mut failure = None;
+    for candidate in candidates {
+        match repository_tags(client, api, name, &candidate).await {
+            Ok(refs) => {
+                let Some(version) = best_tag_version(&refs, name) else {
+                    continue;
+                };
+                // Ties prefer the later candidate, which is the current home
+                // of a moved repository: a release that both locations still
+                // publish records the new location instead of pinning the
+                // install to the previous one.
+                if best.as_ref().is_none_or(|(best, _)| version >= *best) {
+                    best = Some((version, candidate));
+                }
+            }
+            Err(error) => failure = failure.or(Some(error)),
+        }
+    }
+    match best {
+        Some((version, repository)) => Ok((version.to_string(), repository)),
+        None => Err(match failure {
+            Some(error) => format!("{}: {error}", short_repository(&requested)),
+            None => format!(
+                "no stable {name}-v<version> tag exists in this repository; specify --version explicitly"
+            ),
+        }),
+    }
+}
+
+/// Supported triples are deliberately exact: GNU/musl and MSVC/GNU are
+/// different native-library distributions.
 pub fn host_target() -> Result<&'static str, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") if cfg!(target_env = "msvc") => Ok("x86_64-pc-windows-msvc"),
         ("linux", "x86_64") if cfg!(target_env = "gnu") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "x86_64") if cfg!(target_env = "musl") => Ok("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") if cfg!(target_env = "gnu") => Ok("aarch64-unknown-linux-gnu"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
@@ -193,6 +304,42 @@ pub(crate) fn canonical_repository(value: &str) -> Result<String, String> {
         segments[0].to_ascii_lowercase(),
         repo.to_ascii_lowercase()
     ))
+}
+
+/// Repositories that moved to a new home, as `(previous, current)` canonical
+/// URLs. The previous location keeps serving the releases and CDN objects it
+/// already published, so pinned versions and already-installed extensions keep
+/// working; version discovery, upgrade detection and new releases follow the
+/// move.
+const MOVED_REPOSITORIES: &[(&str, &str)] = &[(
+    "https://github.com/pi-rust/rpi-package",
+    "https://github.com/pi-rust/rpi-extension",
+)];
+
+/// The current home of a moved repository, else `repository` unchanged.
+///
+/// Callers pass canonical URLs (see [`canonical_repository`]).
+fn moved_repository(repository: &str) -> &str {
+    MOVED_REPOSITORIES
+        .iter()
+        .find(|(previous, _)| *previous == repository)
+        .map(|(_, current)| *current)
+        .unwrap_or(repository)
+}
+
+/// Whether two canonical repository URLs identify the same extension project,
+/// including the previous and current spelling of a moved repository.
+///
+/// Provenance records written before a move must not be treated as a different
+/// publisher: that would both hide updates and refuse to install them.
+pub(crate) fn same_repository_project(one: &str, other: &str) -> bool {
+    moved_repository(one) == moved_repository(other)
+}
+
+pub(crate) fn short_repository(repository: &str) -> &str {
+    repository
+        .strip_prefix("https://github.com/")
+        .unwrap_or(repository)
 }
 
 fn release_url(repository: &str, name: &str, version: &str, file: &str) -> Result<String, String> {
@@ -257,10 +404,24 @@ async fn resolve_package(
     // An explicit repository + version also supports unpublished third-party extensions.
     if let Some(repository) = repository {
         let repository = canonical_repository(repository)?;
-        let version = match version {
-            Some(version) => semver::Version::parse(version)
-                .map_err(|_| "--version requires an exact semantic version".to_string())?
-                .to_string(),
+        let (version, repository) = match version {
+            Some(version) => {
+                let version = semver::Version::parse(version)
+                    .map_err(|_| "--version requires an exact semantic version".to_string())?
+                    .to_string();
+                // A pinned version also follows a repository move when the
+                // current home publishes it; otherwise the previous location,
+                // which still hosts that release, keeps serving it.
+                let repository = follow_repository_move(
+                    client,
+                    "https://api.github.com",
+                    repository,
+                    name,
+                    &version,
+                )
+                .await;
+                (version, repository)
+            }
             None => repository_version(client, "https://api.github.com", name, &repository).await?,
         };
         return Ok(ResolvedPackage {
@@ -296,12 +457,53 @@ async fn resolve_package(
     let repository = repository
         .or(data.metadata.repository.as_deref())
         .ok_or("crate has no repository metadata; use --github owner/repo or --build")?;
+    let repository = canonical_repository(repository)?;
+    // `api` above is the crates.io base; repository tags live on GitHub.
+    let repository = follow_repository_move(
+        client,
+        "https://api.github.com",
+        repository,
+        &data.metadata.id,
+        &version,
+    )
+    .await;
     Ok(ResolvedPackage {
         name: data.metadata.id,
         version,
-        repository: canonical_repository(repository)?,
+        repository,
         custom_repository: false,
     })
+}
+
+/// Prefer a moved repository's current home for a version it actually
+/// publishes. Published or pinned versions that only exist in the previous
+/// location keep resolving there, so a stale crates.io `repository` field never
+/// makes an install fail and never loses an existing release.
+async fn follow_repository_move(
+    client: &reqwest::Client,
+    api: &str,
+    repository: String,
+    name: &str,
+    version: &str,
+) -> String {
+    let current = moved_repository(&repository).to_string();
+    if current == repository {
+        return repository;
+    }
+    let Ok(url) = release_url(&current, name, version, "rpi-extension.json") else {
+        return repository;
+    };
+    match client.head(url).send().await {
+        Ok(response) if response.status().is_success() => current,
+        Ok(_) => repository,
+        // The release host can be unreachable while the GitHub API still
+        // answers (proxies and restricted networks), so fall back to the tag
+        // list instead of assuming the previous location still publishes.
+        Err(_) => match repository_tags(client, api, name, &current).await {
+            Ok(refs) if tag_published(&refs, name, version) => current,
+            _ => repository,
+        },
+    }
 }
 
 pub(crate) fn hash(bytes: &[u8]) -> String {
@@ -336,7 +538,10 @@ fn validate_manifest<'a>(
     if manifest.name != package.name
         || manifest.version != package.version
         || manifest.tag != format!("{}-v{}", package.name, package.version)
-        || canonical_repository(&manifest.repository)? != package.repository
+        || !same_repository_project(
+            &canonical_repository(&manifest.repository)?,
+            &package.repository,
+        )
     {
         return Err("prebuilt manifest package, version, repository or tag does not match the requested package".into());
     }
@@ -427,10 +632,13 @@ pub(crate) fn validate_release_asset_url(
         || segments[2] != "releases"
         || segments[3] != "download"
         || segments[4] != tag
-        || canonical_repository(&format!(
-            "https://github.com/{}/{}",
-            segments[0], segments[1]
-        ))? != repository
+        || !same_repository_project(
+            &canonical_repository(&format!(
+                "https://github.com/{}/{}",
+                segments[0], segments[1]
+            ))?,
+            repository,
+        )
         || segments[5].is_empty()
         || matches!(segments[5].as_str(), "." | "..")
         || !segments[5]
@@ -493,7 +701,7 @@ pub async fn latest_compatible_version(
         .custom_repository
         .then_some(record.repository.as_str());
     let resolved = resolve_package(client, CRATES_API, &package.name, None, repository).await?;
-    if resolved.repository != record.repository {
+    if !same_repository_project(&resolved.repository, &record.repository) {
         return Err(
             "extension repository changed; reinstall explicitly to select a new publisher".into(),
         );
@@ -511,6 +719,7 @@ pub async fn install(
     version: Option<&str>,
     repository: Option<&str>,
     force: bool,
+    cdn_base: Option<&reqwest::Url>,
 ) -> Result<(), String> {
     let records = crate::install::installed_native_packages_strict()?;
     let existing = records.iter().find(|p| p.name == name);
@@ -528,10 +737,20 @@ pub async fn install(
     });
     let package = resolve_package(&client, CRATES_API, name, version, repository).await?;
     if let Some(record) = existing.and_then(|p| p.prebuilt.as_ref()) {
-        if repository.is_none() && record.repository != package.repository {
+        if repository.is_none() && !same_repository_project(&record.repository, &package.repository)
+        {
             return Err(
                 "extension repository changed; select the new repository explicitly with --github"
                     .into(),
+            );
+        }
+        if record.repository != package.repository
+            && same_repository_project(&record.repository, &package.repository)
+        {
+            println!(
+                "publisher moved from {} to {}; recording the new location",
+                short_repository(&record.repository),
+                short_repository(&package.repository)
             );
         }
     }
@@ -550,17 +769,23 @@ pub async fn install(
     );
     let (manifest, manifest_bytes) = fetch_manifest(&client, &package).await?;
     let distribution = validate_manifest(&manifest, &package, target)?;
-    let response = client
-        .get(&distribution.url)
-        .timeout(std::time::Duration::from_secs(180))
-        .send()
-        .await
-        .map_err(|e| format!("archive request failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("archive request returned {}", response.status()));
-    }
-    let archive = body_limited(response, distribution.size).await?;
+    let cdn_urls = cdn_base
+        .map(|base| {
+            crate::cdn::archive_urls(base, &package.repository, &manifest.tag, &distribution.url)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let archive = crate::cdn::download_with_fallback(
+        &client,
+        &cdn_urls,
+        &distribution.url,
+        distribution.size,
+        &distribution.sha256,
+        "archive",
+    )
+    .await?;
     let agent_dir = crate::config::agent_dir().map_err(|e| e.to_string())?;
+    let agent_dir_for_gc = agent_dir.clone();
     let target = target.to_string();
     let installed = tokio::task::spawn_blocking(move || {
         install_archive_at(
@@ -577,6 +802,14 @@ pub async fn install(
     .map_err(|e| format!("prebuilt installation failed: {e}"))??;
     for path in installed {
         println!("installed {}", path.display());
+    }
+    if matches!(
+        crate::install::gc_retired_native_artifacts(&agent_dir_for_gc),
+        crate::install::RetiredGcOutcome::Deferred
+    ) {
+        eprintln!(
+            "warning: stale native extension artifacts were not cleaned up because the resource lease could not be acquired (a running rpi host or lease setup failure); they will be ignored at startup and retried on a later install"
+        );
     }
     println!("rpi will validate the plugin entrypoint/SDK API size and load this extension on the next start.");
     Ok(())
@@ -596,9 +829,10 @@ fn install_archive_at(
         return Err("archive byte length does not match manifest".into());
     }
     check_hash(archive, &distribution.sha256)?;
-    let bytes = extract_library(archive, &distribution.format, &distribution.library.path)?;
-    check_hash(&bytes, &distribution.library.sha256)?;
-    validate_library_target(&bytes, target)?;
+    // Everything is verified in memory before the extension store is touched.
+    let contents = extract_contents(archive, &distribution.format, &distribution.library.path)?;
+    check_hash(&contents.library, &distribution.library.sha256)?;
+    validate_library_target(&contents.library, target)?;
     let provenance = PrebuiltRecord {
         repository: package.repository.clone(),
         target: target.into(),
@@ -609,10 +843,26 @@ fn install_archive_at(
         archive_sha256: distribution.sha256.clone(),
         library_sha256: distribution.library.sha256.clone(),
         custom_repository: package.custom_repository,
+        assets: contents
+            .assets
+            .iter()
+            .map(|asset| PrebuiltAsset {
+                path: asset.path.clone(),
+                sha256: asset.sha256.clone(),
+            })
+            .collect(),
     };
     let temporary = tempfile::tempdir().map_err(|e| e.to_string())?;
     let artifact = temporary.path().join(&distribution.library.path);
-    std::fs::write(&artifact, bytes).map_err(|e| e.to_string())?;
+    std::fs::write(&artifact, &contents.library).map_err(|e| e.to_string())?;
+    let assets: Vec<crate::install::NativeAssetFile> = contents
+        .assets
+        .into_iter()
+        .map(|asset| crate::install::NativeAssetFile {
+            path: asset.path,
+            bytes: asset.bytes,
+        })
+        .collect();
     let record = crate::install::InstalledNativePackage {
         name: package.name.clone(),
         version: package.version.clone(),
@@ -621,11 +871,12 @@ fn install_archive_at(
         prebuilt: Some(provenance),
         artifacts: Vec::new(),
     };
-    crate::install::install_native_package_at(
+    crate::install::install_native_package_with_assets_at(
         &agent_dir.join("extensions"),
         &agent_dir.join("native-packages.json"),
         record,
         &[artifact],
+        &assets,
         force,
     )
 }
@@ -659,13 +910,22 @@ fn read_library(reader: impl Read) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-pub(crate) fn extract_library(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Directory,
+    File,
+}
+
+/// Visit every entry of a prebuilt archive in archive order. Unsafe names, links,
+/// more than `MAX_ENTRIES` entries and more than `total` expanded bytes are rejected
+/// here, for every archive. Visitors decide what to read.
+fn walk_archive(
     archive: &[u8],
     format: &str,
-    library: &str,
-) -> Result<Vec<u8>, String> {
-    let mut found = None;
-    let mut total = 0u64;
+    total: u64,
+    mut visit: impl FnMut(&Path, EntryKind, &mut dyn Read) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut expanded = 0u64;
     match format {
         "zip" => {
             let mut zip = zip::ZipArchive::new(Cursor::new(archive)).map_err(|e| e.to_string())?;
@@ -673,7 +933,7 @@ pub(crate) fn extract_library(
                 return Err("too many archive entries".into());
             }
             for i in 0..zip.len() {
-                let file = zip.by_index(i).map_err(|e| e.to_string())?;
+                let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
                 let path = safe_entry_name(file.name())?;
                 if file
                     .unix_mode()
@@ -681,28 +941,28 @@ pub(crate) fn extract_library(
                 {
                     return Err("archive symlinks are not allowed".into());
                 }
-                total = total
+                expanded = expanded
                     .checked_add(file.size())
                     .ok_or("archive size overflow")?;
-                if total > MAX_ARCHIVE {
+                if expanded > total {
                     return Err("expanded archive exceeds size limit".into());
                 }
-                if !file.is_dir() && path == Path::new(library) {
-                    if found.is_some() {
-                        return Err("duplicate declared library in archive".into());
-                    }
-                    found = Some(read_library(file)?);
-                }
+                let kind = if file.is_dir() {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                visit(&path, kind, &mut file)?;
             }
         }
         "tar.gz" => {
-            let decoder = flate2::read::GzDecoder::new(Cursor::new(archive)).take(MAX_ARCHIVE + 1);
+            let decoder = flate2::read::GzDecoder::new(Cursor::new(archive)).take(total + 1);
             let mut tar = tar::Archive::new(decoder);
             for (i, entry) in tar.entries().map_err(|e| e.to_string())?.enumerate() {
                 if i >= MAX_ENTRIES {
                     return Err("too many archive entries".into());
                 }
-                let file = entry.map_err(|e| e.to_string())?;
+                let mut file = entry.map_err(|e| e.to_string())?;
                 let name = file
                     .path()
                     .map_err(|e| e.to_string())?
@@ -713,23 +973,311 @@ pub(crate) fn extract_library(
                 if !kind.is_file() && !kind.is_dir() {
                     return Err("archive links and special files are not allowed".into());
                 }
-                total = total
+                expanded = expanded
                     .checked_add(file.size())
                     .ok_or("archive size overflow")?;
-                if total > MAX_ARCHIVE {
+                if expanded > total {
                     return Err("expanded archive exceeds size limit".into());
                 }
-                if kind.is_file() && path == Path::new(library) {
-                    if found.is_some() {
-                        return Err("duplicate declared library in archive".into());
-                    }
-                    found = Some(read_library(file)?);
-                }
+                let kind = if kind.is_dir() {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                visit(&path, kind, &mut file)?;
             }
         }
         _ => return Err("unsupported prebuilt archive format".into()),
     }
+    Ok(())
+}
+
+/// Read only the declared library. Legacy callers, such as the CLI's own release
+/// archives, never carry sidecars, so every other entry is ignored.
+pub(crate) fn extract_library(
+    archive: &[u8],
+    format: &str,
+    library: &str,
+) -> Result<Vec<u8>, String> {
+    let mut found = None;
+    walk_archive(archive, format, MAX_ARCHIVE, |path, kind, reader| {
+        if kind == EntryKind::File && path == Path::new(library) {
+            if found.is_some() {
+                return Err("duplicate declared library in archive".into());
+            }
+            found = Some(read_library(reader)?);
+        }
+        Ok(())
+    })?;
     found.ok_or_else(|| format!("archive does not contain the exact declared library {library}"))
+}
+
+/// Extract a prebuilt package: its library and, when the archive has a
+/// `runtime-assets.json` index, every declared sidecar, all verified.
+pub(crate) fn extract_contents(
+    archive: &[u8],
+    format: &str,
+    library: &str,
+) -> Result<PrebuiltContents, String> {
+    extract_contents_with_limits(archive, format, library, ArchiveLimits::PREBUILT)
+}
+
+/// Two passes over the archive. The first reads the library and the index, so
+/// the index can be validated before any sidecar byte is read. The second
+/// reads each declared sidecar and rejects anything the index does not name.
+/// Without an index the archive is the legacy single-library layout.
+fn extract_contents_with_limits(
+    archive: &[u8],
+    format: &str,
+    library: &str,
+    limits: ArchiveLimits,
+) -> Result<PrebuiltContents, String> {
+    let library_path = Path::new(library);
+    let index_path = Path::new(RUNTIME_ASSETS_FILE);
+    let mut produced = 0u64;
+    let mut library_bytes = None;
+    let mut index_bytes = None;
+    walk_archive(archive, format, limits.total, |path, kind, reader| {
+        if kind == EntryKind::Directory {
+            return Ok(());
+        }
+        if path == library_path {
+            if library_bytes.is_some() {
+                return Err("duplicate declared library in archive".into());
+            }
+            library_bytes = Some(read_budgeted(
+                reader,
+                &mut produced,
+                limits,
+                limits.per_file,
+                "extracted library exceeds size limit",
+            )?);
+        } else if path == index_path {
+            if index_bytes.is_some() {
+                return Err(format!("duplicate {RUNTIME_ASSETS_FILE} in archive"));
+            }
+            index_bytes = Some(read_budgeted(
+                reader,
+                &mut produced,
+                limits,
+                MAX_ASSET_INDEX,
+                "runtime-assets.json exceeds size limit",
+            )?);
+        }
+        Ok(())
+    })?;
+    let library_bytes = library_bytes
+        .ok_or_else(|| format!("archive does not contain the exact declared library {library}"))?;
+    let Some(index_bytes) = index_bytes else {
+        return Ok(PrebuiltContents {
+            library: library_bytes,
+            assets: Vec::new(),
+        });
+    };
+    let declared = declared_assets(&index_bytes, library, limits)?;
+    let mut found: Vec<Option<Vec<u8>>> = vec![None; declared.len()];
+    walk_archive(archive, format, limits.total, |path, kind, reader| {
+        if kind == EntryKind::Directory {
+            if has_node_modules(path) {
+                return Err(format!("archive contains node_modules: {}", path.display()));
+            }
+            return Ok(());
+        }
+        // Already read and checked by the first pass.
+        if path == library_path || path == index_path {
+            return Ok(());
+        }
+        let Some(position) = declared
+            .iter()
+            .position(|asset| Path::new(&asset.path) == path)
+        else {
+            return Err(format!("undeclared file in archive: {}", path.display()));
+        };
+        let asset = &declared[position];
+        if found[position].is_some() {
+            return Err(format!(
+                "duplicate declared asset in archive: {}",
+                asset.path
+            ));
+        }
+        let bytes = read_budgeted(
+            reader,
+            &mut produced,
+            limits,
+            limits.per_file,
+            "extracted asset exceeds size limit",
+        )?;
+        if bytes.len() as u64 != asset.size {
+            return Err(format!(
+                "asset {} size does not match runtime-assets.json",
+                asset.path
+            ));
+        }
+        check_hash(&bytes, &asset.sha256).map_err(|e| format!("asset {}: {e}", asset.path))?;
+        found[position] = Some(bytes);
+        Ok(())
+    })?;
+    let mut assets = Vec::with_capacity(declared.len());
+    for (asset, bytes) in declared.into_iter().zip(found) {
+        let bytes = bytes
+            .ok_or_else(|| format!("archive does not contain declared asset {}", asset.path))?;
+        assets.push(VerifiedAsset {
+            path: asset.path,
+            sha256: asset.sha256,
+            bytes,
+        });
+    }
+    Ok(PrebuiltContents {
+        library: library_bytes,
+        assets,
+    })
+}
+
+/// Parse and validate `runtime-assets.json`. Paths, sizes, digests and collisions
+/// are all checked before any sidecar is read.
+fn declared_assets(
+    bytes: &[u8],
+    library: &str,
+    limits: ArchiveLimits,
+) -> Result<Vec<RuntimeAsset>, String> {
+    let index: RuntimeAssetIndex =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid {RUNTIME_ASSETS_FILE}: {e}"))?;
+    if index.schema_version != 1 {
+        return Err(format!(
+            "unsupported runtime asset index schema {}",
+            index.schema_version
+        ));
+    }
+    // The library and the index are two of the archive's entries.
+    if index.assets.len() + 2 > MAX_ENTRIES {
+        return Err("too many runtime assets".into());
+    }
+    let reserved = [
+        library.to_ascii_lowercase(),
+        RUNTIME_ASSETS_FILE.to_ascii_lowercase(),
+    ];
+    let mut declared: Vec<RuntimeAsset> = Vec::with_capacity(index.assets.len());
+    for asset in index.assets {
+        validate_asset_path(&asset.path)?;
+        if reserved
+            .iter()
+            .any(|name| asset_paths_conflict(name, &asset.path))
+        {
+            return Err(format!(
+                "asset path `{}` collides with the library or manifest",
+                asset.path
+            ));
+        }
+        if declared
+            .iter()
+            .any(|other| asset_paths_conflict(&other.path, &asset.path))
+        {
+            return Err(format!(
+                "duplicate or overlapping asset path `{}`",
+                asset.path
+            ));
+        }
+        if asset.size > limits.per_file {
+            return Err(format!("runtime asset {} exceeds size limit", asset.path));
+        }
+        if !is_sha256_hex(&asset.sha256) {
+            return Err(format!("invalid SHA-256 for runtime asset {}", asset.path));
+        }
+        declared.push(asset);
+    }
+    Ok(declared)
+}
+
+/// Read one archive entry under its per-file cap and the archive's remaining
+/// expansion budget. Budgets count bytes actually produced, so a header that
+/// understates its size cannot bypass them.
+fn read_budgeted(
+    reader: &mut dyn Read,
+    produced: &mut u64,
+    limits: ArchiveLimits,
+    per_file: u64,
+    file_error: &str,
+) -> Result<Vec<u8>, String> {
+    let remaining = limits.total.saturating_sub(*produced);
+    let limit = per_file.min(remaining);
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err(if limit == remaining {
+            "expanded archive exceeds size limit".into()
+        } else {
+            file_error.into()
+        });
+    }
+    *produced += bytes.len() as u64;
+    Ok(bytes)
+}
+
+/// Sidecar paths are relative, forward-slash and plain ASCII. Components cannot be
+/// empty, `.`, `..` or hidden, cannot be a Windows device name or end in a dot,
+/// cannot be `node_modules`, and cannot carry a native library extension, because
+/// the loader scans the extension store for libraries.
+pub(crate) fn validate_asset_path(value: &str) -> Result<(), String> {
+    let invalid = || format!("invalid asset path `{value}`");
+    if value.is_empty() || value.len() > MAX_ASSET_PATH {
+        return Err(invalid());
+    }
+    for component in value.split('/') {
+        // Windows maps these stems to devices even with an extension, and drops trailing dots.
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.as_bytes()[3].is_ascii_digit());
+        if component.is_empty()
+            || component.starts_with('.')
+            || component.ends_with('.')
+            || device
+            || !component
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(invalid());
+        }
+        if component.eq_ignore_ascii_case("node_modules") {
+            return Err(format!(
+                "asset `{value}` vendors node_modules; dependencies must be installed at runtime"
+            ));
+        }
+        if crate::install::is_dynamic_library(Path::new(component)) {
+            return Err(format!(
+                "asset `{value}` has a native library extension and cannot be installed as an asset"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether two store paths name one file, compared case-insensitively, or nest one under the other.
+pub(crate) fn asset_paths_conflict(left: &str, right: &str) -> bool {
+    let (left, right) = (left.to_ascii_lowercase(), right.to_ascii_lowercase());
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
+fn has_node_modules(path: &Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("node_modules"))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Verify the native object format/architecture without executing downloaded code.
@@ -766,7 +1314,7 @@ fn validate_native_target(bytes: &[u8], target: &str, library: bool) -> Result<(
                     }
                 })
         }
-        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" => {
+        "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" | "aarch64-unknown-linux-gnu" => {
             bytes.starts_with(b"\x7fELF\x02\x01")
                 && u16_at(16).is_some_and(|kind| kind == 3 || (!library && kind == 2))
                 && u16_at(18)
@@ -806,9 +1354,10 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    const TARGETS: [&str; 5] = [
+    const TARGETS: [&str; 6] = [
         "x86_64-pc-windows-msvc",
         "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-gnu",
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
@@ -858,20 +1407,30 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
-    fn tgz(name: &str, bytes: &[u8]) -> Vec<u8> {
+    fn tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
             flate2::Compression::default(),
         ));
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(&mut header, name, bytes).unwrap();
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, *bytes).unwrap();
+        }
         tar.into_inner().unwrap().finish().unwrap()
     }
 
     fn fixture(target: &str) -> (ResolvedPackage, serde_json::Value, Vec<u8>) {
+        fixture_with_entries(target, &[])
+    }
+
+    /// The fixture release for `target`, with `extra` files archived beside the library.
+    fn fixture_with_entries(
+        target: &str,
+        extra: &[(&str, &[u8])],
+    ) -> (ResolvedPackage, serde_json::Value, Vec<u8>) {
         let package = ResolvedPackage {
             name: "independent-plugin".into(),
             version: "1.2.3".into(),
@@ -887,10 +1446,12 @@ mod tests {
             ("tar.gz", "libcustom_runtime.so", "package.tar.gz")
         };
         let bytes = object(target);
+        let mut entries = vec![(library, bytes.as_slice())];
+        entries.extend_from_slice(extra);
         let archive = if format == "zip" {
-            zip(&[(library, &bytes)])
+            zip(&entries)
         } else {
-            tgz(library, &bytes)
+            tgz(&entries)
         };
         let manifest = serde_json::json!({
             "schema_version":1, "name":package.name, "version":package.version,
@@ -903,7 +1464,683 @@ mod tests {
     }
 
     #[test]
-    fn all_five_distributions_install_and_record_exact_provenance() {
+    fn declared_runtime_assets_install_beside_the_library() {
+        let target = TARGETS[0];
+        let worker = b"export const ready = true;\n";
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "assets": [{"path": "runtime/main.mjs", "size": worker.len(), "sha256": hash(worker)}]
+        }))
+        .unwrap();
+        let (package, value, archive) = fixture_with_entries(
+            target,
+            &[
+                ("runtime-assets.json", &index[..]),
+                ("runtime/main.mjs", &worker[..]),
+            ],
+        );
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let paths = install_archive_at(
+            &package,
+            &manifest,
+            &serde_json::to_vec(&value).unwrap(),
+            &archive,
+            target,
+            agent.path(),
+            false,
+        )
+        .unwrap();
+        let extensions = agent.path().join("extensions");
+        assert_eq!(
+            std::fs::read(extensions.join("runtime/main.mjs")).unwrap(),
+            worker
+        );
+        assert!(paths.contains(&extensions.join("runtime/main.mjs")));
+        assert!(!extensions.join("runtime-assets.json").exists());
+    }
+
+    #[test]
+    fn runtime_asset_index_rejects_unsafe_or_inconsistent_declarations() {
+        let library = object(TARGETS[0]);
+        let worker: &[u8] = b"export const ready = true;\n";
+        let entry = |path: &str, bytes: &[u8]| serde_json::json!({"path": path, "size": bytes.len(), "sha256": hash(bytes)});
+        let index = |assets: Vec<serde_json::Value>| {
+            serde_json::to_vec(&serde_json::json!({"schema_version": 1, "assets": assets})).unwrap()
+        };
+        let many: Vec<serde_json::Value> = (0..127)
+            .map(|i| entry(&format!("assets/f{i}.mjs"), worker))
+            .collect();
+        let cases: Vec<(&str, Vec<u8>, Vec<(&str, Vec<u8>)>, &str)> = vec![
+            (
+                "absolute path",
+                index(vec![entry("/etc/main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "parent traversal",
+                index(vec![entry("../main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "dot component",
+                index(vec![entry("./main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "backslash",
+                index(vec![entry("runtime\\main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "drive prefix",
+                index(vec![entry("C:main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "hidden component",
+                index(vec![entry(".env", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "trailing slash",
+                index(vec![entry("runtime/", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "overlong path",
+                index(vec![entry(&format!("{}.mjs", "a".repeat(510)), worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "node_modules",
+                index(vec![entry("runtime/node_modules/dep.mjs", worker)]),
+                vec![],
+                "vendors node_modules",
+            ),
+            (
+                "native library",
+                index(vec![entry("native/helper.so", worker)]),
+                vec![],
+                "native library extension",
+            ),
+            (
+                "index name",
+                index(vec![entry("runtime-assets.json", worker)]),
+                vec![],
+                "collides with the library or manifest",
+            ),
+            (
+                "case-folded duplicate",
+                index(vec![
+                    entry("runtime/main.mjs", worker),
+                    entry("Runtime/Main.mjs", worker),
+                ]),
+                vec![],
+                "duplicate or overlapping",
+            ),
+            (
+                "nested path",
+                index(vec![
+                    entry("runtime", worker),
+                    entry("runtime/main.mjs", worker),
+                ]),
+                vec![],
+                "duplicate or overlapping",
+            ),
+            (
+                "malformed digest",
+                index(vec![
+                    serde_json::json!({"path": "main.mjs", "size": worker.len(), "sha256": "ABC"}),
+                ]),
+                vec![],
+                "invalid SHA-256",
+            ),
+            (
+                "windows device name",
+                index(vec![entry("runtime/CON.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "windows bare device name",
+                index(vec![entry("runtime/nul", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "windows trailing dot",
+                index(vec![entry("runtime/main.mjs.", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "empty component",
+                index(vec![entry("runtime//main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "unc prefix",
+                index(vec![entry("\\\\server\\share\\main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "missing digest",
+                index(vec![
+                    serde_json::json!({"path": "main.mjs", "size": worker.len()}),
+                ]),
+                vec![("main.mjs", worker.to_vec())],
+                "invalid runtime-assets.json",
+            ),
+            (
+                "uppercase digest",
+                index(vec![
+                    serde_json::json!({"path": "main.mjs", "size": worker.len(), "sha256": hash(worker).to_uppercase()}),
+                ]),
+                vec![("main.mjs", worker.to_vec())],
+                "invalid SHA-256",
+            ),
+            (
+                "traversing archive entry",
+                index(vec![]),
+                vec![("../escape.mjs", worker.to_vec())],
+                "unsafe archive entry path",
+            ),
+            (
+                "absolute archive entry",
+                index(vec![]),
+                vec![("/escape.mjs", worker.to_vec())],
+                "unsafe archive entry path",
+            ),
+            (
+                "backslash archive entry",
+                index(vec![entry("runtime/main.mjs", worker)]),
+                vec![("runtime\\main.mjs", worker.to_vec())],
+                "unsafe archive entry path",
+            ),
+            (
+                "case-folded archive entry",
+                index(vec![entry("runtime/main.mjs", worker)]),
+                vec![("Runtime/Main.mjs", worker.to_vec())],
+                "undeclared file in archive",
+            ),
+            (
+                "unknown schema",
+                serde_json::to_vec(&serde_json::json!({"schema_version": 2, "assets": []}))
+                    .unwrap(),
+                vec![],
+                "unsupported runtime asset index schema",
+            ),
+            (
+                "malformed index",
+                b"{".to_vec(),
+                vec![],
+                "invalid runtime-assets.json",
+            ),
+            (
+                "too many assets",
+                index(many),
+                vec![],
+                "too many runtime assets",
+            ),
+            (
+                "undeclared file",
+                index(vec![]),
+                vec![("runtime/main.mjs", worker.to_vec())],
+                "undeclared file in archive",
+            ),
+            (
+                "missing declared file",
+                index(vec![entry("runtime/main.mjs", worker)]),
+                vec![],
+                "does not contain declared asset",
+            ),
+            (
+                "size mismatch",
+                index(vec![
+                    serde_json::json!({"path": "main.mjs", "size": worker.len() + 1, "sha256": hash(worker)}),
+                ]),
+                vec![("main.mjs", worker.to_vec())],
+                "size does not match",
+            ),
+            (
+                "digest mismatch",
+                index(vec![
+                    serde_json::json!({"path": "main.mjs", "size": worker.len(), "sha256": hash(b"other")}),
+                ]),
+                vec![("main.mjs", worker.to_vec())],
+                "SHA-256 mismatch",
+            ),
+        ];
+        for (label, index, extra, expected) in cases {
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("custom_runtime.dll", library.as_slice()),
+                ("runtime-assets.json", index.as_slice()),
+            ];
+            entries.extend(extra.iter().map(|(name, bytes)| (*name, bytes.as_slice())));
+            let Err(error) = extract_contents(&zip(&entries), "zip", "custom_runtime.dll") else {
+                panic!("{label} was accepted");
+            };
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn runtime_asset_limits_bound_each_file_and_the_whole_archive() {
+        let library = object(TARGETS[0]);
+        let worker = vec![b'x'; 200];
+        let index = |size: u64| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "assets": [{"path": "runtime/main.mjs", "size": size, "sha256": hash(&worker)}]
+            }))
+            .unwrap()
+        };
+        let declared = index(worker.len() as u64);
+        let archive = |index: &[u8], worker: &[u8]| {
+            zip(&[
+                ("custom_runtime.dll", library.as_slice()),
+                ("runtime-assets.json", index),
+                ("runtime/main.mjs", worker),
+            ])
+        };
+        let limits = |per_file, total| ArchiveLimits { per_file, total };
+
+        // A sidecar larger than the per-file cap is refused by its declaration.
+        let error = extract_contents_with_limits(
+            &archive(&declared, &worker),
+            "zip",
+            "custom_runtime.dll",
+            limits(128, u64::MAX),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("runtime asset runtime/main.mjs exceeds size limit"),
+            "{error}"
+        );
+
+        // A declaration that understates the bytes is stopped by the read cap.
+        let understated = index(4);
+        let error = extract_contents_with_limits(
+            &archive(&understated, &worker),
+            "zip",
+            "custom_runtime.dll",
+            limits(128, u64::MAX),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("extracted asset exceeds size limit"),
+            "{error}"
+        );
+
+        // The expanded total counts every entry, including the library and index.
+        let exact = library.len() as u64 + declared.len() as u64 + worker.len() as u64;
+        let contents = extract_contents_with_limits(
+            &archive(&declared, &worker),
+            "zip",
+            "custom_runtime.dll",
+            limits(u64::MAX, exact),
+        )
+        .unwrap();
+        assert_eq!(contents.assets[0].bytes, worker);
+        let error = extract_contents_with_limits(
+            &archive(&declared, &worker),
+            "zip",
+            "custom_runtime.dll",
+            limits(u64::MAX, exact - 1),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("expanded archive exceeds size limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn archive_walk_bounds_expanded_size_for_every_archive() {
+        // Undeclared entries are never read, so the header-declared total is the
+        // only bound on a legacy archive's expansion.
+        let archive = zip(&[("a.bin", &[0u8; 12][..]), ("b.bin", &[0u8; 12][..])]);
+        let error = walk_archive(&archive, "zip", 20, |_, _, _| Ok(())).unwrap_err();
+        assert!(
+            error.contains("expanded archive exceeds size limit"),
+            "{error}"
+        );
+        walk_archive(&archive, "zip", 24, |_, _, _| Ok(())).unwrap();
+
+        // The tar.gz stream is capped as well, so its framing counts toward the total.
+        let tar = tgz(&[("a.bin", &[0u8; 12][..]), ("b.bin", &[0u8; 12][..])]);
+        assert!(walk_archive(&tar, "tar.gz", 20, |_, _, _| Ok(())).is_err());
+        walk_archive(&tar, "tar.gz", 64 * 1024, |_, _, _| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn runtime_asset_index_size_is_capped() {
+        let mut index = br#"{"schema_version":1,"assets":[]}"#.to_vec();
+        index.resize(MAX_ASSET_INDEX as usize + 1, b' ');
+        let library = object(TARGETS[0]);
+        let archive = zip(&[
+            ("custom_runtime.dll", library.as_slice()),
+            ("runtime-assets.json", index.as_slice()),
+        ]);
+        let Err(error) = extract_contents(&archive, "zip", "custom_runtime.dll") else {
+            panic!("an oversized index was accepted");
+        };
+        assert!(
+            error.contains("runtime-assets.json exceeds size limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_asset_entry_count_is_exact() {
+        let library = object(TARGETS[0]);
+        let worker: &[u8] = b"export const ready = true;\n";
+        let names: Vec<String> = (0..126).map(|i| format!("assets/f{i}.mjs")).collect();
+        let assets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| serde_json::json!({"path": name, "size": worker.len(), "sha256": hash(worker)}))
+            .collect();
+        let index = serde_json::to_vec(&serde_json::json!({"schema_version": 1, "assets": assets}))
+            .unwrap();
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("custom_runtime.dll", library.as_slice()),
+            ("runtime-assets.json", index.as_slice()),
+        ];
+        entries.extend(names.iter().map(|name| (name.as_str(), worker)));
+        // 126 sidecars plus the library and the index make the 128-entry ceiling.
+        let contents = extract_contents(&zip(&entries), "zip", "custom_runtime.dll").unwrap();
+        assert_eq!(contents.assets.len(), 126);
+
+        // A legacy archive is bounded by the same entry ceiling.
+        let legacy: Vec<String> = (0..129).map(|i| format!("docs/{i}.md")).collect();
+        let legacy: Vec<(&str, &[u8])> = legacy
+            .iter()
+            .map(|name| (name.as_str(), &b"x"[..]))
+            .collect();
+        let error = extract_library(&zip(&legacy), "zip", "custom_runtime.dll").unwrap_err();
+        assert!(error.contains("too many archive entries"), "{error}");
+    }
+
+    /// Rewrite the uncompressed size that the local and central headers of `name`
+    /// claim. The stored bytes do not change, so the entry still holds its real length.
+    fn understate_entry(archive: &mut [u8], name: &str, claimed: u32) {
+        let name = name.as_bytes();
+        let local: Vec<usize> = (0..archive.len())
+            .filter(|&at| {
+                archive[at..].starts_with(b"PK\x03\x04")
+                    && archive
+                        .get(at + 30..)
+                        .is_some_and(|rest| rest.starts_with(name))
+            })
+            .collect();
+        let central: Vec<usize> = (0..archive.len())
+            .filter(|&at| {
+                archive[at..].starts_with(b"PK\x01\x02")
+                    && archive
+                        .get(at + 46..)
+                        .is_some_and(|rest| rest.starts_with(name))
+            })
+            .collect();
+        assert!(!local.is_empty() && !central.is_empty());
+        for at in local {
+            archive[at + 22..at + 26].copy_from_slice(&claimed.to_le_bytes());
+        }
+        for at in central {
+            archive[at + 24..at + 28].copy_from_slice(&claimed.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn runtime_asset_budget_holds_when_zip_headers_understate_sizes() {
+        let library = object(TARGETS[0]);
+        let worker = vec![b'x'; 200];
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "assets": [{"path": "runtime/main.mjs", "size": worker.len(), "sha256": hash(&worker)}]
+        }))
+        .unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            ("custom_runtime.dll", library.as_slice()),
+            ("runtime-assets.json", index.as_slice()),
+            ("runtime/main.mjs", worker.as_slice()),
+        ] {
+            writer.start_file(name, stored).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        let mut archive = writer.finish().unwrap().into_inner();
+        // The headers now claim one byte for the sidecar that really holds 200.
+        understate_entry(&mut archive, "runtime/main.mjs", 1);
+
+        // The walker sees a small entry, so only the read budget can stop the bytes.
+        let exact = (library.len() + index.len() + worker.len()) as u64;
+        let limits = ArchiveLimits {
+            per_file: u64::MAX,
+            total: exact - 1,
+        };
+        let error = extract_contents_with_limits(&archive, "zip", "custom_runtime.dll", limits)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("expanded archive exceeds size limit"),
+            "{error}"
+        );
+
+        let limits = ArchiveLimits {
+            per_file: u64::MAX,
+            total: exact,
+        };
+        let contents =
+            extract_contents_with_limits(&archive, "zip", "custom_runtime.dll", limits).unwrap();
+        assert_eq!(contents.assets[0].bytes, worker);
+    }
+
+    #[test]
+    fn runtime_asset_archives_reject_symlinked_files_and_node_modules_directories() {
+        let library = object(TARGETS[0]);
+        let worker = b"export {};\n";
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "assets": [{"path": "runtime/main.mjs", "size": worker.len(), "sha256": hash(worker)}]
+        }))
+        .unwrap();
+        let mut linked = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        linked
+            .start_file(
+                "custom_runtime.dll",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        linked.write_all(&library).unwrap();
+        linked
+            .start_file(
+                "runtime-assets.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        linked.write_all(&index).unwrap();
+        linked
+            .add_symlink(
+                "runtime/main.mjs",
+                "/etc/passwd",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        let archive = linked.finish().unwrap().into_inner();
+        let Err(error) = extract_contents(&archive, "zip", "custom_runtime.dll") else {
+            panic!("a symlinked sidecar was accepted");
+        };
+        assert!(error.contains("symlinks are not allowed"), "{error}");
+
+        let empty =
+            serde_json::to_vec(&serde_json::json!({"schema_version": 1, "assets": []})).unwrap();
+        let mut vendored = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        vendored
+            .start_file(
+                "custom_runtime.dll",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        vendored.write_all(&library).unwrap();
+        vendored
+            .start_file(
+                "runtime-assets.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        vendored.write_all(&empty).unwrap();
+        vendored
+            .add_directory("node_modules/", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let archive = vendored.finish().unwrap().into_inner();
+        let Err(error) = extract_contents(&archive, "zip", "custom_runtime.dll") else {
+            panic!("a node_modules directory was accepted");
+        };
+        assert!(error.contains("node_modules"), "{error}");
+    }
+
+    #[test]
+    fn runtime_asset_digest_mismatch_keeps_the_installed_sidecars() {
+        let target = TARGETS[1];
+        let worker = b"export {};\n";
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "assets": [{"path": "runtime/main.mjs", "size": worker.len(), "sha256": hash(worker)}]
+        }))
+        .unwrap();
+        let (package, value, archive) = fixture_with_entries(
+            target,
+            &[
+                ("runtime-assets.json", &index[..]),
+                ("runtime/main.mjs", &worker[..]),
+            ],
+        );
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        install_archive_at(
+            &package,
+            &manifest,
+            &serde_json::to_vec(&value).unwrap(),
+            &archive,
+            target,
+            agent.path(),
+            false,
+        )
+        .unwrap();
+        let metadata = std::fs::read(agent.path().join("native-packages.json")).unwrap();
+
+        // The manifest and archive hashes are consistent. The sidecar keeps its size and changes its bytes.
+        let tampered: &[u8] = b"export [];\n";
+        assert_eq!(tampered.len(), worker.len());
+        let (package, value, archive) = fixture_with_entries(
+            target,
+            &[
+                ("runtime-assets.json", &index[..]),
+                ("runtime/main.mjs", tampered),
+            ],
+        );
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        let error = install_archive_at(
+            &package,
+            &manifest,
+            &serde_json::to_vec(&value).unwrap(),
+            &archive,
+            target,
+            agent.path(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("asset runtime/main.mjs: SHA-256 mismatch"),
+            "{error}"
+        );
+        let extensions = agent.path().join("extensions");
+        assert_eq!(
+            std::fs::read(extensions.join("runtime/main.mjs")).unwrap(),
+            worker
+        );
+        assert_eq!(
+            std::fs::read(agent.path().join("native-packages.json")).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn runtime_asset_tar_archives_reject_duplicate_index_and_declared_entries() {
+        let library = object(TARGETS[1]);
+        let worker = b"export {};\n";
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "assets": [{"path": "runtime/main.mjs", "size": worker.len(), "sha256": hash(worker)}]
+        }))
+        .unwrap();
+        let archive = tgz(&[
+            ("libcustom_runtime.so", &library),
+            ("runtime-assets.json", &index),
+            ("runtime/main.mjs", worker),
+            ("runtime/main.mjs", worker),
+        ]);
+        let Err(error) = extract_contents(&archive, "tar.gz", "libcustom_runtime.so") else {
+            panic!("a duplicated sidecar was accepted");
+        };
+        assert!(error.contains("duplicate declared asset"), "{error}");
+
+        let archive = tgz(&[
+            ("libcustom_runtime.so", &library),
+            ("runtime-assets.json", &index),
+            ("runtime-assets.json", &index),
+        ]);
+        let Err(error) = extract_contents(&archive, "tar.gz", "libcustom_runtime.so") else {
+            panic!("a duplicated index was accepted");
+        };
+        assert!(error.contains("duplicate runtime-assets.json"), "{error}");
+    }
+
+    #[test]
+    fn legacy_archives_install_only_the_library_and_keep_their_records_unchanged() {
+        for target in TARGETS {
+            let (package, value, archive) =
+                fixture_with_entries(target, &[("README.md", b"not a sidecar")]);
+            let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+            let agent = tempfile::tempdir().unwrap();
+            let paths = install_archive_at(
+                &package,
+                &manifest,
+                &serde_json::to_vec(&value).unwrap(),
+                &archive,
+                target,
+                agent.path(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(paths.len(), 1);
+            assert!(!agent.path().join("extensions/README.md").exists());
+            let records: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(agent.path().join("native-packages.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(records[0]["prebuilt"].get("assets").is_none());
+        }
+    }
+
+    #[test]
+    fn all_six_distributions_install_and_record_exact_provenance() {
         for target in TARGETS {
             let (package, value, archive) = fixture(target);
             let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
@@ -1150,6 +2387,15 @@ mod tests {
             assert!(validate_library_target(&object(target), target).is_ok());
             for other in TARGETS {
                 if other != target {
+                    // ELF headers do not encode the libc choice, so GNU and
+                    // musl x86_64 objects are intentionally indistinguishable
+                    // to this architecture check. Exact target manifests still
+                    // keep those distributions separate.
+                    if target.starts_with("x86_64-unknown-linux-")
+                        && other.starts_with("x86_64-unknown-linux-")
+                    {
+                        continue;
+                    }
                     assert!(validate_library_target(&object(other), target).is_err());
                 }
             }
@@ -1373,11 +2619,209 @@ mod tests {
             )
             .await
             .unwrap(),
-            "1.4.0"
+            (
+                "1.4.0".to_string(),
+                "https://github.com/publisher/monorepo".to_string()
+            )
         );
         assert!(server.join().unwrap().starts_with(
             "GET /repos/publisher/monorepo/git/matching-refs/tags/independent-plugin-v "
         ));
+    }
+
+    /// Serve one response per request, in request order, and return the
+    /// request heads so a test can assert which repositories were queried.
+    fn sequenced_responses(
+        responses: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                socket.write_all(&body).unwrap();
+                requests.push(String::from_utf8(request).unwrap());
+            }
+            requests
+        });
+        (url, thread)
+    }
+
+    #[test]
+    fn moved_repository_spellings_identify_one_project() {
+        assert!(same_repository_project(
+            "https://github.com/pi-rust/rpi-package",
+            "https://github.com/pi-rust/rpi-extension"
+        ));
+        assert!(same_repository_project(
+            "https://github.com/publisher/monorepo",
+            "https://github.com/publisher/monorepo"
+        ));
+        assert!(!same_repository_project(
+            "https://github.com/pi-rust/rpi-extension",
+            "https://github.com/publisher/monorepo"
+        ));
+    }
+
+    #[test]
+    fn tag_published_matches_the_exact_package_tag() {
+        let refs = vec![
+            GitReference {
+                reference: "refs/tags/rpi-todo-v0.3.4".into(),
+            },
+            GitReference {
+                reference: "refs/tags/rpi-todo-v0.3.10".into(),
+            },
+            GitReference {
+                reference: "refs/tags/other-v0.3.4".into(),
+            },
+        ];
+        assert!(tag_published(&refs, "rpi-todo", "0.3.4"));
+        assert!(tag_published(&refs, "rpi-todo", "0.3.10"));
+        assert!(!tag_published(&refs, "rpi-todo", "0.3"));
+        assert!(!tag_published(&refs, "other", "0.3.10"));
+        assert!(!tag_published(&[], "rpi-todo", "0.3.4"));
+    }
+
+    #[test]
+    fn released_assets_are_accepted_across_a_repository_move() {
+        validate_release_asset_url(
+            "https://github.com/pi-rust/rpi-package/releases/download/rpi-todo-v1.2.3/rpi-todo.zip",
+            "https://github.com/pi-rust/rpi-extension",
+            "rpi-todo-v1.2.3",
+        )
+        .unwrap();
+        // A different publisher is still rejected.
+        assert!(validate_release_asset_url(
+            "https://github.com/publisher/monorepo/releases/download/rpi-todo-v1.2.3/rpi-todo.zip",
+            "https://github.com/pi-rust/rpi-extension",
+            "rpi-todo-v1.2.3",
+        )
+        .is_err());
+    }
+
+    async fn version_for(
+        responses: Vec<(&'static str, Vec<u8>)>,
+        legacy: bool,
+    ) -> ((String, String), Vec<String>) {
+        let (api, server) = sequenced_responses(responses);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let repository = if legacy {
+            "https://github.com/pi-rust/rpi-package"
+        } else {
+            "https://github.com/pi-rust/rpi-extension"
+        };
+        let resolved = repository_version(&client, &api, "rpi-todo", repository)
+            .await
+            .map(|resolved| (resolved, server.join().unwrap()));
+        match resolved {
+            Ok(result) => result,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_detection_follows_a_moved_repository() {
+        let previous =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.1.0"}])).unwrap();
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.2.0"}])).unwrap();
+        let (resolved, requests) =
+            version_for(vec![("200 OK", previous), ("200 OK", current)], true).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.2.0".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+        assert!(requests[0]
+            .starts_with("GET /repos/pi-rust/rpi-package/git/matching-refs/tags/rpi-todo-v "));
+        assert!(requests[1]
+            .starts_with("GET /repos/pi-rust/rpi-extension/git/matching-refs/tags/rpi-todo-v "));
+    }
+
+    #[tokio::test]
+    async fn releases_present_in_both_locations_record_the_current_home() {
+        let previous =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.4"}])).unwrap();
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.4"}])).unwrap();
+        let (resolved, _) =
+            version_for(vec![("200 OK", previous), ("200 OK", current)], true).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.3.4".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn versions_only_the_previous_location_published_stay_installable() {
+        let previous =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.0"}])).unwrap();
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.2.0"}])).unwrap();
+        let (resolved, _) =
+            version_for(vec![("200 OK", previous), ("200 OK", current)], true).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.3.0".to_string(),
+                "https://github.com/pi-rust/rpi-package".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_detection_survives_a_retired_previous_location() {
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.4"}])).unwrap();
+        let (resolved, _) = version_for(
+            vec![("404 Not Found", Vec::new()), ("200 OK", current)],
+            true,
+        )
+        .await;
+        assert_eq!(
+            resolved,
+            (
+                "0.3.4".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_without_a_move_is_queried_once() {
+        let tags =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.1.0"}])).unwrap();
+        let (resolved, requests) = version_for(vec![("200 OK", tags)], false).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.1.0".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]

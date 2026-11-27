@@ -35,6 +35,7 @@ mod commands;
 use commands::*;
 mod settings;
 use settings::*;
+mod history;
 mod sessions;
 use sessions::*;
 mod run;
@@ -44,11 +45,15 @@ use events::*;
 mod selectors;
 use selectors::*;
 mod autocomplete;
+mod plugin_autocomplete;
 use autocomplete::*;
+mod extension_arguments;
+use extension_arguments::ExtensionArgumentProvider;
 mod rendering;
 use rendering::*;
 mod panels;
 mod pet;
+mod settlement;
 mod side_questions;
 
 #[cfg(test)]
@@ -56,6 +61,9 @@ mod selection_probe;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "interactive_tui/tests/windows_paste_folding.rs"]
+mod windows_paste_folding;
 
 mod state;
 pub(crate) use state::configured_keybindings;
@@ -77,19 +85,18 @@ use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
 use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
-use rpi_tui::{
-    apply_theme_preset, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
-    AssistantMessageOptions, AutocompleteItem, AutocompleteManager, AutocompleteSuggestions,
-    BashExecutionComponent, BashTruncation, CombinedAutocompleteProvider, Component, Container,
-    DynamicBorder, Editor, EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable,
-    FollowMode, FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal,
-    ScrollView, ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList,
-    SettingItem, SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider,
-    Spacer, StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
-    ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState,
-    TUI,
-};
 use rpi_tui::{bold as tui_bold, theme as current_theme};
+use rpi_tui::{
+    AltScreenSearch, AssistantBlock, AssistantMessageComponent, AssistantMessageOptions,
+    AutocompleteItem, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
+    BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
+    EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
+    FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
+    ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
+    SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
+    StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ToolExecutionComponent,
+    ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState, TUI,
+};
 
 #[allow(unused_imports)]
 use rpi_tui::BashStatus;
@@ -310,12 +317,50 @@ trait SlashCommand: Send + Sync {
     fn description_owned(&self) -> String {
         self.description().to_string()
     }
+    /// Structured command payloads must not collapse whitespace inside JSON
+    /// strings. Legacy commands keep their existing normalized argument policy.
+    fn preserve_args_whitespace(&self) -> bool {
+        false
+    }
     /// Execute the command. Only invoked for inputs starting with `/` whose
     /// first token matches `name()` or an alias. `args` is the whitespace-
     /// trimmed remainder after the command token ("" when none). Must stay
     /// synchronous (see the module-level note) — async work goes through
     /// `ctx.tx.send(TuiMessage::…)` or `tokio::spawn`.
     fn execute(&self, ctx: &CommandContext, args: &str);
+}
+
+/// The built-in slash commands as `(name, description)` pairs, for consumers
+/// outside the TUI (the `ListCommands` runtime action).
+///
+/// Exists so a remote client sees the same built-ins the terminal offers. The
+/// command registry itself is TUI-private, and reaching into it from the
+/// extension host would mean exposing `Arc<dyn SlashCommand>` (whose `execute`
+/// needs a `CommandContext`) across the ABI.
+pub(crate) fn build_builtin_commands_for_abi(native_durable: bool) -> Vec<(String, String)> {
+    build_session_command_registry(native_durable)
+        .visible_entries()
+        .into_iter()
+        .map(|entry| (entry.name, entry.description))
+        .collect()
+}
+
+/// Every name the built-in dispatch answers to: canonical names **and** aliases,
+/// including hidden commands.
+///
+/// This is the reservation set, not a suggestion list. A remote command listing
+/// merges extension entries into the built-ins, and an extension registering
+/// `/q` or `/context` is unreachable in the terminal (the built-in wins
+/// dispatch), yet without this it would still be advertised as
+/// `source:"extension"`.
+pub(crate) fn builtin_reserved_names(native_durable: bool) -> Vec<String> {
+    let registry = build_session_command_registry(native_durable);
+    let mut out: Vec<String> = Vec::new();
+    for command in &registry.commands {
+        out.push(command.name().to_string());
+        out.extend(command.aliases().iter().map(|a| (*a).to_string()));
+    }
+    out
 }
 
 /// Holds all registered slash commands; the single source of truth for both
@@ -368,6 +413,16 @@ impl CommandRegistry {
         }
         out
     }
+}
+
+/// Session-owned opt-ins must drive both TUI dispatch and remote discovery.
+/// Never infer native enablement from tool selection, extension flags or names.
+fn build_session_command_registry(native_durable: bool) -> CommandRegistry {
+    let mut registry = build_builtin_registry();
+    if native_durable {
+        registry.register(Arc::new(NativeDurableCommand));
+    }
+    registry
 }
 
 /// Dispatch a ui_prompt_start event to extensions.
@@ -516,13 +571,21 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
 /// `/skill:name` intact so the model can still handle it; it must not be
 /// converted into a local error before input handlers or the agent see it.
 /// Returns `true` only when a registered slash command handled the input.
-fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) -> bool {
+fn slash_arguments(text: &str, command: &dyn SlashCommand) -> String {
     let mut parts = text.split_whitespace();
     let token = parts.next().unwrap_or("");
-    let args = parts.collect::<Vec<_>>().join(" ");
+    if command.preserve_args_whitespace() {
+        text.trim_start()[token.len()..].trim_start().to_owned()
+    } else {
+        parts.collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) -> bool {
+    let token = text.split_whitespace().next().unwrap_or("");
     match registry.find(token) {
         Some(cmd) => {
-            cmd.execute(ctx, &args);
+            cmd.execute(ctx, &slash_arguments(text, cmd.as_ref()));
             true
         }
         None => false,
@@ -586,11 +649,13 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
         exclude_from_context,
     ));
     comp.set_expanded(*ctx.state.tool_outputs_expanded.lock().unwrap());
-    ctx.chat.add_child(comp.clone());
-
-    // Register the cancellation slot before spawning so an Esc arriving on the
-    // key thread can never miss the run (upstream's `_bashAbortControllers`).
+    // Reserve/invalidate before exposing the component to a paging worker.
     let cancel = ctx.state.begin_user_bash();
+    if ctx.state.history_page.is_bound() {
+        ctx.state.history_page.active.add_child(comp.clone());
+    } else {
+        ctx.chat.add_child(comp.clone());
+    }
     ctx.tui.request_render(false);
 
     let env: Arc<dyn rpi_tools::ExecutionEnv> =
@@ -701,6 +766,7 @@ enum TuiMessage {
     ExportSessionWithFormat(crate::export::ExportFormat),
     /// Show live usage/context stats (from `/usage` and `/context`).
     ShowUsage,
+    NativeDurable(String),
     /// Fork the current session into a new one and switch to it (from `/fork`).
     ForkSession,
     /// Rename the current session (from `/name <name>`).
@@ -725,6 +791,8 @@ enum TuiMessage {
         input: serde_json::Value,
         purpose: ProviderOAuthPurpose,
         flow_id: u64,
+        /// Cancelled when the flow ends; the plugin call observes it.
+        cancel: CancellationToken,
     },
     /// Result of one provider-owned OAuth action.
     ProviderOAuthResult {
@@ -887,6 +955,15 @@ fn resolve_tui_startup_settings(
     }
 }
 
+async fn dispatch_observed_session_event(
+    reload_context: &crate::session::ReloadContext,
+    tag: rpi_plugin_sdk::EventTag,
+) {
+    if let Some(reason) = crate::session::dispatch_session_event_async(reload_context, tag).await {
+        tracing::warn!(?tag, %reason, "extension lifecycle veto is advisory");
+    }
+}
+
 /// TUI-based interactive mode.
 ///
 /// `event_rx` carries the live `AgentEvent` stream (installed by
@@ -909,7 +986,7 @@ pub async fn interactive_tui(
     extra_messages: &[String],
     initial_images: Vec<rpi_ai::types::ImageContent>,
     theme: Option<&str>,
-    _no_themes: bool,
+    no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -993,16 +1070,47 @@ pub async fn interactive_tui(
     // components keep styled text, so doing this after the welcome banner left
     // the first screen in the dark palette until it was rebuilt.
     let theme_manager = Arc::new(ThemeManager::new());
-    if let Some(preset) = match theme {
-        Some("light") => Some(ThemePreset::Light),
-        Some("monochrome") => Some(ThemePreset::Monochrome),
-        Some("dark") => Some(ThemePreset::Dark),
-        _ => None,
-    } {
-        apply_theme_preset(preset);
-        theme_manager.apply_preset(preset);
+    // Build the discovery registry before resolving the saved spec: selector
+    // and settings persist a registry name (e.g. "ocean"), which only
+    // resolves to its file when the registry is already in scope.
+    let theme_registry = if no_themes {
+        crate::themes::ThemeRegistry::default()
+    } else {
+        let (mut registry, diagnostics) =
+            crate::themes::ThemeRegistry::discover(&cwd, project_trusted);
+        // Extension-contributed themes (`resources_discover` themePaths) merge
+        // after the static dirs; `--no-themes` suppresses them like discovery.
+        if let Ok(paths) = reload_context.discovered_theme_paths.lock() {
+            registry.merge_discovered(&paths);
+        }
+        for diagnostic in &diagnostics {
+            eprintln!("warning: {diagnostic}");
+        }
+        registry
+    };
+    if let Some(spec) = theme {
+        // `--theme` / settings: preset name, registry name, or theme file
+        // path. A file that fails to load warns and falls back to the
+        // built-in default without vetoing startup (`emit_startup_warnings`
+        // style); the TUI still comes up in the dark palette and `/theme`
+        // remains available.
+        match crate::themes::apply_startup_spec(spec, Some(&theme_registry), &theme_manager) {
+            Ok(()) => {}
+            Err(message) => {
+                eprintln!("warning: {message}; using the built-in default theme");
+            }
+        }
     }
-
+    // Record which spec is active (the persisted form) so `/reload` can detect
+    // that the active file theme vanished and fall back to the default.
+    let active_theme_spec: Option<String> =
+        theme.and_then(
+            |spec| match crate::themes::resolve_spec_in(spec, Some(&theme_registry)) {
+                crate::themes::ThemeSpec::Preset(_) => Some(spec.to_string()),
+                crate::themes::ThemeSpec::File(path) if path.is_file() => Some(spec.to_string()),
+                crate::themes::ThemeSpec::File(_) => None,
+            },
+        );
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
@@ -1011,13 +1119,21 @@ pub async fn interactive_tui(
     // of returning a fabricated answer. The mailbox is session-scoped (held in
     // `ReloadContext`) so in-flight prompts survive a `/reload`.
     let ask_user_bridge = AskUserBridge::new(reload_context.ui_dialog.clone());
-    ask_user_bridge.attach();
+    if !ask_user_bridge.attach() {
+        eprintln!(
+            "[rpi] interactive dialog bridge attachment was rejected; refusing to start the TUI"
+        );
+        return 1;
+    }
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
+    // Keep startup output in the retained header, not loose chat children:
+    // settling the first reply replaces the chat's history page.
+    let history_page = history::HistoryUi::with_native_durable(args.native_durable);
     let chat_container = Arc::new(Container::new());
     let startup_context = if should_show_startup_listing(args.verbose, quiet_startup) {
         Some(add_welcome_message_with_capabilities(
-            &chat_container,
+            &history_page.header,
             &active_tool_names,
             &skill_names,
             &resources_snapshot.context_files,
@@ -1025,6 +1141,13 @@ pub async fn interactive_tui(
     } else {
         None
     };
+    // Startup notices from the launch (a restored session whose directory fell
+    // back, an untrusted adopted directory). Notes in the transcript rather than
+    // stderr: the TUI is already in the alternate screen by the time it draws
+    // this, and a stray write would corrupt the layout (issue #115).
+    for notice in &reload_context.startup_notices {
+        add_note_message(&history_page.header, notice);
+    }
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
     // banner once, then write the sentinel. The banner covers the theme hint;
@@ -1033,14 +1156,14 @@ pub async fn interactive_tui(
     let existing_profile = crate::extras::setup_done()
         || saved_settings.last_changelog_version.is_some()
         || saved_settings.last_rpi_changelog_version.is_some();
-    crate::extras::maybe_first_time_setup(&chat_container);
+    crate::extras::maybe_first_time_setup(&history_page.header);
     let collapse_changelog =
         preferred_project_setting(&project_settings, |settings| settings.collapse_changelog)
             .or(saved_settings.collapse_changelog)
             .unwrap_or(false);
     maybe_add_startup_changelog(
         harness,
-        &chat_container,
+        &history_page.header,
         &saved_settings,
         collapse_changelog,
         existing_profile,
@@ -1061,19 +1184,6 @@ pub async fn interactive_tui(
     // A normal launch creates a fresh session and must not replay records from
     // another/project harness. Only explicit restore/fork modes render prior
     // conversation history. This fixes stale prompts appearing every startup.
-    if launch_restores_history(args) {
-        render_session_history(
-            harness,
-            &chat_container,
-            initial_transformer.clone(),
-            Some(reload_context.extension_session.clone()),
-            show_images,
-            // The footer is built later in this function, so there is nothing
-            // to fold replayed usage into yet.
-            None,
-        )
-        .await;
-    }
 
     // `document_container` wraps the welcome header + chat so the scrollview
     // follows the whole transcript (mirrors TS `documentContainer`).
@@ -1145,6 +1255,12 @@ pub async fn interactive_tui(
         footer.set_context_window(m.context_window as i64);
     }
     footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+O: Expand/collapse tools | Ctrl+T: Show/hide thinking | /help");
+    // A restored session may already carry a name (`/name` in an earlier run, or
+    // an extension that names sessions). Line 1 reserves a slot for it, so a
+    // resume that left it blank showed less than the session actually knew.
+    if let Some(name) = lane.session_view().get_name().await.ok().flatten() {
+        footer.set_session_name(Some(&name));
+    }
 
     // Live git-branch refresh (native fs-watch on `.git/HEAD`): a checkout or
     // commit updates the footer's branch without a manual refresh.
@@ -1189,7 +1305,7 @@ pub async fn interactive_tui(
     // prompt-template commands are merged into the autocomplete list separately
     // (they dispatch via template expansion, not the registry); built-ins come
     // first so they win on a fuzzy tie.
-    let mut command_registry = build_builtin_registry();
+    let mut command_registry = build_session_command_registry(reload_context.args.native_durable);
     register_extension_commands(
         &mut command_registry,
         reload_context.extension_session.clone(),
@@ -1200,6 +1316,19 @@ pub async fn interactive_tui(
     let autocomplete = AutocompleteManager::new();
     {
         let mut combined = CombinedAutocompleteProvider::new();
+        // Argument suggestions first: they own the popup once the caret is
+        // inside a plugin command's argument region (`/msg a|`); the slash
+        // provider takes over only inside the command token (`/m|sg`).
+        combined.add_provider(Arc::new(ExtensionArgumentProvider::new(
+            reload_context.extension_session.clone(),
+        )));
+        // Then plugin-contributed completion (pi's `addAutocompleteProvider`
+        // stacks on top of the built-in provider): their candidates are the
+        // specific ones (`#document`), and a plugin with no opinion falls
+        // through to the built-ins.
+        for provider in plugin_autocomplete::providers(reload_context.extension_session.clone()) {
+            combined.add_provider(provider);
+        }
         combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
             all_slash_commands,
         )));
@@ -1214,11 +1343,16 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::new(args.native_durable),
+        history_page,
         session_dir: reload_context.session_dir(),
+        session_cwd: cwd.clone(),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(hide_thinking)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(tool_outputs_expanded)),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -1242,6 +1376,7 @@ pub async fn interactive_tui(
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -1253,6 +1388,9 @@ pub async fn interactive_tui(
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
+        theme_registry: std::sync::RwLock::new(theme_registry),
+        active_theme_spec: std::sync::Mutex::new(active_theme_spec),
+        theme_watcher: std::sync::Mutex::new(None),
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(show_images),
@@ -1261,6 +1399,7 @@ pub async fn interactive_tui(
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(initial_transformer)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -1274,6 +1413,16 @@ pub async fn interactive_tui(
         ),
     });
 
+    state.history_page.bind(harness);
+    state.history_page.mount_active(&chat_container);
+    if launch_restores_history(args) {
+        history::restore(harness, &state, &chat_container).await;
+    } else {
+        // Do not restore foreign history on a fresh launch merely to observe
+        // durable state. This read-only component also respects --no-tools.
+        history::refresh_native_durable_notice(harness, &state, &chat_container).await;
+    }
+
     let _compaction_watcher = harness.watch({
         let state = Arc::clone(&state);
         let tui = Arc::clone(&tui);
@@ -1285,7 +1434,6 @@ pub async fn interactive_tui(
                 if event.active {
                     if state.show_terminal_progress {
                         state.editor.set_working(Some(WorkingState {
-                            frame: 0,
                             started_at: std::time::Instant::now(),
                             message: if event.manual {
                                 "Compacting context… (Esc to cancel)"
@@ -1303,6 +1451,27 @@ pub async fn interactive_tui(
             }
         }
     });
+
+    // Hot-reload the active theme file (native fs-watch contract): an edit to
+    // the JSON re-parses and re-applies live; a broken in-progress edit keeps
+    // the current palette and surfaces the parse error instead of dropping the
+    // user back to the default. Presets are immutable and `--no-themes`
+    // suppresses the watcher entirely, so only file themes poll (one task,
+    // one mtime entry — see fs_watch.rs). The handle lives in the state slot
+    // and is re-targeted by selection and reload.
+    {
+        let tui_ref = tui.clone();
+        let registry_snapshot = state.theme_registry.read().ok().map(|r| r.clone());
+        crate::themes::restart_theme_watcher(
+            &state.theme_watcher,
+            state.active_theme_spec().as_deref(),
+            registry_snapshot
+                .as_ref()
+                .unwrap_or(&crate::themes::ThemeRegistry::default()),
+            &state.theme_manager,
+            theme_watch_notify(&state, tui_ref),
+        );
+    }
 
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
@@ -1440,7 +1609,7 @@ pub async fn interactive_tui(
         if let Some((command, exclude_from_context)) = parse_user_bash(text) {
             if ctx_for_cb.state.user_bash_running() {
                 add_error_message(
-                    &ctx_for_cb.chat,
+                    &ctx_for_cb.state.notice_container(),
                     "A bash command is already running. Press Esc to cancel it first.",
                 );
                 ctx_for_cb.tui.request_render(false);
@@ -1455,10 +1624,10 @@ pub async fn interactive_tui(
             let images = ctx_for_cb.state.take_pending_images();
             let message = user_message_with_images(text, images.clone());
             let lane = ctx_for_cb.lane.clone();
-            let chat = ctx_for_cb.chat.clone();
+            let chat = ctx_for_cb.state.notice_container();
             let tui = ctx_for_cb.tui.clone();
             let state = ctx_for_cb.state.clone();
-            tokio::spawn(async move {
+            state.session_write_tasks.clone().spawn(async move {
                 // Queue immediately while the agent loop is still running.
                 // Routing this through the TUI's main channel delayed it until
                 // `prompt_text()` returned, after the loop's drain points had
@@ -1502,7 +1671,7 @@ pub async fn interactive_tui(
         // `crates/rpi-harness/tests/harness_run_e2e.rs`. Queued steering /
         // follow-up prompts DO get a `message_start` (the loop drains those
         // itself), so those are deliberately rendered from the event instead.
-        add_user_message(&ctx_for_cb.chat, text);
+        add_user_message(&ctx_for_cb.state.history_page.active, text);
         // A new prompt starts a fresh interaction at the tail even when the
         // user had scrolled up to inspect older output.
         if let Some(scroll) = ctx_for_cb.tui.get_primary_scroll_view() {
@@ -1538,12 +1707,16 @@ pub async fn interactive_tui(
     // Check rpi and installed registry packages in the background so startup
     // remains responsive while their latest versions are fetched.
     let mut update_check_handles = Vec::new();
-    let rpi_chat = chat_container.clone();
+    // Land in the retained update slot, not on the chat root: a late check must
+    // not render after (or be wiped with) the live transcript page.
+    let update_container = state.history_page.updates.clone();
+    let update_hint = state.history_page.regular_update_hint.clone();
     let rpi_tui = tui.clone();
     update_check_handles.push(tokio::spawn(async move {
         let report = crate::updates::check_rpi_startup().await;
         if !report.is_empty() {
-            add_update_notices(&rpi_chat, &report);
+            add_update_notices(&update_container, &report);
+            update_hint.update(&report);
         }
         rpi_tui.request_render(false);
     }));
@@ -1581,10 +1754,13 @@ pub async fn interactive_tui(
         }
     });
 
-    // ---- Render-tick task (advances the loader spinner while Working) ----
+    // ---- Render-tick task (keeps the spinner animating while Working) ----
     //
-    // The `Loader` only advances its frame on render; without a periodic
-    // `request_render` the spinner visibly freezes between events.
+    // The spinner frame is derived from wall-clock time at render time (one
+    // step per `SPINNER_FRAME_MS`, matching upstream's `setInterval` cadence),
+    // but a frame only reaches the screen when something repaints. Without a
+    // periodic `request_render` a quiet stretch (thinking, tool running) would
+    // show a frozen glyph even though the frame index moved.
     let tui_tick = tui.clone();
     let state_tick = state.clone();
     // The tick, not the key loop, drives the voice-draft auto-send: it must
@@ -1606,16 +1782,14 @@ pub async fn interactive_tui(
     let tick_handle = tokio::spawn(async move {
         // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
-        // frame is advanced by `Editor::render` (mirroring `Loader::render`),
-        // so streaming output — which schedules a frame per token — spins it
-        // faster, and this interval is the floor when the model is silent.
-        //
-        // Advancing here as well would double-step every tick and make the idle
-        // spinner run at 40ms/frame, twice upstream's rate.
+        // frame itself comes from elapsed wall-clock time inside the render, so
+        // this interval is only the repaint floor for quiet stretches and has
+        // no effect on the visible speed (streaming repaints included).
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
             rpi_tui::loader::SPINNER_FRAME_MS,
         ));
         interval.tick().await; // discard immediate
+
         loop {
             interval.tick().await;
             // Size watchdog: re-read the window and repaint when it differs
@@ -1729,8 +1903,31 @@ pub async fn interactive_tui(
             if !*running_key.lock().unwrap() {
                 break;
             }
+            // Console releases, mouse motion and resize must not postpone
+            // the last text character's idle deadline indefinitely.
+            if cfg!(windows)
+                && windows_paste_run
+                    .remaining_delay(std::time::Instant::now())
+                    .is_some_and(|left| left.is_zero())
+            {
+                windows_paste_run.flush_with_clipboard(
+                    &editor_for_key,
+                    std::time::Instant::now(),
+                    read_clipboard_text,
+                );
+                refresh_autocomplete(&state_for_key, &editor_for_key);
+                tui_for_key.request_render_reusing_scroll_content();
+            }
             if !state_for_key.selector_open() && !state_for_key.extension_dialog_open() {
-                if let Some(request) = ask_user_for_key.take_pending() {
+                if let Some(request) = ask_user_for_key.take_pending_for_tui() {
+                    if cfg!(windows) {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        windows_paste_run.end_paste_session();
+                    }
                     open_ask_user_dialog(&ctx_for_key, ask_user_for_key.clone(), request);
                 }
             }
@@ -1739,18 +1936,27 @@ pub async fn interactive_tui(
             } else {
                 // `event::read()` blocks indefinitely. Poll first so shutdown can
                 // stop and join this worker even when no further key arrives. A
-                // paste run being collected may pause for the rest of the
-                // payload; ordinary typing must be taken at once.
-                let idle = if cfg!(windows) && windows_paste_run.is_buffering() {
-                    std::time::Duration::from_millis(120)
+                // paste run waits only for the remainder of its idle window,
+                // not another full 120ms after each unrelated event.
+                let idle = if cfg!(windows) {
+                    windows_paste_run.remaining_delay(std::time::Instant::now())
                 } else {
-                    std::time::Duration::from_millis(50)
-                };
+                    None
+                }
+                .unwrap_or(std::time::Duration::from_millis(50));
                 match crossterm::event::poll(idle) {
                     Ok(true) => {}
                     Ok(false) => {
-                        if cfg!(windows) && windows_paste_run.is_buffering() {
-                            windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
+                        if cfg!(windows)
+                            && windows_paste_run
+                                .remaining_delay(std::time::Instant::now())
+                                .is_some_and(|left| left.is_zero())
+                        {
+                            windows_paste_run.flush_with_clipboard(
+                                &editor_for_key,
+                                std::time::Instant::now(),
+                                read_clipboard_text,
+                            );
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
                         }
@@ -1782,6 +1988,18 @@ pub async fn interactive_tui(
             // scrolling). Previously every non-Key event was dropped, so a
             // wheel had zero effect
             if let Event::Mouse(m) = ev {
+                if cfg!(windows) && m.kind != crossterm::event::MouseEventKind::Moved {
+                    if windows_paste_run.is_buffering() {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        refresh_autocomplete(&state_for_key, &editor_for_key);
+                        tui_for_key.request_render_reusing_scroll_content();
+                    }
+                    windows_paste_run.end_paste_session();
+                }
                 if side_questions::input_allowed(&state_for_key)
                     && side_for_key
                         .lock()
@@ -1792,6 +2010,19 @@ pub async fn interactive_tui(
                 }
                 if tui_for_key.handle_scroll_to_end_indicator_mouse_event(&m) {
                     tui_for_key.clear_selection();
+                    continue;
+                }
+                // A click on a thinking label/body row toggles THAT message's
+                // thinking before the press can anchor a text selection. The
+                // regions are frame-scoped: only rows the last painted frame
+                // actually showed resolve, so a stale rectangle can never fire
+                // after a scroll.
+                if let Some(message_id) = tui_for_key.thinking_region_hit(&m) {
+                    state_for_key
+                        .transcript_view()
+                        .toggle_message_thinking(&message_id);
+                    tui_for_key.clear_selection();
+                    tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
                 use crossterm::event::MouseEventKind;
@@ -1809,6 +2040,12 @@ pub async fn interactive_tui(
                         }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Right) if cfg!(windows) => {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        windows_paste_run.end_paste_session();
                         // upstream treats Windows right-click as a clipboard
                         // paste, rather than letting the console deliver the
                         // clipboard contents as individual key events. This is
@@ -1842,12 +2079,15 @@ pub async fn interactive_tui(
                                 .ok()
                                 .and_then(|s| s.fullscreen_copy_on_select)
                                 .unwrap_or(true);
-                            if auto_copy {
-                                if let Some(selected_text) = tui_for_key.selection_text() {
-                                    if !selected_text.trim().is_empty() {
-                                        let _ = copy_to_clipboard(&selected_text);
-                                    }
-                                }
+                            if auto_copy
+                                && copy_mouse_selection_with(&tui_for_key, copy_to_clipboard)
+                                    == Some(false)
+                            {
+                                add_note_message(
+                                    &state_for_key.notice_container(),
+                                    "Clipboard unavailable. Selection kept; press Ctrl+X to retry.",
+                                );
+                                tui_for_key.request_render(false);
                             }
                         }
                     }
@@ -1857,6 +2097,14 @@ pub async fn interactive_tui(
             }
             let Event::Key(key) = ev else {
                 if let Event::Paste(text) = ev {
+                    if cfg!(windows) {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        windows_paste_run.end_paste_session();
+                    }
                     if side_questions::input_allowed(&state_for_key)
                         && side_for_key.lock().unwrap().paste(&text, &tui_for_key)
                     {
@@ -1895,7 +2143,7 @@ pub async fn interactive_tui(
                             state_for_key.queue_image(image);
                         }
                         add_note_message(
-                            &state_for_key.chat_container,
+                            &state_for_key.notice_container(),
                             "Dropped images attached to the next prompt.",
                         );
                         tui_for_key.request_render(false);
@@ -1911,6 +2159,18 @@ pub async fn interactive_tui(
                 key,
                 tui_for_key.terminal().info().supports_kitty_keyboard,
             );
+            if cfg!(windows) && windows_paste_key_barrier(&key) {
+                if windows_paste_run.is_buffering() {
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        std::time::Instant::now(),
+                        read_clipboard_text,
+                    );
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                }
+                windows_paste_run.end_paste_session();
+            }
             // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
             // actually arrived before any routing decision, so a client that
             // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
@@ -1947,7 +2207,20 @@ pub async fn interactive_tui(
             // push-to-talk extension time a hold). Checked before the
             // release-drop below; a claimed key with an empty editor is routed
             // to the plugin's `Input` handler instead of the editor.
-            if dispatch_key_event(&state_for_key, &key, &editor_for_key) {
+            // Hidden, buffered text is still a draft. Do not let an
+            // empty-editor shortcut (notably push-to-talk Space) steal a
+            // printable key while that draft awaits its display deadline.
+            // Releases owned by an extension must still reach that owner.
+            let owned_release = key.kind == KeyEventKind::Release
+                && state_for_key
+                    .extension_claimed_keys
+                    .lock()
+                    .unwrap()
+                    .contains(&key.code);
+            let shortcut_allowed = !windows_paste_run.is_buffering()
+                || matches!(key.code, KeyCode::F(_))
+                || owned_release;
+            if shortcut_allowed && dispatch_key_event(&state_for_key, &key, &editor_for_key) {
                 continue;
             }
             // Drop releases but preserve Repeat so holding arrows, Backspace,
@@ -2032,14 +2305,17 @@ pub async fn interactive_tui(
                 .load(std::sync::atomic::Ordering::Acquire)
                 != 0
             {
-                if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
-                    finish_provider_login(
+                // Only report a cancel that won the flow from a completing result.
+                if key.code == KeyCode::Esc
+                    && key.modifiers == KeyModifiers::NONE
+                    && finish_provider_login(
                         &state_for_key,
                         &ctx_for_key.editor_container,
                         &editor_for_key,
                         &tui_for_key,
-                    );
-                    add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
+                    )
+                {
+                    add_note_message(&state_for_key.notice_container(), "OAuth flow cancelled.");
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
@@ -2126,9 +2402,9 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0b. Ctrl+X: upstream's `app.message.copy` — copy the editor
-            //     selection, else the last assistant reply. Native's Ctrl+C no
-            //     longer copies, so selection-copy lives here now.
+            // 0b. Ctrl+X: copy the mouse selection first, then the editor
+            //     selection, else the last assistant reply. Ctrl+C retains its
+            //     clear/exit semantics. A failed write must not change sources.
             if !state_for_key.selector_open()
                 && keybinding_matches(
                     &keybindings_for_key,
@@ -2136,10 +2412,22 @@ pub async fn interactive_tui(
                     rpi_tui::keybindings::keys::MESSAGE_COPY,
                 )
             {
-                if editor_for_key.has_selection() && editor_for_key.copy_selection() {
-                    add_note_message(&state_for_key.chat_container, "Copied!");
-                } else {
-                    copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                match copy_mouse_selection_with(&tui_for_key, copy_to_clipboard) {
+                    Some(copied) => add_note_message(
+                        &state_for_key.notice_container(),
+                        if copied {
+                            "Copied selection to the clipboard."
+                        } else {
+                            "Clipboard unavailable. Selection kept; press Ctrl+X to retry."
+                        },
+                    ),
+                    None => {
+                        if editor_for_key.has_selection() && editor_for_key.copy_selection() {
+                            add_note_message(&state_for_key.notice_container(), "Copied!");
+                        } else {
+                            copy_last_assistant(&state_for_key);
+                        }
+                    }
                 }
                 tui_for_key.request_render(false);
                 continue;
@@ -2163,6 +2451,14 @@ pub async fn interactive_tui(
             //    escape to the selector; on done/cancel the selector callbacks
             //    restore the editor and clear `active_selector`.
             if state_for_key.selector_open() {
+                // `/session` uses Tab to switch between this-project and all-
+                // projects. Autocomplete is cleared while a selector is open,
+                // so Tab is free here; consume it before the generic selector
+                // routing (which would send it to the list as a no-op).
+                if selector_owns_key(&state_for_key, &key) {
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
+                }
                 // Esc always cancels the selector (even with modifiers off).
                 // Route through `SelectList::handle_key(Esc)` so the list's
                 // `on_cancel` fires (the `/scoped-models` toggle selector saves
@@ -2298,7 +2594,7 @@ pub async fn interactive_tui(
                 let expanded = state_for_key.toggle_tool_outputs();
                 // Persist per-session so a later `-c`/`-r` restores it.
                 let session = ctx_for_key.session.clone();
-                tokio::spawn(async move {
+                ctx_for_key.state.session_write_tasks.spawn(async move {
                     let _ = session
                         .set_value("display.tool_outputs_expanded", serde_json::json!(expanded))
                         .await;
@@ -2316,7 +2612,7 @@ pub async fn interactive_tui(
                 let hide = state_for_key.toggle_thinking();
                 // Persist per-session so a later `-c`/`-r` restores it.
                 let session = ctx_for_key.session.clone();
-                tokio::spawn(async move {
+                ctx_for_key.state.session_write_tasks.spawn(async move {
                     let _ = session
                         .set_value("display.hide_thinking", serde_json::json!(hide))
                         .await;
@@ -2346,14 +2642,14 @@ pub async fn interactive_tui(
                 let lane = lane_for_key.clone();
                 let state = state_for_key.clone();
                 let tui = tui_for_key.clone();
-                tokio::spawn(async move {
+                state.session_write_tasks.clone().spawn(async move {
                     match cycle_model(&lane, &catalog, cycle_backward).await {
                         Ok(Some(model)) => {
                             report_model_selection(&lane, &state, &tui, model, false).await;
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            add_error_message(&state.chat_container, &error);
+                            add_error_message(&state.notice_container(), &error);
                             tui.request_render(false);
                         }
                     }
@@ -2374,7 +2670,7 @@ pub async fn interactive_tui(
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
                 let state = state_for_key.clone();
-                tokio::spawn(async move {
+                state.session_write_tasks.clone().spawn(async move {
                     let Ok(current_model) = lane.get_model().await else {
                         return;
                     };
@@ -2423,6 +2719,14 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::PASTE_IMAGE,
             ) {
+                if cfg!(windows) {
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        std::time::Instant::now(),
+                        read_clipboard_text,
+                    );
+                    windows_paste_run.end_paste_session();
+                }
                 if let Some(paths) = read_clipboard_file_paths() {
                     let text = paths.join("\n");
                     if let Some(images) = images_from_pasted_paths(&text) {
@@ -2430,7 +2734,7 @@ pub async fn interactive_tui(
                             state_for_key.queue_image(image);
                         }
                         add_note_message(
-                            &state_for_key.chat_container,
+                            &state_for_key.notice_container(),
                             "Clipboard images attached to the next prompt.",
                         );
                     } else {
@@ -2442,7 +2746,7 @@ pub async fn interactive_tui(
                 if let Ok(Some(image)) = read_clipboard_image() {
                     state_for_key.queue_image(image);
                     add_note_message(
-                        &state_for_key.chat_container,
+                        &state_for_key.notice_container(),
                         "Clipboard image attached to the next prompt.",
                     );
                     tui_for_key.request_render(false);
@@ -2557,42 +2861,58 @@ pub async fn interactive_tui(
             // 5. Global transcript scroll. PageUp/PageDown use the actual
             // viewport height with four rows of overlap (upstream behavior),
             // while Home/End jump to the transcript boundaries.
-            if crate::transcript_navigation::handle_key(&tui_for_key, &keybindings_for_key, &key) {
+            if history::handle_key(&state_for_key, &tui_for_key, &keybindings_for_key, &key) {
+                continue;
+            }
+            if editor_for_key.get_text().is_empty()
+                && crate::transcript_navigation::handle_key(
+                    &tui_for_key,
+                    &keybindings_for_key,
+                    &key,
+                )
+            {
                 continue;
             }
 
-            // 5a-bis. ↑/↓ navigate the autocomplete list while it is open
-            //     (typed `/` or `@`), then Tab accepts the highlighted row.
-            if key.modifiers == KeyModifiers::NONE
-                && (key.code == KeyCode::Up || key.code == KeyCode::Down)
-            {
-                let direction = if key.code == KeyCode::Up { -1 } else { 1 };
+            // 5a-bis. ↑/↓ (or Alt-P/Alt-N, the emacs bindings — Ctrl-P is
+            //     taken by user-configurable model select) navigate the
+            //     autocomplete list while it is open (typed `/` or `@`), then
+            //     Tab accepts the highlighted row.
+            let navigate_direction =
+                if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Up {
+                    Some(-1)
+                } else if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Down {
+                    Some(1)
+                } else if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('p') {
+                    Some(-1)
+                } else if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('n') {
+                    Some(1)
+                } else {
+                    None
+                };
+            if let Some(direction) = navigate_direction {
                 if navigate_autocomplete(&state_for_key, &editor_for_key, direction) {
                     tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
             }
 
-            // 5b. ↑/↓ browse submitted-message history when the editor is
-            //     EMPTY (a fresh prompt) — mirrors TS historyPrevious/Next
-            //     without the surprise of replacing typed text. When the
-            //     editor holds content, ↑/↓ fall through to cursor movement
-            //     (typing "hello", pressing ↑ at the start, must never swap
-            //     the draft for a history entry — reported as "text
-            //     disappeared"). Once browsing, ↓ walks back and restores the
-            //     draft.
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Up {
-                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
-                if editor_for_key.get_text().is_empty() || browsing {
-                    navigate_history(&state_for_key, &editor_for_key, -1);
-                    tui_for_key.request_render_reusing_scroll_content();
-                    continue;
-                }
-            }
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Down {
-                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
-                if editor_for_key.get_text().is_empty() || browsing {
-                    navigate_history(&state_for_key, &editor_for_key, 1);
+            // 5b. ↑/↓ move the caret through a multi-line draft, and only
+            //     leave for prompt history once the caret cannot move any
+            //     further (first line for ↑, last line for ↓) — mirrors TS
+            //     historyPrevious/Next, which only fire at the editor's edge.
+            //     A fresh prompt (no caret row to move to) recalls
+            //     immediately. A single-line draft keeps the older contract
+            //     and never swaps itself for a history entry: that was
+            //     reported as "text disappeared", and one line has no second
+            //     row to move to — but once a browse session is active, ↑/↓
+            //     keep walking history (a one-line recall must not strand it).
+            if key.modifiers == KeyModifiers::NONE
+                && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            {
+                let direction = if key.code == KeyCode::Up { -1 } else { 1 };
+                if arrow_belongs_to_history(&state_for_key, &editor_for_key, direction) {
+                    navigate_history(&state_for_key, &editor_for_key, direction);
                     tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
@@ -2618,7 +2938,7 @@ pub async fn interactive_tui(
                 // Routed through `handle_dequeue` (not the raw restore) so the
                 // `Restored N queued message(s)` status note fires, mirroring
                 // upstream's `handleDequeue`.
-                tokio::spawn(handle_dequeue(
+                state_for_key.session_write_tasks.spawn(handle_dequeue(
                     lane_for_key.clone(),
                     editor_for_key.clone(),
                     state_for_key.clone(),
@@ -2647,7 +2967,7 @@ pub async fn interactive_tui(
                         // Direct send: the harness emits no user `message_start`
                         // for it, so render the bubble here (see the submit
                         // handler in `interactive_tui`).
-                        add_user_message(&state_for_key.chat_container, &prompt);
+                        add_user_message(&state_for_key.history_page.active, &prompt);
                         push_history(&state_for_key, &prompt);
                         let _ = tx_for_key.send(TuiMessage::UserInput(
                             prompt,
@@ -2661,10 +2981,10 @@ pub async fn interactive_tui(
                     let images = state_for_key.take_pending_images();
                     let message = user_message_with_images(&prompt, images.clone());
                     let lane = lane_for_key.clone();
-                    let chat = state_for_key.chat_container.clone();
+                    let chat = state_for_key.notice_container();
                     let tui = tui_for_key.clone();
                     let state = state_for_key.clone();
-                    tokio::spawn(async move {
+                    state.session_write_tasks.clone().spawn(async move {
                         if let Err(error) = lane.follow_up(message).await {
                             state.restore_pending_images(images);
                             add_error_message(&chat, &format!("Could not queue message: {error}"));
@@ -2722,18 +3042,9 @@ pub async fn interactive_tui(
                             }
                             continue;
                         }
-                        // Paste vs typing is decided by the console queue, not
-                        // by elapsed time. A clipboard payload is handed over
-                        // already queued, so a *real* key still waiting behind
-                        // this one means the run is a paste to collect and fold.
-                        // An empty queue means these are keystrokes — and an IME
-                        // commit, which delivers a whole word with no gap at all,
-                        // looks exactly like this — so they go straight to the
-                        // editor instead of waiting out a timer.
-                        //
-                        // `probe_paste_input` is essential here: Windows queues
-                        // every key's Release directly behind its Press, so a raw
-                        // poll would report "more input" for ordinary typing.
+                        // Queue-empty is not a paste boundary. Leave the run
+                        // buffered for its idle window; probe only to retain
+                        // newline evidence. Releases are not queued text.
                         let (more_queued, stashed) =
                             probe_paste_input(pending_event.take(), || {
                                 if crossterm::event::poll(std::time::Duration::ZERO)
@@ -2746,17 +3057,8 @@ pub async fn interactive_tui(
                             });
                         pending_event = stashed;
                         if more_queued {
-                            // Real input was queued behind this character, which
-                            // is the only proof that this run is a paste. IME
-                            // commits never reach here: their queue is empty.
                             windows_paste_run.mark_collected();
-                            continue;
                         }
-                        // Nothing queued behind it: hand the run over now. This
-                        // is the typing path, so it must not wait on a timer.
-                        windows_paste_run.flush(&editor_for_key, now);
-                        refresh_autocomplete(&state_for_key, &editor_for_key);
-                        tui_for_key.request_render_reusing_scroll_content();
                         continue;
                     }
                 }
@@ -2794,19 +3096,33 @@ pub async fn interactive_tui(
                         continue;
                     }
                     crate::key_trace::note("windows paste run -> flush + submit");
-                    windows_paste_run.flush(&editor_for_key, now);
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        now,
+                        read_clipboard_text,
+                    );
+                    windows_paste_run.end_paste_session();
+                    // Enter can beat the idle deadline: autocomplete must see
+                    // the newly delivered draft before its confirm/submit path.
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
                 } else {
-                    windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        std::time::Instant::now(),
+                        read_clipboard_text,
+                    );
+                    windows_paste_run.end_paste_session();
                 }
             }
 
             // 5a-ter. A bare Enter in a completion context (`/` or `@`)
             //     resolves the completion before submitting, mirroring the
             //     TS editor's `tui.select.confirm` (`editor.ts:757-815`):
-            //     apply the sole/highlighted item, then let a `/` completion
-            //     fall through to submit while an `@`-path one consumes the
-            //     Enter. Unambiguous only — a fresh ambiguous popup submits
-            //     the typed text, and unknown `/skill:name` still reaches
+            //     apply the highlighted item — the panel's first choice on a
+            //     fresh popup — then let a `/` completion fall through to
+            //     submit while an `@`-path one consumes the Enter (a path
+            //     popup therefore still needs a sole candidate or an explicit
+            //     ↑/↓). Unknown `/skill:name` has no popup and still reaches
             //     the model untouched.
             //
             //     Placement is load-bearing: this runs AFTER the Windows
@@ -2892,8 +3208,8 @@ pub async fn interactive_tui(
         // The harness emits no user `message_start` for a directly-sent prompt
         // (it drives the loop with an empty prompts vec), so the initial
         // `-p` / `--prompt` bubbles are rendered here.
-        add_user_message(&chat_container, &prompt);
-        add_image_previews(&chat_container, &images, show_images);
+        add_user_message(&state.history_page.active, &prompt);
+        add_image_previews(&state.history_page.active, &images, show_images);
         tui.request_render(false);
         run_prompt_streaming(
             &lane,
@@ -2935,9 +3251,9 @@ pub async fn interactive_tui(
                 match switch_provider(&input, &manifests, &available, &lane).await {
                     Ok((model, note)) => {
                         state.set_current_model(&model);
-                        add_note_message(&chat_container, &note);
+                        add_note_message(&state.notice_container(), &note);
                     }
-                    Err(error) => add_error_message(&chat_container, &error),
+                    Err(error) => add_error_message(&state.notice_container(), &error),
                 }
                 tui.request_render(false);
             }
@@ -2950,10 +3266,14 @@ pub async fn interactive_tui(
                 // as a user edit made a hands-free voice session switch itself
                 // off the moment it was started.
                 state.clear_editor_programmatically();
-                add_image_previews(&chat_container, &prompt_images, state.images_visible());
+                add_image_previews(
+                    &state.history_page.active,
+                    &prompt_images,
+                    state.images_visible(),
+                );
                 if !prompt_images.is_empty() {
                     add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Attached {} image(s) to this prompt.", prompt_images.len()),
                     );
                 }
@@ -2974,9 +3294,12 @@ pub async fn interactive_tui(
                         let cursor = text.chars().count();
                         editor.set_text(&text);
                         editor.set_cursor(0, cursor);
-                        add_note_message(&chat_container, "Draft updated from external editor.");
+                        add_note_message(
+                            &state.notice_container(),
+                            "Draft updated from external editor.",
+                        );
                     }
-                    Err(error) => add_error_message(&chat_container, &error),
+                    Err(error) => add_error_message(&state.notice_container(), &error),
                 }
                 tui.request_render(false);
             }
@@ -2999,12 +3322,17 @@ pub async fn interactive_tui(
                 // flushed at `AgentEnd` (upstream `_pendingBashMessages`).
                 if *state.status.lock().unwrap() == RunStatus::Idle {
                     if let Err(error) = lane.append_message(message).await {
+                        state
+                            .history_page
+                            .unsaved
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         add_error_message(
-                            &chat_container,
+                            &state.notice_container(),
                             &format!("Could not record bash result: {error}"),
                         );
                         tui.request_render(false);
                     }
+                    history::settle(&state, &tui);
                 } else {
                     state.pending_bash_messages.lock().unwrap().push(message);
                 }
@@ -3012,24 +3340,22 @@ pub async fn interactive_tui(
             Some(TuiMessage::OpenTree) => {
                 if *state.status.lock().unwrap() != RunStatus::Idle {
                     add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         "Wait for the current run to finish before opening the tree.",
                     );
                     tui.request_render(false);
                 } else {
-                    open_tree_selector(
-                        harness,
-                        &state,
-                        &editor_container,
-                        &editor,
-                        &tui,
-                        &chat_container,
-                        &tx,
-                    )
-                    .await;
+                    open_tree_selector(harness, &state, &editor_container, &editor, &tui, &tx)
+                        .await;
                 }
             }
             Some(TuiMessage::NavigateTree(entry_id)) => {
+                state.history_page.invalidate();
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeTree,
+                )
+                .await;
                 match lane.navigate_tree(Some(&entry_id), false, None, None).await {
                     Ok(result) => match result.outcome {
                         rpi_harness::agent_harness::NavigationOutcome::Completed { .. } => {
@@ -3038,35 +3364,32 @@ pub async fn interactive_tui(
                             let (tools, skills, context_files) =
                                 current_capabilities(harness, &lane).await;
                             add_welcome_message_with_capabilities(
-                                &chat_container,
+                                &state.history_page.header,
                                 &tools,
                                 &skills,
                                 &context_files,
                             );
-                            render_session_history(
-                                harness,
-                                &chat_container,
-                                state.markdown_transformer(),
-                                Some(state.extension_session.clone()),
-                                state.images_visible(),
-                                Some(&state.footer),
+                            history::restore(harness, &state, &chat_container).await;
+                            dispatch_observed_session_event(
+                                reload_context,
+                                rpi_plugin_sdk::EventTag::SessionTree,
                             )
                             .await;
                             add_note_message(
-                                &chat_container,
+                                &state.notice_container(),
                                 "Moved to the selected session entry.",
                             );
                         }
                         rpi_harness::agent_harness::NavigationOutcome::Failed { error, .. } => {
-                            add_error_message(&chat_container, &error.message);
+                            add_error_message(&state.notice_container(), &error.message);
                         }
                         _ => add_note_message(
-                            &chat_container,
+                            &state.notice_container(),
                             "The selected entry could not be opened.",
                         ),
                     },
                     Err(error) => add_error_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Could not navigate session tree: {error}"),
                     ),
                 }
@@ -3077,6 +3400,11 @@ pub async fn interactive_tui(
                 // the transcript: the harness swaps its JSONL backing, the
                 // banner is rebuilt from the real capability snapshot, and the
                 // footer counters are reset.
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeSwitch,
+                )
+                .await;
                 start_new_session(
                     harness,
                     &lane,
@@ -3089,10 +3417,21 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::Compact) => {
-                run_compact(&lane, &tui, &state).await;
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeCompact,
+                )
+                .await;
+                if run_compact(&lane, &tui, &state).await {
+                    dispatch_observed_session_event(
+                        reload_context,
+                        rpi_plugin_sdk::EventTag::SessionCompact,
+                    )
+                    .await;
+                }
             }
             Some(TuiMessage::Copy) => {
-                copy_last_assistant(&state, &chat_container);
+                copy_last_assistant(&state);
                 tui.request_render(false);
             }
             Some(TuiMessage::Exit) => {
@@ -3100,6 +3439,11 @@ pub async fn interactive_tui(
                 break;
             }
             Some(TuiMessage::SwitchSession(id)) => {
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeSwitch,
+                )
+                .await;
                 switch_to_session(
                     harness,
                     &lane,
@@ -3114,6 +3458,11 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ImportSession(path)) => {
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeSwitch,
+                )
+                .await;
                 import_session(
                     harness,
                     &lane,
@@ -3128,18 +3477,24 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ShareSession) => {
-                share_session(harness, &chat_container).await;
+                share_session(harness, &state.notice_container()).await;
                 tui.request_render(false);
             }
             Some(TuiMessage::SetSessionName(name)) => {
                 let outcome = harness.session().set_name(Some(&name)).await;
                 match outcome {
-                    Ok(_) => add_note_message(
-                        &chat_container,
-                        &format!("Session renamed to \"{name}\"."),
-                    ),
+                    Ok(_) => {
+                        // Line 1 of the footer renders `session_name`, but nothing
+                        // in production ever wrote it — the slot was always empty
+                        // and `/name` looked like a no-op on screen.
+                        state.footer.set_session_name(Some(&name));
+                        add_note_message(
+                            &state.notice_container(),
+                            &format!("Session renamed to \"{name}\"."),
+                        );
+                    }
                     Err(e) => add_error_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Could not rename session: {e}"),
                     ),
                 }
@@ -3152,12 +3507,13 @@ pub async fn interactive_tui(
                 let path = cwd.join(&file_name);
                 match agent_session.export_to_markdown(&path).await {
                     Ok(_) => add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => {
-                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
-                    }
+                    Err(e) => add_error_message(
+                        &state.notice_container(),
+                        &format!("Could not write export: {e}"),
+                    ),
                 }
                 tui.request_render(false);
             }
@@ -3166,12 +3522,22 @@ pub async fn interactive_tui(
                 let path = cwd.join(&file_name);
                 match agent_session.export(format, &path).await {
                     Ok(_) => add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => {
-                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
-                    }
+                    Err(e) => add_error_message(
+                        &state.notice_container(),
+                        &format!("Could not write export: {e}"),
+                    ),
+                }
+                tui.request_render(false);
+            }
+            Some(TuiMessage::NativeDurable(args)) => {
+                match crate::native_durable::interactive_command(agent_session.harness(), &args)
+                    .await
+                {
+                    Ok(text) => add_note_message(&state.notice_container(), &text),
+                    Err(text) => add_error_message(&state.notice_container(), &text),
                 }
                 tui.request_render(false);
             }
@@ -3218,15 +3584,21 @@ pub async fn interactive_tui(
                                 ));
                             }
                         }
-                        add_note_message(&chat_container, &lines.join("\n"));
+                        add_note_message(&state.notice_container(), &lines.join("\n"));
                     }
-                    None => {
-                        add_error_message(&chat_container, "Could not read session usage stats.")
-                    }
+                    None => add_error_message(
+                        &state.notice_container(),
+                        "Could not read session usage stats.",
+                    ),
                 }
                 tui.request_render(false);
             }
             Some(TuiMessage::ForkSession) => {
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeFork,
+                )
+                .await;
                 fork_session(
                     harness,
                     &cwd,
@@ -3243,7 +3615,16 @@ pub async fn interactive_tui(
                 input,
                 purpose,
                 flow_id,
+                cancel,
             }) => {
+                // The flow ended (Esc, or a newer flow) before its call started.
+                if state
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != flow_id
+                {
+                    continue;
+                }
                 let (snapshot, keepalive) = {
                     let session = ctx
                         .reload_context
@@ -3262,11 +3643,12 @@ pub async fn interactive_tui(
                             let action_call = action.clone();
                             tokio::task::spawn_blocking(move || {
                                 let _keepalive = keepalive;
-                                rpi_extensions::request_oauth(
+                                rpi_extensions::request_oauth_with_cancel(
                                     &snapshot,
                                     &provider_call,
                                     &action_call,
                                     input,
+                                    &cancel,
                                 )
                                 .map_err(|error| error.to_string())
                             })
@@ -3292,13 +3674,6 @@ pub async fn interactive_tui(
                 purpose,
                 flow_id,
             }) => {
-                if state
-                    .provider_auth_flow_id
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != flow_id
-                {
-                    continue;
-                }
                 handle_provider_oauth_result(
                     &state,
                     &editor_container,
@@ -3317,7 +3692,7 @@ pub async fn interactive_tui(
                     Ok(auth) => auth,
                     Err(error) => {
                         add_error_message(
-                            &chat_container,
+                            &state.notice_container(),
                             &format!("Could not read saved credentials: {error}"),
                         );
                         tui.request_render(false);
@@ -3329,45 +3704,32 @@ pub async fn interactive_tui(
                     Some(crate::config::Credential::Oauth {
                         access, refresh, ..
                     }) => {
-                        show_provider_auth_status(
+                        begin_provider_oauth_logout(
                             &state,
                             &editor_container,
                             &editor,
                             &tui,
-                            &format!("Revoking OAuth credentials for {provider}…"),
+                            &ctx.tx,
+                            &provider,
+                            access,
+                            refresh,
                         );
-                        let flow_id = state
-                            .provider_auth_generation
-                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                            .wrapping_add(1);
-                        state
-                            .provider_auth_flow_id
-                            .store(flow_id, std::sync::atomic::Ordering::Release);
-                        let _ = ctx.tx.send(TuiMessage::ProviderOAuthAction {
-                            provider,
-                            action: "revoke".to_string(),
-                            input: serde_json::json!({
-                                "credential": {"access": access, "refresh": refresh}
-                            }),
-                            purpose: ProviderOAuthPurpose::Logout,
-                            flow_id,
-                        });
                     }
                     Some(crate::config::Credential::ApiKey { .. }) => {
                         match crate::config::delete_credential(&provider) {
                             Ok(true) => {
                                 add_note_message(
-                                    &chat_container,
+                                    &state.notice_container(),
                                     &format!("Removed saved credentials for {provider}; reloading providers…"),
                                 );
                                 let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
                             }
                             Ok(false) => add_note_message(
-                                &chat_container,
+                                &state.notice_container(),
                                 &format!("No saved credentials found for {provider}."),
                             ),
                             Err(error) => add_error_message(
-                                &chat_container,
+                                &state.notice_container(),
                                 &format!("Could not remove {provider} credentials: {error}"),
                             ),
                         }
@@ -3375,7 +3737,7 @@ pub async fn interactive_tui(
                     }
                     None => {
                         add_note_message(
-                            &chat_container,
+                            &state.notice_container(),
                             &format!("No saved credentials found for {provider}."),
                         );
                         tui.request_render(false);
@@ -3390,7 +3752,10 @@ pub async fn interactive_tui(
                 // clone the `Arc` out so the borrow of `harness` (the main
                 // loop's `&AgentHarness`) lives across the await.
                 let reload_ctx = ctx.reload_context.clone();
-                add_note_message(&chat_container, "Reloading extensions + resources…");
+                add_note_message(
+                    &state.notice_container(),
+                    "Reloading extensions + resources…",
+                );
                 tui.request_render(false);
                 let outcome =
                     crate::session::reload_extension_resources(harness, &reload_ctx).await;
@@ -3415,25 +3780,84 @@ pub async fn interactive_tui(
                     reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
                 );
                 state.set_markdown_transformer_with_reinstall(fresh_transformer);
+                // Rebuild the custom-theme registry: extension reloads can
+                // change project trust (`/trust` flow) and the session cwd is
+                // fixed per TUI, so re-resolve both. Use the policy this
+                // reload actually resolved (`resolve_project_trust` over the
+                // effective args), not the immutable startup snapshot;
+                // after a hard failure the previous resources were kept, so
+                // the previous registry stays untouched too. A broken theme
+                // dir surfaces as a warning, never a reload failure.
+                if !reload_ctx.args.no_themes {
+                    let mut rebuilt = None;
+                    if let Some(reload_trusted) = outcome.project_trusted {
+                        let (mut registry, diagnostics) =
+                            crate::themes::ThemeRegistry::discover(&reload_ctx.cwd, reload_trusted);
+                        let discovered = reload_ctx
+                            .discovered_theme_paths
+                            .lock()
+                            .map(|paths| paths.clone())
+                            .unwrap_or_default();
+                        registry.merge_discovered(&discovered);
+                        for diagnostic in &diagnostics {
+                            eprintln!("warning: {diagnostic}");
+                        }
+                        // A reload can remove the active file theme (its package
+                        // went away or no longer returns the path); fall back to
+                        // the default preset with a notice instead of rendering
+                        // with a palette nothing can re-resolve.
+                        let active = state.active_theme_spec.lock().ok().and_then(|g| g.clone());
+                        if let Ok(mut guard) = state.theme_registry.write() {
+                            *guard = registry.clone();
+                        }
+                        if let Some(notice) = crate::themes::reconcile_after_reload(
+                            active.as_deref(),
+                            &registry,
+                            &state.theme_manager,
+                        ) {
+                            add_note_message(&state.notice_container(), &notice);
+                            state.set_active_theme_spec(Some("dark".to_string()));
+                        }
+                        rebuilt = Some(registry);
+                    }
+                    // The registry may now resolve a different file for the
+                    // active name; re-target the watcher either way (with the
+                    // rebuilt registry when the reload completed, the previous
+                    // one after a hard failure kept the old resources).
+                    let registry = rebuilt.unwrap_or_else(|| {
+                        state
+                            .theme_registry
+                            .read()
+                            .map(|guard| guard.clone())
+                            .unwrap_or_default()
+                    });
+                    crate::themes::restart_theme_watcher(
+                        &state.theme_watcher,
+                        state.active_theme_spec().as_deref(),
+                        &registry,
+                        &state.theme_manager,
+                        theme_watch_notify(&state, tui.clone()),
+                    );
+                }
                 if outcome.had_errors {
                     // Hard failure: the summary itself carries the error detail
                     // (e.g. "Settings reload failed: …"), so render it as an
                     // error without an extra stderr pointer.
-                    add_error_message(&chat_container, &outcome.summary);
+                    add_error_message(&state.notice_container(), &outcome.summary);
                 } else if outcome.had_warnings {
                     // Reload succeeded but produced soft diagnostics (skill
                     // shadowing, name validation, …). The details are printed
                     // to stderr; keep this as an informational note so a
                     // successful reload isn't shown as a red ✗ error.
                     add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!(
                             "{} (with warnings — see stderr for details).",
                             outcome.summary
                         ),
                     );
                 } else {
-                    add_note_message(&chat_container, &outcome.summary);
+                    add_note_message(&state.notice_container(), &outcome.summary);
                 }
                 tui.request_render(false);
             }
@@ -3442,6 +3866,37 @@ pub async fn interactive_tui(
     }
 
     // ---- Shutdown ----
+    state.history_page.invalidate();
+    let mut key_handle = Some(key_handle);
+    let mut exit_code = 0;
+    if args.native_durable {
+        // Stop/join the built-in input producer before sealing its accepted
+        // background session writers. Dialog cancellation can unblock key work;
+        // the streaming event consumer stays live through producer settlement.
+        *running.lock().unwrap() = false;
+        ask_user_bridge.shutdown();
+        if key_handle.take().unwrap().await.is_err() {
+            exit_code = 1;
+        }
+        // Native shutdown is an explicit cooperative runtime boundary: settle
+        // an active prompt before the producer join/core barrier. Idle lanes
+        // return an error here, which is intentionally ignored just like RPC
+        // shutdown; the subsequent settlement still owns accepted writers.
+        let _ = lane.abort_and_reconcile().await;
+        if !settlement::settle_native(harness, state.session_write_tasks.seal()).await {
+            eprintln!("[rpi] native TUI settlement failed");
+            exit_code = 1;
+        }
+    } else {
+        // Let anything the lane has already committed to writing reach the disk
+        // before the tasks that carry those writes are aborted. A turn's entries are
+        // appended by the harness rather than by the drain task, but the drain task
+        // is what acknowledges them to the UI, so aborting it first can leave a turn
+        // the user saw with no durable counterpart.
+        let _ = lane.wait_for_idle().await;
+        lane.drain_session().await;
+    }
+
     ask_user_bridge.shutdown();
     *running.lock().unwrap() = false;
     for handle in update_check_handles {
@@ -3450,7 +3905,9 @@ pub async fn interactive_tui(
     }
     // The input worker checks `running` at least every 50ms. Join it before
     // restoring cooked mode so no late event read races terminal cleanup.
-    let _ = key_handle.await;
+    if let Some(key_handle) = key_handle {
+        let _ = key_handle.await;
+    }
     tick_handle.abort();
     if let Some(handle) = drain_handle {
         handle.abort();
@@ -3470,9 +3927,8 @@ pub async fn interactive_tui(
         println!("\x1b[2mTo resume this session:\x1b[0m {command}");
     }
     println!("\nGoodbye!");
-    let _ = args;
 
-    0
+    exit_code
 }
 
 // ===========================================================================
@@ -3487,3 +3943,28 @@ pub fn is_tui_supported() -> bool {
 // Keep the `Color` import used (theme accent rendering in autocomplete).
 #[allow(unused_imports)]
 use rpi_tui::Color as _Color;
+
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_failed_attach_tests.rs"]
+mod experimental_dialog_failed_attach_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_generation_tests.rs"]
+mod experimental_dialog_generation_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_reattachment_tests.rs"]
+mod experimental_dialog_reattachment_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_retirement_tests.rs"]
+mod experimental_dialog_retirement_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_startup_tests.rs"]
+mod experimental_dialog_startup_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_durable_tests.rs"]
+mod experimental_durable_shutdown_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_event_retirement_tests.rs"]
+mod experimental_event_retirement_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_reload_bridge_tests.rs"]
+mod experimental_reload_bridge_tests;

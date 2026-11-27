@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 const REGISTRY: &str = "packages.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectPackage {
     pub name: String,
     pub version: String,
@@ -25,6 +26,22 @@ pub struct ProjectPackage {
 struct PackageRegistry {
     #[serde(default)]
     packages: Vec<ProjectPackage>,
+}
+
+/// Extension management deliberately exposes only the shared update operation.
+pub fn run_extension(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        None | Some("--help") | Some("-h") => {
+            print_extension_help();
+            0
+        }
+        Some("update") => update(&args[1..]),
+        Some(other) => {
+            eprintln!("error: unknown extension command `{other}`");
+            print_extension_help();
+            2
+        }
+    }
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -103,6 +120,50 @@ fn link(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let native_root = project_root.join(".rpi");
+    let _lease = match crate::resource_management::shared_lease(&native_root) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = std::fs::create_dir_all(&native_root) {
+        eprintln!("error: could not create {}: {error}", native_root.display());
+        return 1;
+    }
+    let package_lock = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(native_root.join("packages.lock"))
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("error: could not open project package lock: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&package_lock) {
+        eprintln!("error: another project package update is running: {error}");
+        return 1;
+    }
+    let package_registry = match read_registry(&project_root) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    // Check an explicit identity before Cargo can execute a build script.
+    if let Some(name) = &name {
+        if let Err(error) =
+            crate::resource_management::legacy_unowned(&native_root, "package", name)
+        {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    }
     let source = source
         .map(|p| project_root.join(p))
         .unwrap_or_else(|| project_root.clone());
@@ -121,9 +182,19 @@ fn link(args: &[String]) -> i32 {
         }
     };
     let package_name = name.unwrap_or_else(|| selected.name.clone());
+    let previous_package = package_registry
+        .packages
+        .iter()
+        .find(|package| package.name == package_name);
     if !valid_name(&package_name) {
         eprintln!("error: invalid package name `{package_name}`");
         return 2;
+    }
+    if let Err(error) =
+        crate::resource_management::legacy_unowned(&native_root, "package", &package_name)
+    {
+        eprintln!("error: {error}");
+        return 1;
     }
     eprintln!("package: building {}...", selected.name);
     let artifact = match build(&selected, release, locked) {
@@ -135,10 +206,6 @@ fn link(args: &[String]) -> i32 {
     };
     let root = project_root.join(".rpi/packages").join(&package_name);
     let ext = root.join("extensions");
-    if let Err(e) = std::fs::create_dir_all(&ext) {
-        eprintln!("error: could not create {}: {e}", ext.display());
-        return 1;
-    }
     let file = match artifact.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
         None => {
@@ -146,21 +213,102 @@ fn link(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let target = ext.join(&file);
+    let target_file = if previous_package.is_some() || (force && ext.join(&file).exists()) {
+        match crate::install::versioned_artifact_name(&file, &selected.version, &ext) {
+            Ok(name) => name,
+            Err(error) => {
+                eprintln!("error: could not allocate package artifact: {error}");
+                return 1;
+            }
+        }
+    } else {
+        file.clone()
+    };
+    let target = ext.join(&target_file);
+    let tmp = ext.join(format!(".{target_file}.tmp"));
+    // Cargo can execute build scripts. Recheck the addressed write paths after
+    // it returns, before creating directories or removing/copying any artifact.
+    let mut guarded_targets = vec![target.clone(), tmp.clone()];
+    if target_file != file {
+        // A legacy first-install artifact may not be present in the old
+        // registry ledger. Keep it inside the validation boundary as well.
+        let legacy_target = ext.join(&file);
+        let legacy_tmp = ext.join(format!(".{file}.tmp"));
+        if legacy_tmp.try_exists().unwrap_or(false) {
+            eprintln!("error: could not stage package artifact: staging path already exists");
+            return 1;
+        }
+        guarded_targets.push(legacy_target);
+        guarded_targets.push(legacy_tmp);
+    }
+    if let Some(previous) = previous_package {
+        // An upgrade publishes a new artifact, but the old artifact and its
+        // staging name still belong to this transaction's safety boundary.
+        // Validate them too so a stale reparse point or pre-existing staging
+        // file cannot be silently bypassed by the new versioned name.
+        for artifact in &previous.artifacts {
+            let old_target = ext.join(artifact);
+            let old_tmp = ext.join(format!(".{artifact}.tmp"));
+            if old_tmp.try_exists().unwrap_or(false) {
+                eprintln!("error: could not stage package artifact: staging path already exists");
+                return 1;
+            }
+            guarded_targets.push(old_target);
+            guarded_targets.push(old_tmp);
+        }
+    }
+    if let Err(error) =
+        crate::resource_management::legacy_unowned(&native_root, "package", &package_name).and_then(
+            |_| crate::resource_management::legacy_unowned_targets(&native_root, &guarded_targets),
+        )
+    {
+        eprintln!("error: {error}");
+        return 1;
+    }
     if target.exists() && !force {
         eprintln!("error: package already exists; use --force");
         return 1;
     }
-    let tmp = ext.join(format!(".{file}.tmp"));
+    if let Err(e) = std::fs::create_dir_all(&ext) {
+        eprintln!("error: could not create {}: {e}", ext.display());
+        return 1;
+    }
+    // Never follow/truncate a pre-existing fixed staging path (including a
+    // hardlink). Only clean up a temporary file this invocation created.
+    let mut staged = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("error: could not stage package artifact: {error}");
+            return 1;
+        }
+    };
+    let copied = std::fs::File::open(&artifact)
+        .and_then(|mut input| std::io::copy(&mut input, &mut staged))
+        .and_then(|_| staged.sync_all())
+        // macOS: the copy carries the artifact's build-time signature but a new
+        // mtime, and the kernel kills any host that maps such a page. See
+        // `install::resign_staged_native`.
+        .and_then(|()| crate::install::resign_staged_native(&tmp).map_err(std::io::Error::other));
+    drop(staged);
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("error: could not stage package artifact: {error}");
+        return 1;
+    }
     if force {
         if let Err(e) = std::fs::remove_file(&target) {
             if e.kind() != std::io::ErrorKind::NotFound {
+                let _ = std::fs::remove_file(&tmp);
                 eprintln!("error: could not replace existing package artifact: {e}");
                 return 1;
             }
         }
     }
-    if let Err(e) = std::fs::copy(&artifact, &tmp).and_then(|_| std::fs::rename(&tmp, &target)) {
+    if let Err(e) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
         eprintln!("error: could not activate package: {e}");
         return 1;
@@ -178,7 +326,7 @@ fn link(args: &[String]) -> i32 {
         version: selected.version,
         source: source.display().to_string(),
         cargo_package: selected.name,
-        artifacts: vec![file],
+        artifacts: vec![target_file],
     });
     registry.packages.sort_by(|a, b| a.name.cmp(&b.name));
     if let Err(e) = write_registry(&project_root, &registry) {
@@ -233,14 +381,34 @@ fn update(args: &[String]) -> i32 {
 fn update_at(
     cwd: &Path,
     args: &[String],
-    mut update_global: impl FnMut(&crate::install::InstalledNativePackage, &[String]) -> bool,
+    mut update_global: impl FnMut(
+        &crate::install::InstalledNativePackage,
+        &[String],
+        Option<&str>,
+    ) -> bool,
 ) -> i32 {
     let mut name = None;
+    let mut cdn = None;
     let mut link_args = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--debug" | "--locked" => link_args.push(args[i].clone()),
+            "--cdn" => {
+                i += 1;
+                let value = match args.get(i).filter(|value| !value.starts_with('-')) {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("error: --cdn requires a value");
+                        return 2;
+                    }
+                };
+                if let Err(error) = crate::cdn::resolve_base(Some(value)) {
+                    eprintln!("error: {error}");
+                    return 2;
+                }
+                cdn = Some(value.clone());
+            }
             "--help" | "-h" => {
                 print_update_help();
                 return 0;
@@ -251,7 +419,7 @@ fn update_at(
             }
             value => {
                 if name.replace(value.to_string()).is_some() {
-                    eprintln!("error: update accepts at most one package name");
+                    eprintln!("error: update accepts at most one extension name");
                     return 2;
                 }
             }
@@ -266,9 +434,25 @@ fn update_at(
             return 1;
         }
     };
+    let resource_owned =
+        match crate::resource_management::resource_owned_names(&cwd.join(".rpi"), "package") {
+            Ok(names) => names,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 1;
+            }
+        };
+    if name
+        .as_ref()
+        .is_some_and(|name| resource_owned.contains(name))
+    {
+        eprintln!("error: resource-owned Package; use rpi resource update package NAME --scope project --path PATH");
+        return 1;
+    }
     let packages = registry
         .packages
         .iter()
+        .filter(|package| !resource_owned.contains(&package.name))
         .filter(|package| {
             name.as_deref()
                 .map_or(true, |wanted| wanted == package.name)
@@ -302,20 +486,20 @@ fn update_at(
             .any(|package| package.name == wanted);
         let global_found = global_packages.iter().any(|package| package.name == wanted);
         if !project_found && !global_found {
-            eprintln!("error: package `{wanted}` is not installed");
+            eprintln!("error: extension `{wanted}` is not installed");
             return 1;
         }
     }
 
     if packages.is_empty() && global_packages.is_empty() {
-        println!("no project or global packages to update");
+        println!("no project or global extensions to update");
         return 0;
     }
 
     let mut status = 0;
     for package in packages {
         let package_name = package.name.clone();
-        eprintln!("package: updating project package `{package_name}`...");
+        eprintln!("extension: updating project extension `{package_name}`...");
         let mut args = vec![
             "--path".to_string(),
             package.source,
@@ -331,8 +515,8 @@ fn update_at(
         }
     }
     for package in global_packages {
-        eprintln!("package: updating global package `{}`...", package.name);
-        if !update_global(&package, &link_args) {
+        eprintln!("extension: updating global extension `{}`...", package.name);
+        if !update_global(&package, &link_args, cdn.as_deref()) {
             status = 1;
         }
     }
@@ -343,17 +527,31 @@ fn update_at(
 fn global_update_args(
     package: &crate::install::InstalledNativePackage,
     args: &[String],
+    cdn: Option<&str>,
 ) -> Vec<String> {
     let mut install_args = vec!["install".into(), package.name.clone()];
+    // Pre-provenance prebuilt installs (records that only stored a
+    // `prebuilt:<repository>` marker) keep upgrading from their publisher —
+    // version discovery follows a repository move — instead of falling back to
+    // an explicit source rebuild.
+    let legacy_repository = package.legacy_prebuilt_repository();
+    let prebuilt = package.prebuilt.is_some() || legacy_repository.is_some();
     if let Some(source) = &package.prebuilt {
         if source.custom_repository {
             install_args.extend(["--github".into(), source.repository.clone()]);
         }
+    } else if let Some(repository) = legacy_repository {
+        install_args.extend(["--github".into(), repository.to_string()]);
     } else {
         install_args.push("--build".into());
     }
-    if package.prebuilt.is_none() && args.iter().any(|arg| arg == "--locked") {
+    if !prebuilt && args.iter().any(|arg| arg == "--locked") {
         install_args.push("--locked".into());
+    }
+    if prebuilt {
+        if let Some(cdn) = cdn {
+            install_args.extend(["--cdn".into(), cdn.into()]);
+        }
     }
     install_args
 }
@@ -361,6 +559,7 @@ fn global_update_args(
 fn update_global_package(
     package: &crate::install::InstalledNativePackage,
     args: &[String],
+    cdn: Option<&str>,
 ) -> bool {
     let name = &package.name;
     let executable = match std::env::current_exe() {
@@ -371,11 +570,11 @@ fn update_global_package(
         }
     };
     let mut command = std::process::Command::new(executable);
-    command.args(global_update_args(package, args));
+    command.args(global_update_args(package, args, cdn));
     match command.status() {
         Ok(exit) if exit.success() => true,
         Ok(exit) => {
-            eprintln!("error: updating global package `{name}` failed with {exit}");
+            eprintln!("error: updating global extension `{name}` failed with {exit}");
             false
         }
         Err(error) => {
@@ -401,6 +600,18 @@ fn unlink(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let native_root = cwd.join(".rpi");
+    let _lease = match crate::resource_management::mutation_lease(&native_root) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = crate::resource_management::legacy_unowned(&native_root, "package", name) {
+        eprintln!("error: {error}");
+        return 1;
+    }
     let mut registry = match read_registry(&cwd) {
         Ok(r) => r,
         Err(e) => {
@@ -570,8 +781,10 @@ fn is_dynamic(p: &Path) -> bool {
         Some("dll" | "so" | "dylib")
     )
 }
-fn valid_name(s: &str) -> bool {
+pub(crate) fn valid_name(s: &str) -> bool {
     !s.is_empty()
+        && s != "."
+        && s != ".."
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
@@ -586,13 +799,40 @@ fn value(args: &[String], i: usize, flag: &str) -> Option<String> {
 }
 fn read_registry(cwd: &Path) -> Result<PackageRegistry, String> {
     let path = cwd.join(".rpi").join(REGISTRY);
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
-            serde_json::from_str(&s).map_err(|e| format!("invalid project package registry: {e}"))
+    let registry = match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("invalid project package registry: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PackageRegistry::default()),
+        Err(e) => return Err(e.to_string()),
+    };
+    validate_registry(&registry)?;
+    Ok(registry)
+}
+
+fn validate_registry(registry: &PackageRegistry) -> Result<(), String> {
+    let mut names = std::collections::HashSet::new();
+    for package in &registry.packages {
+        if !valid_name(&package.name) || !names.insert(package.name.to_ascii_lowercase()) {
+            return Err(format!(
+                "invalid or duplicate project package name `{}`",
+                package.name
+            ));
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PackageRegistry::default()),
-        Err(e) => Err(e.to_string()),
+        let mut artifacts = std::collections::HashSet::new();
+        for artifact in &package.artifacts {
+            let path = Path::new(artifact);
+            if path.components().count() != 1
+                || path.file_name().and_then(|value| value.to_str()) != Some(artifact)
+                || !is_dynamic(path)
+                || !artifacts.insert(artifact.to_ascii_lowercase())
+            {
+                return Err(format!(
+                    "invalid or duplicate project package artifact `{artifact}`"
+                ));
+            }
+        }
     }
+    Ok(())
 }
 fn write_registry(cwd: &Path, r: &PackageRegistry) -> Result<(), String> {
     let dir = cwd.join(".rpi");
@@ -603,6 +843,35 @@ fn write_registry(cwd: &Path, r: &PackageRegistry) -> Result<(), String> {
     std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
 }
+pub fn selected_project_package(cwd: &Path, name: &str) -> Result<ProjectPackage, String> {
+    selected_package_at(&cwd.join(".rpi"), name)
+}
+
+pub(crate) fn selected_package_at(root: &Path, name: &str) -> Result<ProjectPackage, String> {
+    if !valid_name(name) {
+        return Err("invalid main package name".into());
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let limit = crate::resource_selection::MAX_STATE_BYTES;
+    std::fs::File::open(root.join(REGISTRY))
+        .map_err(|e| e.to_string())?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > limit {
+        return Err("project package registry exceeds 256 KiB".into());
+    }
+    let registry: PackageRegistry = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("invalid project package registry: {e}"))?;
+    validate_registry(&registry)?;
+    registry
+        .packages
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("main package `{name}` not in .rpi/packages.json"))
+}
+
 pub fn project_package_dirs(cwd: &Path, kind: &str) -> Vec<PathBuf> {
     match read_registry(cwd) {
         Ok(registry) => registry
@@ -616,14 +885,39 @@ pub fn project_package_dirs(cwd: &Path, kind: &str) -> Vec<PathBuf> {
         }
     }
 }
+
+/// Resolve the active project package extension files. Package directories
+/// are not scanned because upgrades retain retired versioned artifacts for
+/// already-running hosts.
+pub fn active_project_package_artifacts(cwd: &Path) -> Vec<PathBuf> {
+    let Ok(registry) = read_registry(cwd) else {
+        return Vec::new();
+    };
+    registry
+        .packages
+        .into_iter()
+        .flat_map(|package| {
+            package.artifacts.into_iter().map(move |artifact| {
+                cwd.join(".rpi/packages")
+                    .join(package.name.clone())
+                    .join("extensions")
+                    .join(artifact)
+            })
+        })
+        .collect()
+}
+fn print_extension_help() {
+    println!("Usage: rpi extension <command>\n\nCommands:\n  update [name] [--debug] [--locked] [--cdn <URL>]  Update project and global installed extensions\n\nSee `rpi extension update --help` for options.");
+}
+
 pub fn print_help() {
-    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked]                    Update project and global installed packages\n  unlink <name>                                          Remove a project package");
+    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked] [--cdn <URL>]      Legacy compatibility alias for `rpi extension update`\n  unlink <name>                                          Remove a project package");
 }
 fn print_link_help() {
     println!("Usage: rpi package link [name] [options]\n\nOptions:\n  --path <dir>       Extension source directory (default: current directory)\n  --package, -P <n>  Select a Cargo cdylib package\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --force, -f        Replace an existing package");
 }
 fn print_update_help() {
-    println!("Usage: rpi package update [name] [options]\n\nOptions:\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --help, -h         Show this help\n\nWithout a name, all project and global installed packages are updated.");
+    println!("Usage: rpi extension update [name] [options]\n\nOptions:\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --cdn <URL>        Download prebuilt extensions from this HTTPS CDN; manifests remain on GitHub\n  --help, -h         Show this help\n\nWithout a name, all project and global installed extensions are updated.\n`--cdn` affects prebuilt global extensions; project-linked and Cargo-built extensions are unchanged.\nLegacy compatibility alias: rpi package update [name] [options]");
 }
 
 #[cfg(test)]
@@ -690,8 +984,8 @@ mod tests {
             // hide an installed remote package.
             let mut commands = Vec::new();
             assert_eq!(
-                update_at(cwd, &[], |package, args| {
-                    commands.push(global_update_args(package, args));
+                update_at(cwd, &[], |package, args, cdn| {
+                    commands.push(global_update_args(package, args, cdn));
                     true
                 }),
                 0
@@ -707,10 +1001,14 @@ mod tests {
             for wanted in ["rpi-im-message", "cargo-extension"] {
                 commands.clear();
                 assert_eq!(
-                    update_at(cwd, &[wanted.into(), "--locked".into()], |package, args| {
-                        commands.push(global_update_args(package, args));
-                        true
-                    }),
+                    update_at(
+                        cwd,
+                        &[wanted.into(), "--locked".into()],
+                        |package, args, cdn| {
+                            commands.push(global_update_args(package, args, cdn));
+                            true
+                        }
+                    ),
                     0
                 );
                 assert_eq!(commands.len(), 1);
@@ -722,7 +1020,7 @@ mod tests {
             }
             for wanted in ["local-extension", "missing-extension"] {
                 assert_eq!(
-                    update_at(cwd, &[wanted.into()], |_, _| {
+                    update_at(cwd, &[wanted.into()], |_, _, _| {
                         panic!("local or unknown packages must not trigger a remote install")
                     }),
                     1
@@ -737,8 +1035,8 @@ mod tests {
         with_registry(&serde_json::to_vec(&[record]).unwrap(), |cwd| {
             let mut commands = Vec::new();
             assert_eq!(
-                update_at(cwd, &[], |package, args| {
-                    commands.push(global_update_args(package, args));
+                update_at(cwd, &[], |package, args, cdn| {
+                    commands.push(global_update_args(package, args, cdn));
                     true
                 }),
                 0
@@ -756,6 +1054,83 @@ mod tests {
     }
 
     #[test]
+    fn update_preserves_a_legacy_prebuilt_publisher() {
+        let mut record = prebuilt_package(true);
+        record.prebuilt = None;
+        record.source = Some("prebuilt:https://github.com/pi-rust/rpi-package".into());
+        with_registry(&serde_json::to_vec(&[record]).unwrap(), |cwd| {
+            let mut commands = Vec::new();
+            assert_eq!(
+                update_at(cwd, &[], |package, args, cdn| {
+                    commands.push(global_update_args(package, args, cdn));
+                    true
+                }),
+                0
+            );
+            assert_eq!(
+                commands,
+                [vec![
+                    "install",
+                    "rpi-im-message",
+                    "--github",
+                    "https://github.com/pi-rust/rpi-package"
+                ]]
+            );
+        });
+        // `--locked` only means something to a Cargo build, and a legacy
+        // prebuilt record is still a prebuilt install: `--cdn` applies.
+        let mut record = prebuilt_package(true);
+        record.prebuilt = None;
+        record.source = Some("prebuilt:https://github.com/pi-rust/rpi-package".into());
+        let args = vec!["--locked".to_string()];
+        assert_eq!(
+            global_update_args(&record, &args, Some("https://cdn.example.test")),
+            [
+                "install",
+                "rpi-im-message",
+                "--github",
+                "https://github.com/pi-rust/rpi-package",
+                "--cdn",
+                "https://cdn.example.test"
+            ]
+        );
+    }
+
+    #[test]
+    fn update_forwards_cdn_only_to_prebuilt_global_extensions() {
+        let records = vec![
+            prebuilt_package(false),
+            native_package("cargo-extension", None),
+        ];
+        with_registry(&serde_json::to_vec(&records).unwrap(), |cwd| {
+            let mut commands = Vec::new();
+            assert_eq!(
+                update_at(
+                    cwd,
+                    &["--cdn".into(), "https://assets.example.test/mirror".into()],
+                    |package, args, cdn| {
+                        commands.push(global_update_args(package, args, cdn));
+                        true
+                    },
+                ),
+                0
+            );
+            assert_eq!(
+                commands,
+                [
+                    vec![
+                        "install",
+                        "rpi-im-message",
+                        "--cdn",
+                        "https://assets.example.test/mirror"
+                    ],
+                    vec!["install", "cargo-extension", "--build"],
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn update_continues_after_a_failed_package_and_returns_failure() {
         let records = vec![
             prebuilt_package(false),
@@ -764,7 +1139,7 @@ mod tests {
         with_registry(&serde_json::to_vec(&records).unwrap(), |cwd| {
             let mut visited = Vec::new();
             assert_eq!(
-                update_at(cwd, &[], |package, _| {
+                update_at(cwd, &[], |package, _, _| {
                     visited.push(package.name.clone());
                     package.name != "rpi-im-message"
                 }),
@@ -790,7 +1165,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(update_at(cwd, &[], |_, _| panic!("invalid registry")), 1);
+            assert_eq!(update_at(cwd, &[], |_, _, _| panic!("invalid registry")), 1);
             assert!(!cwd.join(".rpi/packages/project-extension").exists());
         });
     }

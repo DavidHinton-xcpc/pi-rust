@@ -89,7 +89,7 @@ impl MutableAgentState {
     /// Reduce an event into state. Mirrors the switch in TS `processEvents`.
     fn reduce(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::MessageStart { message } => {
+            AgentEvent::MessageStart { message, .. } => {
                 // One clone per message (not per delta): the state holds the
                 // partial as a shared snapshot from here on.
                 self.streaming_message = message
@@ -99,7 +99,7 @@ impl MutableAgentState {
             AgentEvent::MessageUpdate { message, .. } => {
                 self.streaming_message = Some(Arc::clone(message));
             }
-            AgentEvent::MessageEnd { message } => {
+            AgentEvent::MessageEnd { message, .. } => {
                 self.streaming_message = None;
                 self.messages.push(message.clone());
             }
@@ -521,6 +521,11 @@ impl Agent {
         let state = self.inner.state.lock().expect("state lock");
         let steering = Arc::clone(&self.inner.steering_queue);
         let follow_up = Arc::clone(&self.inner.follow_up_queue);
+        // 两个队列的**只读**引用，给 `pending_message_count` 用（它必须与
+        // 上面那两个 drain hook 读同一份数据，否则“显示 N 条”与“真的还在
+        // 排队 N 条”会脱节）。
+        let steering_count = Arc::clone(&self.inner.steering_queue);
+        let follow_count = Arc::clone(&self.inner.follow_up_queue);
         AgentLoopConfig {
             model: state.model.clone(),
             convert_to_llm: Arc::clone(&self.inner.convert_to_llm),
@@ -538,8 +543,16 @@ impl Agent {
                 let q = Arc::clone(&follow_up);
                 Box::pin(async move { q.lock().expect("followup lock").try_drain() })
             })),
+            // 只读计数，**不消耗队列**（两个 drain hook 都会把消息取走，
+            // 拿它们来“问还剩几条”等于把排队的消息吃掉）。
+            pending_message_count: Some(Arc::new(move || {
+                let steer = steering_count.lock().expect("steer lock").len();
+                let follow = follow_count.lock().expect("followup lock").len();
+                steer + follow
+            })),
             before_tool_call: None,
             after_tool_call: None,
+            provider_hooks: None,
             tool_execution: self.inner.tool_execution,
             thinking_level: state.thinking_level,
             api_key: None,

@@ -12,9 +12,10 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use super::component::{Component, RenderedDocument};
 use super::mermaid::Mermaid;
 use crate::ansi::{bold, italic, underline};
+use crate::latex::RenderLatexOptions;
 use crate::theme::theme;
 use crate::utils::{
-    apply_background_to_line, truncate_to_width, visible_width, wrap_text_with_ansi,
+    apply_background_to_line, visible_width, widest_char_width, wrap_text_with_ansi,
 };
 
 /// Markdown rendering options.
@@ -305,6 +306,41 @@ impl Markdown {
                 continue;
             }
 
+            // ---- Display math ----
+            // `$$ … $$`, `\[ … \]` and `\begin{…}` environments are
+            // lowered to Unicode text (terminals cannot typeset TeX). Code
+            // fences above already claimed their content, so `$` inside a
+            // code block stays literal.
+            if let Some((opener, first_line)) =
+                display_math_open(line, raw_lines.get(i + 1..).unwrap_or(&[]))
+            {
+                list_continuation_indent = None;
+                let mut source = opener.prefix();
+                i += 1;
+                match opener.strip_close(&first_line) {
+                    Some(inner) => source.push_str(&inner),
+                    None => {
+                        source.push_str(&first_line);
+                        // Unterminated blocks (a streaming response, or a
+                        // missing `$$`) render what has arrived so far instead
+                        // of leaking raw LaTeX for a frame.
+                        while i < raw_lines.len() {
+                            let candidate = raw_lines[i];
+                            i += 1;
+                            if let Some(inner) = opener.strip_close(candidate) {
+                                source.push('\n');
+                                source.push_str(&inner);
+                                break;
+                            }
+                            source.push('\n');
+                            source.push_str(candidate);
+                        }
+                    }
+                }
+                self.push_math_block(&source, &pad, cwidth, &mut lines);
+                continue;
+            }
+
             // ---- Tables ----
             if is_table_separator(raw_lines.get(i + 1)) && is_table_row(line) {
                 list_continuation_indent = None;
@@ -428,11 +464,29 @@ impl Markdown {
         lines
     }
 
+    /// Lay out one display-math block as centered, math-colored lines.
+    fn push_math_block(&self, source: &str, pad: &str, cwidth: usize, out: &mut Vec<String>) {
+        let colors = theme().colors;
+        let rendered = crate::latex::render_latex_block(source, &RenderLatexOptions::default());
+        let rows: Vec<&String> = rendered.iter().filter(|l| !l.trim().is_empty()).collect();
+        // Center the block as a unit, not line by line: `aligned` rows and
+        // matrix brackets only line up if every row starts at the same column.
+        let widest = rows.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+        let left = cwidth.saturating_sub(widest) / 2;
+        let indent = " ".repeat(left);
+        for line in rows {
+            out.push(format!("{pad}{indent}{}", colors.md_code.fg(line)));
+        }
+    }
+
     /// Render inline CommonMark/GFM with terminal-specific ANSI styling.
     fn render_inline(&self, text: &str) -> String {
         let colors = theme().colors;
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
+        // Math is opt-in in pulldown-cmark; without it `$…$` would reach us as
+        // plain text and stay raw LaTeX in the transcript.
+        options.insert(Options::ENABLE_MATH);
 
         // pulldown-cmark parses complete documents and has no inline-only
         // entry point. A plain prefix keeps block-looking text in inline
@@ -481,16 +535,31 @@ impl Markdown {
                         .text
                         .push_str(&colors.md_code_bg.bg(&chip));
                 }
-                Event::InlineMath(value) => frames
-                    .last_mut()
-                    .expect("root inline frame")
-                    .text
-                    .push_str(&format!("${value}$")),
-                Event::DisplayMath(value) => frames
-                    .last_mut()
-                    .expect("root inline frame")
-                    .text
-                    .push_str(&format!("$${value}$$")),
+                Event::InlineMath(value) => {
+                    let rendered =
+                        crate::latex::render_latex(value.as_ref(), &RenderLatexOptions::default());
+                    let styled = colors.md_code.fg(&rendered);
+                    frames
+                        .last_mut()
+                        .expect("root inline frame")
+                        .text
+                        .push_str(&styled);
+                }
+                Event::DisplayMath(value) => {
+                    // A display-math run inside a paragraph/table cell: keep it
+                    // on one line rather than breaking the enclosing layout.
+                    let rendered = crate::latex::render_latex_block(
+                        value.as_ref(),
+                        &RenderLatexOptions::default(),
+                    )
+                    .join("   ");
+                    let styled = colors.md_code.fg(&rendered);
+                    frames
+                        .last_mut()
+                        .expect("root inline frame")
+                        .text
+                        .push_str(&styled);
+                }
                 Event::Html(value) | Event::InlineHtml(value) => frames
                     .last_mut()
                     .expect("root inline frame")
@@ -678,6 +747,69 @@ fn fence_info(line: &str) -> Option<(char, String)> {
     }
 }
 
+/// Opening delimiter of a display-math block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MathOpener {
+    /// `$$ … $$`
+    Dollars,
+    /// `\[ … \]`
+    Bracket,
+    /// `\begin{env} … \end{env}`
+    Environment(String),
+}
+
+impl MathOpener {
+    /// Seed text for the collected source. Delimiter forms hand only the body
+    /// to the renderer; an environment keeps its `\begin{…}` so the block
+    /// renderer can recognize (and lay out) the environment.
+    fn prefix(&self) -> String {
+        match self {
+            MathOpener::Dollars | MathOpener::Bracket => String::new(),
+            MathOpener::Environment(env) => format!("\\begin{{{env}}}"),
+        }
+    }
+
+    /// Remove the closing delimiter from `line`, if it is the last line.
+    fn strip_close(&self, line: &str) -> Option<String> {
+        match self {
+            MathOpener::Dollars => line.trim_end().strip_suffix("$$").map(ToString::to_string),
+            MathOpener::Bracket => line.split_once("\\]").map(|(head, _)| head.to_string()),
+            MathOpener::Environment(env) => line
+                .find(&format!("\\end{{{env}}}"))
+                .map(|at| line[..at].to_string()),
+        }
+    }
+}
+
+/// Detect the opening line of a display-math block.
+///
+/// Only block-level openers are recognized here (`$$`, `\[`, and `\begin{…}`
+/// math environments). Inline `$…$` is left to the inline parser so a currency
+/// amount inside a sentence is not swallowed as math.
+fn display_math_open(line: &str, rest: &[&str]) -> Option<(MathOpener, String)> {
+    let trimmed = line.trim_start();
+    if let Some(remainder) = trimmed.strip_prefix("$$") {
+        return Some((MathOpener::Dollars, remainder.to_string()));
+    }
+    if let Some(remainder) = trimmed.strip_prefix("\\[") {
+        // `\[` is also CommonMark's escape for a literal `[`. Only claim the
+        // line as display math when a closing `\]` exists, so an accidental
+        // (or streaming-truncated) escape keeps its bracket.
+        if remainder.contains("\\]") || rest.iter().any(|line| line.contains("\\]")) {
+            return Some((MathOpener::Bracket, remainder.to_string()));
+        }
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("\\begin{") {
+        let (env, tail) = rest.split_once('}')?;
+        let env = env.trim();
+        if crate::latex::is_math_environment(env) {
+            return Some((MathOpener::Environment(env.to_string()), tail.to_string()));
+        }
+    }
+    None
+}
+
 /// Render one physical code line on a subtle surface, without an outer frame.
 ///
 /// A long line wraps instead of being clipped with an ellipsis. A code block is
@@ -764,6 +896,12 @@ fn is_table_separator(maybe: Option<&&str>) -> bool {
 }
 
 /// Parse a table into rendered lines with box-drawing borders.
+///
+/// Column widths follow the upstream TS renderer (`packages/tui/src/components/markdown.ts`,
+/// `renderTable`): cells that do not fit are **wrapped** to extra rows, never
+/// clipped behind an ellipsis — a transcript copied through the terminal's
+/// native selection would otherwise lose the wrapped-away tail (same failure
+/// mode already fixed for code blocks by wrapping instead of clipping).
 fn render_table<F>(rows: &[&str], pad: &str, cwidth: usize, out: &mut Vec<String>, render_inline: F)
 where
     F: Fn(&str) -> String,
@@ -786,8 +924,22 @@ where
         return;
     }
 
-    // Compute column visible widths from header + body.
-    let mut col_w: Vec<usize> = (0..ncols)
+    // Border overhead: "| " + (n-1) * " | " + " |" in upstream terms; here the
+    // same count expressed for the box-drawing grid: "│ " left plus " │ "
+    // between columns plus " │" right.
+    let overhead = 3 * ncols + 1;
+    let available = cwidth.saturating_sub(overhead);
+    if available < ncols {
+        // Too narrow for a stable grid: fall back to the raw table text,
+        // wrapped like any other paragraph, so nothing is lost.
+        for line in wrap_text_with_ansi(&rows.join("\n"), cwidth.max(1)) {
+            out.push(format!("{pad}{line}"));
+        }
+        return;
+    }
+
+    // Natural width per column (widest cell).
+    let natural: Vec<usize> = (0..ncols)
         .map(|c| {
             std::iter::once(&header)
                 .chain(body.iter())
@@ -797,57 +949,161 @@ where
         })
         .collect();
 
-    // Account for " | " separators + leading/trailing border usage.
-    // We cap the total so the table fits within `cwidth`.
-    let overhead = 3 * (ncols - 1) + 4; // approximate: "| " + " | "*n + " |"
-    let budget = cwidth.saturating_sub(overhead);
-    let total: usize = col_w.iter().sum();
-    if total > budget {
-        // Shrink proportionally (floor of 1 per column).
-        let scale = budget as f64 / total as f64;
-        for w in col_w.iter_mut() {
-            *w = (*w as f64 * scale).round() as usize;
-            if *w < 1 {
-                *w = 1;
+    // Floor per column: the widest single glyph the column has to hold. Cells
+    // are wrapped per character (the repo-wide convention in
+    // `wrap_text_with_ansi`), so any width at or above this renders correctly;
+    // below it a double-width glyph (CJK, emoji) spills into the next cell and
+    // breaks the grid.
+    let min_col: Vec<usize> = (0..ncols)
+        .map(|c| {
+            std::iter::once(&header)
+                .chain(body.iter())
+                .map(|r| r.get(c).map(|s| widest_char_width(s)).unwrap_or(1))
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        })
+        .collect();
+
+    // When even the per-glyph floors do not fit, no stable grid exists: fall
+    // back to the raw table text, wrapped like any other paragraph, so nothing
+    // is lost and no row exceeds the render width.
+    if min_col.iter().sum::<usize>() > available {
+        for line in wrap_text_with_ansi(&rows.join("\n"), cwidth.max(1)) {
+            out.push(format!("{pad}{line}"));
+        }
+        return;
+    }
+
+    // Final column widths: everything fits naturally -> use natural widths;
+    // otherwise grow from the min widths in proportion to how far each column
+    // is from its natural width, then hand out rounding leftovers.
+    let col_w: Vec<usize> = if natural.iter().sum::<usize>() <= available {
+        natural
+            .iter()
+            .zip(&min_col)
+            .map(|(n, m)| (*n).max(*m))
+            .collect()
+    } else {
+        let total_grow_potential: usize = natural
+            .iter()
+            .zip(&min_col)
+            .map(|(n, m)| n.saturating_sub(*m))
+            .sum();
+        let extra = available.saturating_sub(min_col.iter().sum::<usize>());
+        let mut widths: Vec<usize> = natural
+            .iter()
+            .zip(&min_col)
+            .map(|(n, m)| {
+                let delta = n.saturating_sub(*m);
+                let grow = if total_grow_potential > 0 {
+                    delta * extra / total_grow_potential
+                } else {
+                    0
+                };
+                m + grow
+            })
+            .collect();
+        let mut remaining = available.saturating_sub(widths.iter().sum::<usize>());
+        while remaining > 0 {
+            let mut grew = false;
+            for i in 0..ncols {
+                if remaining == 0 {
+                    break;
+                }
+                if widths[i] < natural[i] {
+                    widths[i] += 1;
+                    remaining -= 1;
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
             }
         }
-    }
+        widths
+    };
 
-    let join = |cells: &[String]| {
-        cells
+    // Wrap every cell to its column width, then render row by row with the
+    // box-drawing grid; rows grow taller instead of losing text. Each body
+    // row's leading border doubles as the separator after the previous row.
+    let wrap_cell = |cell: &str, w: usize| -> Vec<String> {
+        wrap_text_with_ansi(cell, w.max(1))
+            .into_iter()
+            .map(|line| {
+                let vw = visible_width(&line);
+                if vw >= w {
+                    line
+                } else {
+                    format!("{line}{}", " ".repeat(w - vw))
+                }
+            })
+            .collect()
+    };
+    let render_row = |cells: &[String]| -> Vec<String> {
+        let cell_lines: Vec<Vec<String>> = cells
             .iter()
             .enumerate()
-            .map(|(i, c)| {
-                let w = col_w.get(i).copied().unwrap_or(0);
-                let cell = truncate_to_width(c, w, "…");
-                pad_cell(&cell, w)
-            })
-            .collect::<Vec<_>>()
-            .join("│")
-    };
-
-    let border = |left: &str, mid: &str, joiner: &str, right: &str| -> String {
-        let segs: Vec<String> = col_w.iter().map(|w| mid.repeat(*w)).collect();
-        format!("{left}{}{right}", segs.join(joiner))
-    };
-
-    out.push(format!("{pad}{}", border("┌", "─", "┬", "┐")));
-    out.push(format!("{pad}│{}│", join(&header)));
-    out.push(format!("{pad}{}", border("├", "─", "┼", "┤")));
-    for (row_index, row) in body.iter().enumerate() {
-        let cells: Vec<String> = (0..ncols)
-            .map(|c| row.get(c).cloned().unwrap_or_default())
+            .map(|(i, c)| wrap_cell(c, col_w.get(i).copied().unwrap_or(1)))
             .collect();
-        out.push(format!("{pad}│{}│", join(&cells)));
-        // Keep the table grid visible between body rows as well as between the
-        // header and the first row. This is especially useful for narrow
-        // terminals where adjacent wrapped-looking rows are otherwise hard
-        // to distinguish.
-        if row_index + 1 < body.len() {
-            out.push(format!("{pad}{}", border("├", "─", "┼", "┤")));
+        let height = cell_lines.iter().map(Vec::len).max().unwrap_or(1);
+        let mut rendered = Vec::with_capacity(height + 1);
+        rendered.push(format!(
+            "├{}┤",
+            col_w
+                .iter()
+                .map(|w| "─".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("┼")
+        ));
+        for line_idx in 0..height {
+            let parts: Vec<String> = cell_lines
+                .iter()
+                .enumerate()
+                .map(|(i, lines)| {
+                    // Continuation rows leave exhausted cells empty; pad them
+                    // so every grid row spans the full table width.
+                    let w = col_w.get(i).copied().unwrap_or(0);
+                    let text = lines.get(line_idx).cloned().unwrap_or_default();
+                    let vw = visible_width(&text);
+                    if vw >= w {
+                        text
+                    } else {
+                        format!("{text}{}", " ".repeat(w - vw))
+                    }
+                })
+                .collect();
+            rendered.push(format!("│{}│", parts.join("│")));
+        }
+        rendered
+    };
+
+    out.push(format!(
+        "{pad}┌{}┐",
+        col_w
+            .iter()
+            .map(|w| "─".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("┬")
+    ));
+    for line in render_row(&header).into_iter().skip(1) {
+        out.push(format!("{pad}{line}"));
+    }
+    for row in &body {
+        let mut cells = row.clone();
+        cells.resize(ncols, String::new());
+        for line in render_row(&cells) {
+            out.push(format!("{pad}{line}"));
         }
     }
-    out.push(format!("{pad}{}", border("└", "─", "┴", "┘")));
+    out.push(format!(
+        "{pad}└{}┘",
+        col_w
+            .iter()
+            .map(|w| "─".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("┴")
+    ));
 }
 
 /// Split a table row without treating escaped pipes or pipes inside code spans
@@ -875,16 +1131,6 @@ fn split_table_cells(row: &str) -> Vec<String> {
         }
     }
     cells
-}
-
-/// Left-pad/content a cell string to `w` columns (ANSI-aware).
-fn pad_cell(cell: &str, w: usize) -> String {
-    let vw = visible_width(cell);
-    if vw >= w {
-        cell.to_string()
-    } else {
-        format!("{cell}{}", " ".repeat(w - vw))
-    }
 }
 
 /// Wrap `rendered` (an already-styled line possibly with leading pad) into the
@@ -1087,6 +1333,125 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_math_renders_unicode_without_delimiters() {
+        let md = Markdown::new("Euler: $e^{i\\pi}+1=0$ and $\\alpha \\leq \\beta$", 0, 0);
+        let rendered = md.render(80).join("\n");
+        let plain = crate::ansi::strip_ansi(&rendered);
+        assert!(plain.contains('π'), "greek letter missing: {plain}");
+        assert!(plain.contains("e"), "base missing: {plain}");
+        assert!(plain.contains('≤'), "relation missing: {plain}");
+        assert!(!plain.contains('$'), "raw math delimiters leaked: {plain}");
+        assert!(!plain.contains('\\'), "raw command leaked: {plain}");
+    }
+
+    #[test]
+    fn test_currency_is_not_swallowed_as_math() {
+        let md = Markdown::new("It costs $5 and $10 for the pair.", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert_eq!(plain, "It costs $5 and $10 for the pair.");
+    }
+
+    #[test]
+    fn test_display_math_block_renders_body_only() {
+        let md = Markdown::new("$$\n\\frac{a+b}{c} = \\sqrt{2}\n$$", 0, 0);
+        let lines = md.render(80);
+        let plain: Vec<String> = lines
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line).trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(plain, vec!["(a+b)/c = √2"]);
+        assert!(lines[0].contains('\x1b'), "display math should be styled");
+    }
+
+    #[test]
+    fn test_display_math_matrix_keeps_rows_and_columns() {
+        let md = Markdown::new(
+            "$$\n\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}\n$$",
+            0,
+            0,
+        );
+        let plain: Vec<String> = md
+            .render(80)
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line).trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(plain.len(), 2, "matrix rows collapsed: {plain:?}");
+        assert!(
+            plain[0].starts_with('⎛') && plain[0].contains('a'),
+            "{plain:?}"
+        );
+        assert!(
+            plain[1].starts_with('⎝') && plain[1].contains('d'),
+            "{plain:?}"
+        );
+        assert_eq!(visible_width(&plain[0]), visible_width(&plain[1]));
+    }
+
+    #[test]
+    fn test_display_math_bracket_and_aligned_forms() {
+        let md = Markdown::new("\\[ a = 1 \\\\ b = 2 \\]", 0, 0);
+        let plain: Vec<String> = md
+            .render(80)
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line).trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(plain, vec!["a = 1", "b = 2"]);
+
+        let md = Markdown::new(
+            "$$\n\\begin{aligned}\nx &= 1 \\\\\ny &= 2\n\\end{aligned}\n$$",
+            0,
+            0,
+        );
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains('='), "aligned body missing: {plain}");
+        assert!(!plain.contains("begin"), "environment leaked: {plain}");
+    }
+
+    #[test]
+    fn test_unclosed_bracket_escape_is_not_math() {
+        // `\[` without a closing `\]` is a CommonMark escape, not display math.
+        let md = Markdown::new("Use \\[1\\] style labels here", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(
+            plain.contains("[1]"),
+            "escape was swallowed as math: {plain}"
+        );
+
+        let md = Markdown::new("\\[ x + 1", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("[ x + 1"), "unclosed bracket lost: {plain}");
+    }
+
+    #[test]
+    fn test_math_inside_code_is_literal() {
+        let md = Markdown::new("```\n$x^2$ and $$y$$\n```", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("$x^2$"), "fenced math changed: {plain}");
+        assert!(
+            plain.contains("$$y$$"),
+            "fenced display math changed: {plain}"
+        );
+
+        let md = Markdown::new("Use `$HOME` and `$x^2$` literally.", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("$HOME"), "code span changed: {plain}");
+        assert!(plain.contains("$x^2$"), "code span math changed: {plain}");
+    }
+
+    #[test]
+    fn test_partial_streamed_math_block_renders_progressively() {
+        // Streaming: the closing `$$` has not arrived yet. The body renders
+        // instead of leaking the raw delimiter.
+        let md = Markdown::new("$$\n\\alpha + \\beta", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("α + β"), "partial math missing: {plain}");
+        assert!(!plain.contains("$$"), "raw delimiter leaked: {plain}");
+    }
+
+    #[test]
     fn test_mermaid_fence_uses_diagram_renderer() {
         let md = Markdown::new("```mermaid\nflowchart LR\nA[Start] --> B[End]\n```", 0, 0);
         let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
@@ -1270,6 +1635,177 @@ mod tests {
         );
     }
 
+    /// The sequences below each occupy two terminal columns as a whole but do
+    /// not sum to two from their scalars (ZWJ: 2+0+2 = 4, skin tone: 2+2 = 4,
+    /// VS16: 1+0 = 1). A table cell must keep one displayed sequence on one
+    /// body row, and the grid must stay aligned, at ordinary widths too.
+    const WIDE_SEQUENCES: [&str; 3] = ["👩‍💻", "👍🏽", "❤️"];
+
+    fn assert_sequence_never_split(lines: &[String], seq: &str, context: &str) {
+        let rows: Vec<String> = lines.iter().map(|l| crate::ansi::strip_ansi(l)).collect();
+        // Find the body row holding the sequence's first scalar, then require
+        // the whole cluster on that same row.
+        let first = seq.chars().next().unwrap();
+        for (idx, row) in rows.iter().enumerate() {
+            if row.contains(first) {
+                assert!(
+                    row.contains(seq),
+                    "{seq:?} split across rows at row {idx} ({context}): {rows:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_markdown_table_keeps_zwj_and_modifier_sequences_on_one_row() {
+        // Ordinary 80-column terminal with a long neighbouring cell: the wide
+        // cell squeezes the sequence column, which is where the split showed.
+        for seq in WIDE_SEQUENCES {
+            let source = format!(
+                "| e | content |\n|---|---|\n| {seq} | {} |",
+                "x".repeat(800)
+            );
+            let lines = Markdown::new(source, 0, 0).render(80);
+            assert_sequence_never_split(&lines, seq, "80 columns, long sibling cell");
+        }
+    }
+
+    #[test]
+    fn test_markdown_table_keeps_sequences_at_narrow_widths() {
+        // A one-column table is the smallest grid that can still hold a
+        // two-cell sequence; the cell floor must be the cluster width, not the
+        // widest scalar, or the sequence spills past the border.
+        for seq in WIDE_SEQUENCES {
+            for width in [6usize, 10, 20] {
+                let source = format!("| e |\n|---|\n| {seq} |");
+                let lines = Markdown::new(source, 0, 0).render(width);
+                assert_sequence_never_split(&lines, seq, &format!("{width} columns"));
+                // Every rendered row must be the same display width, or the
+                // grid is broken (the sequence counted as 4 instead of 2).
+                let widths: Vec<usize> = lines
+                    .iter()
+                    .map(|l| crate::utils::visible_width(&crate::ansi::strip_ansi(l)))
+                    .collect();
+                assert!(
+                    widths.windows(2).all(|w| w[0] == w[1]),
+                    "{seq:?} at {width} columns produced ragged rows: {widths:?} in {lines:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_markdown_table_keeps_sequences_among_ascii_and_cjk() {
+        // The axis that must not regress while fixing the sequence model:
+        // ASCII and CJK tails still survive, and a mixed row keeps its grid.
+        let source = "| seq | 内容 |\n|---|---|\n| 👩‍💻 | 中文内容很长的一串文字用于测试换行 |";
+        let lines = Markdown::new(source, 0, 0).render(30);
+        let plain = crate::ansi::strip_ansi(&lines.join("\n"));
+        assert!(plain.contains("👩‍💻"), "sequence lost: {plain}");
+        assert!(!plain.contains('…'), "must wrap, not clip: {plain}");
+        assert!(
+            plain.contains("用于测试换行"),
+            "CJK tail lost while wrapping: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_table_cells_wrap_instead_of_clipping() {
+        // Real-world shape: the assistant's PR-split table from session
+        // 2026-10-30T16-22-17 (E:\rpi). Long CJK cells in a narrow transcript
+        // used to squash the narrow columns to "PR…" / "*(tui)*…" and drop
+        // the wide cell's tail behind an ellipsis, so a native-selection copy
+        // lost the content — the same failure mode already fixed for code
+        // blocks by wrapping instead of clipping.
+        let cell = "`ThemeJson` serde 解析层：camelCase→snake_case 映射、`#rrggbb`→`Color`、部分覆盖时回落 default palette;用 pi dark.json/light.json 做 fixture 单测。纯库新增，零行为变化，不碰任何调用点";
+        let md = Markdown::new(
+            &format!("| PR | 范围 | 内容 |\n|---|---|---|\n| PR 1 | `*(tui)*` | {cell} |"),
+            0,
+            0,
+        );
+        let lines = md.render(80);
+        let plain = crate::ansi::strip_ansi(&lines.join("\n"));
+        // Cells wrap per character, so a multi-character phrase can be split
+        // across rows ("*(tui)*" becomes "*(t" / "ui)*"). Per row, strip
+        // whitespace and the grid glyphs, then assert on what truncation
+        // destroyed: the ellipsis is gone and the cell tail — the part clipping
+        // swallowed — survives somewhere in the render.
+        let row_text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                crate::ansi::strip_ansi(line)
+                    .chars()
+                    .filter(|c| !c.is_whitespace() && !"│┌┐└├┤┬┴┼─".contains(*c))
+                    .collect()
+            })
+            .collect();
+        assert!(
+            row_text.iter().any(|r| r.contains("PR")),
+            "row identifier missing: {plain}"
+        );
+        assert!(
+            row_text.iter().any(|r| r.contains("*(t")),
+            "scope cell missing: {plain}"
+        );
+        assert!(
+            !plain.contains('…'),
+            "table must wrap cells, not clip with an ellipsis: {plain}"
+        );
+        assert!(
+            row_text.iter().any(|r| r.contains("用点")),
+            "cell tail lost to truncation: {plain}"
+        );
+        // Exhausted columns keep their width on continuation rows: the grid
+        // stays rectangular — every row the same visible width, within the
+        // render width.
+        let row_widths: Vec<usize> = lines.iter().map(|line| visible_width(line)).collect();
+        assert!(
+            row_widths.iter().all(|w| *w == row_widths[0] && *w <= 80),
+            "table grid not rectangular: {row_widths:?}"
+        );
+        for line in &lines {
+            assert!(
+                visible_width(line) <= 80,
+                "table row exceeds width: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_pr196_table_cell_keeps_a_sequence_intact_at_terminal_widths() {
+        // ZWJ / skin-tone sequences are one display unit: the wrapper must
+        // never split them into continuation rows (the woman on one row, the
+        // laptop on the next). Reproduces at an ordinary 80-column width and
+        // in a one-column cell at width 6 — not only an extremely narrow
+        // terminal.
+        for emoji in ["👩‍💻", "👍🏽"] {
+            let source = format!(
+                "| e | content |\n|---|---|\n| {emoji} | {} |",
+                "x".repeat(800)
+            );
+            let lines = Markdown::new(source, 0, 0).render(80);
+            let plain = crate::ansi::strip_ansi(&lines.join("\n"));
+            assert!(
+                plain.contains(emoji),
+                "{emoji:?} split across body rows: {plain}"
+            );
+
+            let narrow = Markdown::new(format!("| {emoji} |\n|---|"), 0, 0).render(6);
+            let plain = crate::ansi::strip_ansi(&narrow.join("\n"));
+            assert!(plain.contains(emoji), "{emoji:?} split at width 6: {plain}");
+        }
+    }
+
+    #[test]
+    fn review_pr196_inline_reset_then_combining_mark_survives_render() {
+        // The inline renderer's bold reset SGR can land in the same grapheme
+        // as a following combining mark; the shared wrapper dropped the
+        // visible remainder, so the accent vanished from renderer output.
+        let rows = Markdown::new("**a**\u{301}b", 0, 0).render(80);
+        let plain = crate::ansi::strip_ansi(&rows.join("\n"));
+        assert!(plain.contains('\u{301}'), "accent lost: {plain}");
+    }
+
     #[test]
     fn test_base_style_reopened_after_inline_code_reset() {
         // Regression: inline code (and other colored spans) terminate with an
@@ -1304,6 +1840,66 @@ mod tests {
                 line.contains("\x1b[38;5;244m"),
                 "base style missing on line: {line:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_markdown_table_grid_survives_narrow_widths() {
+        // The wrap-based grid must never overflow the render width and must stay
+        // rectangular at every width. The interesting corner is a width so
+        // narrow that a double-width glyph (CJK, emoji) no longer fits in one
+        // cell: before the per-column floor was derived from the widest glyph,
+        // a one-cell column emitted a two-cell line and the grid drifted by one
+        // cell per such column (6-wide vs 7-wide rows).
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "long token",
+                "| a | b |\n|---|---|\n| aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | b |",
+            ),
+            (
+                "cjk",
+                "| 范围 | 内容 |\n|---|---|\n| *(tui)* | 主题解析层：camelCase→snake_case 映射与回落 |",
+            ),
+            ("empty cells", "| a | b | c |\n|---|---|---|\n|  | x |  |"),
+            (
+                "single col",
+                "| only |\n|---|\n| a very long single column cell that must wrap somewhere |",
+            ),
+            (
+                "many cols",
+                "| a | b | c | d | e | f | g | h |\n|---|---|---|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |",
+            ),
+            (
+                "wide glyphs",
+                "| 表 | 值 |\n|---|---|\n| 宽字符测试 | ＡＢＣＤＥＦＧＨ |",
+            ),
+            ("emoji", "| e | v |\n|---|---|\n| 🎉🎉🎉 | ok |"),
+        ];
+        for (name, src) in cases {
+            for width in [6usize, 8, 10, 12, 15, 20, 25, 30, 40, 60, 80, 120] {
+                let lines = Markdown::new(src, 0, 0).render(width);
+                for line in &lines {
+                    assert!(
+                        visible_width(line) <= width,
+                        "{name} @ {width}: row exceeds render width\n{}",
+                        lines.join("\n")
+                    );
+                }
+                let grid: Vec<usize> = lines
+                    .iter()
+                    .filter(|l| {
+                        l.contains('│') || l.contains('┌') || l.contains('└') || l.contains('├')
+                    })
+                    .map(|l| visible_width(l))
+                    .collect();
+                if grid.len() > 1 {
+                    assert!(
+                        grid.iter().all(|w| *w == grid[0]),
+                        "{name} @ {width}: grid not rectangular {grid:?}\n{}",
+                        lines.join("\n")
+                    );
+                }
+            }
         }
     }
 }

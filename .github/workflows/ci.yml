@@ -5,14 +5,38 @@ on:
     branches: [main, preview]
   pull_request:
     branches: [main, preview]
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    # 00:00 Asia/Shanghai (16:00 UTC on the previous day).
+    - cron: '0 16 * * *'
   workflow_dispatch:
+    inputs:
+      prepare_release:
+        description: 'Prepare or update the stable Release PR after CI passes'
+        required: false
+        type: boolean
+        default: true
+      publish_preview:
+        description: 'Publish preview binaries from the preview branch'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  # Only upstream Release PR drafts defer validation until docs are synchronized.
+  # Drafts cannot merge; ready_for_review reruns every check on the final head.
   msrv:
     name: Rust 1.88 (${{ matrix.os }})
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -41,6 +65,13 @@ jobs:
 
   windows-installer:
     name: Windows installer (${{ matrix.shell }})
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
     runs-on: windows-latest
     timeout-minutes: 5
     strategy:
@@ -62,7 +93,21 @@ jobs:
         run: ./scripts/tests/install.Tests.ps1
 
   check:
-    name: Cargo check (${{ matrix.os }})
+    # Skipped draft runs must not satisfy the normal required check contexts.
+    name: >-
+      Cargo check (${{ matrix.os }})${{ github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true && ' (preparing release)' || '' }}
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -88,12 +133,33 @@ jobs:
         run: cargo check -p rpi-extensions --all-features --tests --locked
 
   test:
-    name: Cargo test
+    name: >-
+      Cargo test${{ github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true && ' (preparing release)' || '' }}
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       RUSTFLAGS: "-D warnings"
       RUSTDOCFLAGS: "-D warnings"
+      # Large workspace test binaries can exhaust the hosted runner disk.
+      # Keep assertions and warning checks; only omit symbols/incremental state.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      # Cargo caches target/, including old diagnostics. Keep smoke output outside
+      # that cache and unique per attempt without weakening overwrite protection.
+      SESSION_SMOKE_DIAGNOSTICS_NAME: session-smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -108,6 +174,8 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: test-no-debuginfo
 
       - name: Verify embedded docs are in sync
         run: |
@@ -120,6 +188,29 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
+      - name: Build CLI for offline session smoke test
+        run: cargo build -p rpi-cli --bin rpi --locked --target-dir target
+
+      - name: Test offline CLI session recovery
+        run: |
+          python3 -B scripts/test_session_smoke.py
+          python3 -B scripts/session-smoke.py --rpi target/debug/rpi --diagnostics-dir "$RUNNER_TEMP/$SESSION_SMOKE_DIAGNOSTICS_NAME"
+
+      - name: Upload failed session smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-smoke-diagnostics
+          # Only synthetic protocol/summary diagnostics; never homes, auth or histories.
+          path: |
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/results.json
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/failure.log
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/*/command.json
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/*/stdout.jsonl
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/*/stderr.log
+          if-no-files-found: ignore
+          include-hidden-files: false
+
       - name: Test the optional provider SDK bridge
         run: cargo test -p rpi-plugin-sdk --features provider --locked
 
@@ -127,6 +218,7 @@ jobs:
         run: |
           cargo build -p plugin-stub --locked
           cargo test -p rpi-extensions --features provider-performance --test plugin_stub_smoke --locked
+          cargo test -p rpi-cli --test tool_prompt_metadata --locked
 
       - name: Check the standalone ABI core
         run: cargo check -p rpi-plugin-sdk --no-default-features --locked
@@ -134,16 +226,39 @@ jobs:
       - name: Test provider bridge reconstruction and capacity
         run: cargo test -p rpi-extensions --features provider-performance --locked 'provider::'
 
+      - name: Test offline website verifier and community entries
+        run: python3 -B scripts/test_website.py VerifierTests CommunityTests
+
       - name: Test prebuilt release manifests
         run: python3 scripts/test_prebuilt_release.py
 
       - name: Test release automation
         run: |
           python3 scripts/test_release_automation.py
+          python3 scripts/test_release_pr_readiness.py
           python3 scripts/test_release_channels.py
+          python3 -B scripts/test_channel_drift.py
+          python3 -B scripts/test_workflow_infrastructure.py
+          python3 -B scripts/test_ci_transient_recovery.py
+
+      - name: Test the linked-issue check
+        run: python3 -B scripts/test_pr_issue_link.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Test npm installer and release automation offline
+        run: npm test
 
   windows-plugin-lifecycle:
     name: Windows plugin ABI and DLL lifecycle
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -157,20 +272,577 @@ jobs:
       - name: Check DLL shutdown and tool ownership
         run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
 
+  platform-startup:
+    name: Platform startup (${{ matrix.target }})
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Match the release baseline; don't let ubuntu-latest move it silently.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      RUSTFLAGS: "-D warnings"
+      # musl-tools installs `musl-gcc`; make both Cargo and cc-rs use it for
+      # the target instead of looking for x86_64-linux-musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse a preinstalled compiler instead of needlessly hitting mirrors.
+          if ! command -v musl-gcc >/dev/null 2>&1; then
+            install_musl_tools() {
+              # apt-get update normally succeeds with stale indexes on DNS
+              # errors. Treat partial fetch failures as failures and bound each
+              # command, not just the backoff between attempts.
+              timeout 120s sudo apt-get update \
+                -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || return $?
+              timeout 120s sudo apt-get install --yes --no-install-recommends \
+                -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=15 musl-tools
+            }
+            for attempt in 1 2 3; do
+              if install_musl_tools; then
+                break
+              fi
+              if (( attempt == 3 )); then
+                echo "::error::Could not install musl-tools after ${attempt} attempts."
+                exit 1
+              fi
+              echo "::warning::musl-tools install failed; retrying (attempt ${attempt}/3)."
+              sleep $(( attempt * 10 ))
+            done
+          fi
+          command -v musl-gcc
+          # Presence alone isn't enough: ensure the compiler links a runnable
+          # static binary before spending minutes on the Rust build.
+          probe="$RUNNER_TEMP/musl-linker-smoke"
+          printf 'int main(void) { return 0; }\n' | musl-gcc -static -x c - -o "$probe"
+          "$probe"
+          rm -f "$probe"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platform-startup-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native CLI
+        run: cargo build -p rpi-cli --bin rpi --release --locked --target ${{ matrix.target }}
+      - name: Start native CLI through linked external prefixes
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            binary="target/${{ matrix.target }}/release/rpi.exe"
+          else
+            binary="target/${{ matrix.target }}/release/rpi"
+          fi
+          python -B scripts/test_resource_lease_startup_smoke.py
+          python -B scripts/resource-lease-startup-smoke.py --rpi "$binary"
+
+  resources:
+    name: Offline resource regression
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
+    # A historical latency budget requires a stable OS baseline. Keep latest
+    # coverage in the check/test jobs, not in this performance comparison.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RUSTFLAGS: "-D warnings"
+      RESOURCE_DIAGNOSTICS_NAME: resource-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      COLD_START_DIAGNOSTICS_NAME: cold-start-${{ github.run_id }}-${{ github.run_attempt }}
+      EXTERNAL_TOOLS_DIAGNOSTICS_NAME: external-tools-${{ github.run_id }}-${{ github.run_attempt }}
+      RPI_RESOURCE_SMOKE_BINARY: target/resource-tests-cargo/release/rpi
+      RPI_COLD_START_BINARY: target/resource-tests-cargo/release/rpi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: resources-release
+          workspaces: . -> target/resource-tests-cargo
+      - name: Record performance environment
+        shell: bash
+        run: |
+          {
+            uname -a
+            cat /etc/os-release
+            printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+            lscpu
+            rustc -Vv
+            python3 --version
+          } | tee "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-environment.txt"
+      - name: Build release resource fixtures
+        run: |
+          cargo build -p rpi-cli --bin rpi --release --locked --target-dir target/resource-tests-cargo
+          cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir target/resource-tests-cargo
+      - name: Test resource controller and editor invariants
+        run: |
+          python3 -B scripts/test_resource_smoke.py
+          python3 -B scripts/test_resource_cold_start.py
+          python3 -B scripts/test_compare_resources.py
+          python3 -B scripts/test_resource_tui.py
+          cargo test -p rpi-tui --lib --example editor_resource_probe --release --locked --target-dir target/resource-tests-cargo
+      - name: Test offline external-tool RPC lifecycle
+        run: >-
+          python3 -B scripts/external-tools-smoke.py
+          --rpi target/resource-tests-cargo/release/rpi
+          --diagnostics-dir "$RUNNER_TEMP/$EXTERNAL_TOOLS_DIAGNOSTICS_NAME"
+      - name: Upload failed external-tool diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-tools-smoke-diagnostics
+          # Only synthetic protocol/summary diagnostics; never homes, auth or histories.
+          path: |
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/results.json
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/failure.txt
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/failure.txt
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/native-command.json
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/native-stdout.jsonl
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/native-stderr.log
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/provider-errors.json
+          if-no-files-found: ignore
+          include-hidden-files: false
+      - name: Test offline memory CPU and round conclusions
+        run: >-
+          python3 -B scripts/resource-smoke.py
+          --rpi target/resource-tests-cargo/release/rpi
+          --editor-probe target/resource-tests-cargo/release/examples/editor_resource_probe
+          --diagnostics-dir "$RUNNER_TEMP/$RESOURCE_DIAGNOSTICS_NAME"
+          --rounds 5 --profile release
+      # Shared hosted runners need explicit, more tolerant budgets than the
+      # local 2s modern target. Both shapes keep the full historical record load.
+      # A pure latency-gate failure gets one fresh attempt to absorb transient
+      # hosted-runner contention; protocol, semantic and cleanup failures do not.
+      - name: Regress cold opening 701000 synthetic append frames (modern)
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_base="$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-modern"
+          run_benchmark() {
+            local output="$1"
+            python3 -B scripts/resource-cold-start.py \
+              --candidate target/resource-tests-cargo/release/rpi \
+              --output "$output" \
+              --shapes modern --frames 701000 --entries 21733 --repeats 3 \
+              --max-ready-ms 4000 --max-single-ready-ms 8000 \
+              --max-get-messages-ms 250 --max-get-state-ms 2000
+          }
+          latency_only_failure() {
+            python3 - "$1" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              data = json.load(stream)
+          runs = data.get("runs", [])
+          summaries = [item for item in data.get("summaries", [])
+                       if item.get("gate", {}).get("gatesExit")]
+          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
+                              runs and summaries and
+                              all(run.get("status") == "PASS" and not run.get("errors")
+                                  for run in runs) and
+                              all(item["gate"].get("complete") is True for item in summaries) and
+                              all(item.get("metrics", {}).get(key) is not None
+                                  for item in summaries
+                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
+                              any(item.get("gate", {}).get("status") == "FAIL"
+                                  for item in summaries))
+          raise SystemExit(0 if only_latency else 1)
+          PY
+          }
+          if run_benchmark "${output_base}-1"; then
+            exit 0
+          fi
+          if ! latency_only_failure "${output_base}-1/results.json"; then
+            echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
+            exit 1
+          fi
+          echo '::warning::Cold-start latency gate was noisy; retrying once with the same thresholds.'
+          run_benchmark "${output_base}-2"
+      - name: Regress cold opening 701000 synthetic append frames (legacy upgrade)
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_base="$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-legacy"
+          run_benchmark() {
+            local output="$1"
+            python3 -B scripts/resource-cold-start.py \
+              --candidate target/resource-tests-cargo/release/rpi \
+              --output "$output" \
+              --shapes legacy --frames 701000 --entries 21733 --repeats 3 \
+              --max-ready-ms 6000 --max-single-ready-ms 10000 \
+              --max-get-messages-ms 250 --max-get-state-ms 2000
+          }
+          latency_only_failure() {
+            python3 - "$1" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              data = json.load(stream)
+          runs = data.get("runs", [])
+          summaries = [item for item in data.get("summaries", [])
+                       if item.get("gate", {}).get("gatesExit")]
+          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
+                              runs and summaries and
+                              all(run.get("status") == "PASS" and not run.get("errors")
+                                  for run in runs) and
+                              all(item["gate"].get("complete") is True for item in summaries) and
+                              all(item.get("metrics", {}).get(key) is not None
+                                  for item in summaries
+                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
+                              any(item.get("gate", {}).get("status") == "FAIL"
+                                  for item in summaries))
+          raise SystemExit(0 if only_latency else 1)
+          PY
+          }
+          if run_benchmark "${output_base}-1"; then
+            exit 0
+          fi
+          if ! latency_only_failure "${output_base}-1/results.json"; then
+            echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
+            exit 1
+          fi
+          echo '::warning::Cold-start latency gate was noisy; retrying once with the same thresholds.'
+          run_benchmark "${output_base}-2"
+      - name: Upload historical cold-start regression diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-cold-start-diagnostics
+          # Allowlist diagnostics: even a failed history cleanup must not upload
+          # hundreds of MiB of generated transcripts/companion data.
+          path: |
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-environment.txt
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/results.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/reproduce.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/report.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/fixture.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/process.jsonl
+          if-no-files-found: ignore
+          include-hidden-files: false
+      - name: Upload failed resource diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-smoke-diagnostics
+          # Only synthetic protocol/summary diagnostics; never homes, auth or histories.
+          path: |
+            ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}/results.json
+            ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}/metrics.jsonl
+            ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}/*/process.jsonl
+          if-no-files-found: ignore
+          include-hidden-files: false
+
+  extension-compatibility:
+    name: Official extension compatibility (${{ matrix.os }})
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    env:
+      # Update this deliberately when rpi-extension compatibility is reviewed.
+      # The SHA makes the extension set reproducible and auditable.
+      RPI_EXTENSION_REF: e37cb36010ed20db40a9b3a327ae182c8a4637c7
+      COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out host
+        uses: actions/checkout@v4
+
+      - name: Check out pinned official extension catalog
+        uses: actions/checkout@v4
+        with:
+          repository: pi-rust/rpi-extension
+          ref: ${{ env.RPI_EXTENSION_REF }}
+          path: rpi-extension
+          fetch-depth: 1
+
+      - name: Record source revisions and official catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "host=$(git rev-parse HEAD)"
+          echo "rpi-extension=$(git -C rpi-extension rev-parse HEAD)"
+          python - <<'PY'
+          import json
+          import pathlib
+          import tomllib
+          # The catalog carries bilingual descriptions; read UTF-8 explicitly
+          # because the Windows runner's default locale codec is cp1252.
+          host = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          catalog = json.loads(
+              pathlib.Path("rpi-extension/catalog/packages.json").read_text(encoding="utf-8")
+          )
+          print(f"host-version={host['workspace']['package']['version']}")
+          print(f"official-extension-count={len(catalog)}")
+          print("official-extensions=" + ",".join(item["name"] for item in catalog))
+          PY
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_native_dependencies() {
+            timeout 120s sudo apt-get update \
+              -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+              -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || return $?
+            timeout 120s sudo apt-get install --yes --no-install-recommends \
+              -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=15 pkg-config libasound2-dev
+          }
+          for attempt in 1 2 3; do
+            if install_native_dependencies; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "::error::Could not install Linux native dependencies after ${attempt} attempts."
+              exit 1
+            fi
+            echo "::warning::Native dependency install failed; retrying (attempt ${attempt}/3)."
+            sleep $(( attempt * 10 ))
+          done
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache sherpa-onnx archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sherpa-onnx-archives
+          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rpi-extension/Cargo.lock') }}
+
+      - name: Prefetch sherpa-onnx archive
+        shell: bash
+        working-directory: rpi-extension
+        run: |
+          set -euo pipefail
+          version="$(python - <<'PY'
+          import tomllib
+
+          with open("Cargo.lock", "rb") as lock_file:
+              lock = tomllib.load(lock_file)
+
+          versions = [
+              package["version"]
+              for package in lock["package"]
+              if package["name"] == "sherpa-onnx-sys"
+          ]
+          if len(versions) != 1:
+              raise SystemExit(f"expected one sherpa-onnx-sys version, found {versions!r}")
+          print(versions[0])
+          PY
+          )"
+
+          case "${RUNNER_OS}:${RUNNER_ARCH}" in
+            Linux:X64)
+              suffix="linux-x64-static-lib"
+              ;;
+            macOS:ARM64)
+              suffix="osx-arm64-static-lib"
+              ;;
+            macOS:X64)
+              suffix="osx-x64-static-lib"
+              ;;
+            Windows:X64)
+              suffix="win-x64-static-MT-Release-lib"
+              ;;
+            *)
+              echo "Unsupported runner: ${RUNNER_OS}:${RUNNER_ARCH}"
+              exit 1
+              ;;
+          esac
+
+          archive="sherpa-onnx-v${version}-${suffix}.tar.bz2"
+          archive_dir="${RUNNER_TEMP}/sherpa-onnx-archives"
+          archive_path="${archive_dir}/${archive}"
+          url="https://github.com/k2-fsa/sherpa-onnx/releases/download/v${version}/${archive}"
+          mkdir -p "$archive_dir"
+
+          if [[ ! -s "$archive_path" ]]; then
+            curl \
+              --fail \
+              --location \
+              --retry 10 \
+              --retry-delay 15 \
+              --retry-connrefused \
+              --retry-max-time 900 \
+              --connect-timeout 30 \
+              --max-time 900 \
+              "$url" \
+              --output "$archive_path"
+          fi
+
+          test -s "$archive_path"
+          echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
+          echo "Using $archive_path"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target/extension-compat
+            rpi-extension -> rpi-extension/target
+
+      - name: Build the current host
+        shell: bash
+        run: cargo build -p rpi-cli --bin rpi --release --locked --target-dir target/extension-compat
+
+      - name: Build every official extension and protocol bridge
+        shell: bash
+        working-directory: rpi-extension
+        run: cargo build --workspace --release --locked
+
+      - name: Stage exactly the catalog extensions
+        shell: bash
+        working-directory: rpi-extension
+        run: |
+          set -euo pipefail
+          cargo run --release --locked -p rpi-package-install -- pack --no-archive --out "$RUNNER_TEMP/rpi-extension-dist"
+          stage="$(python - "$RUNNER_TEMP/rpi-extension-dist" <<'PY'
+          import pathlib
+          import sys
+          matches = sorted(pathlib.Path(sys.argv[1]).glob("rpi-packages-*"))
+          if len(matches) != 1:
+              raise SystemExit(f"expected one staged bundle, found {matches!r}")
+          print(matches[0].resolve())
+          PY
+          )"
+          test -n "$stage"
+          echo "RPI_COMPAT_STAGE=$stage" >> "$GITHUB_ENV"
+          echo "staged=$stage"
+
+      - name: Assert every staged extension loads in the current host
+        shell: bash
+        run: RPI_SMOKE_PLUGIN_DIR="$RPI_COMPAT_STAGE" cargo test -p rpi-extensions --test extension_compat --locked -- --ignored
+
+      - name: Exercise native RPC, ACP and Web against the staged set
+        shell: bash
+        run: |
+          set -euo pipefail
+          rpi_bin="target/extension-compat/release/rpi"
+          acp_bin="rpi-extension/target/release/rpi-acp-bridge"
+          web_bin="rpi-extension/target/release/rpi-web"
+          case "$RUNNER_OS" in
+            Windows) rpi_bin="$rpi_bin.exe"; acp_bin="$acp_bin.exe"; web_bin="$web_bin.exe" ;;
+          esac
+          python scripts/extension-compatibility.py \
+            --rpi "$rpi_bin" \
+            --extensions-dir "$RPI_COMPAT_STAGE" \
+            --acp "$acp_bin" \
+            --web "$web_bin" \
+            --diagnostics-dir "$RUNNER_TEMP/$COMPAT_DIAGNOSTICS_NAME"
+
+      - name: Upload compatibility diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.COMPAT_DIAGNOSTICS_NAME }}-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/${{ env.COMPAT_DIAGNOSTICS_NAME }}
+            ${{ runner.temp }}/rpi-extension-dist/**/web.log
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  release-validation:
+    name: Release PR validation
+    if: always()
+    needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
+    runs-on: ubuntu-latest
+    steps:
+      # This is a required check for ordinary PRs too. A failed resource or
+      # platform job must not be hidden by a successful no-op aggregation.
+      - name: Require every validation job to pass
+        if: >-
+          ${{ !(github.event_name == 'pull_request' &&
+          github.repository == 'bigfish1913/pi-rust' &&
+          github.event.pull_request.base.ref == 'main' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+          github.event.pull_request.draft == true) }}
+        run: |
+          set -euo pipefail
+          test "${{ needs.msrv.result }}" = success
+          test "${{ needs.check.result }}" = success
+          test "${{ needs.test.result }}" = success
+          test "${{ needs.resources.result }}" = success
+          test "${{ needs['platform-startup'].result }}" = success
+          test "${{ needs['windows-installer'].result }}" = success
+          test "${{ needs['extension-compatibility'].result }}" = success
+
   release:
     name: Release automation
-    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, windows-installer]
+    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     permissions:
       contents: write
-      pull-requests: read
+      pull-requests: write
+      id-token: write
     uses: ./.github/workflows/release.yml
+    with:
+      # Daily runs prepare a Release PR and request Auto-merge for it; ordinary PRs remain manual.
+      prepare: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.prepare_release == true) }}
     secrets: inherit
 
+  # Preview pushes still run validation, but publishing is manual and opt-in.
   preview-version:
     name: Prepare preview release
-    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, windows-installer]
+    if: >-
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.ref == 'refs/heads/preview' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish_preview == true
+    needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -222,6 +894,7 @@ jobs:
     uses: ./.github/workflows/release-binaries.yml
     permissions:
       contents: write
+      id-token: write
     with:
       tag: ${{ needs.preview-version.outputs.tag }}
       version: ${{ needs.preview-version.outputs.version }}

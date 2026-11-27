@@ -1,0 +1,86 @@
+name: README image refresh
+
+on:
+  schedule:
+    # 00:17 UTC+8 each day; GitHub may delay scheduled jobs.
+    - cron: '17 16 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - README.md
+      - scripts/refresh-readme-images.py
+      - scripts/prepare-readme-image-pr.py
+      - scripts/test_refresh_readme_images.py
+      - .github/workflows/readme-images.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test README image refresh offline
+        run: python -B -m unittest discover -s scripts -p test_refresh_readme_images.py -v
+
+  refresh:
+    needs: test
+    if: >-
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: readme-image-refresh-main
+      cancel-in-progress: false
+    steps:
+      - name: Require the automation token
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo '::error::Set RELEASE_AUTOMATION_TOKEN with contents and pull requests write access; see docs/maintaining/releasing.md.'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Refresh the WeChat image date
+        run: python -B scripts/refresh-readme-images.py
+      # A PAT/App token, not GITHUB_TOKEN, lets the PR trigger normal required CI.
+      - name: Update the stable branch and open or reuse its PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: python -B scripts/prepare-readme-image-pr.py
+      # This is deliberately restricted to the exact upstream automation PR. It
+      # bypasses normal required checks because the script has already verified
+      # that the only changed path is README.md and that the branch is rebuilt
+      # from main. The automation token must be an explicit ruleset bypass actor.
+      - name: Merge the WeChat image PR without waiting for CI
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+            --head automation/readme-images \
+            --json number,headRepositoryOwner,isCrossRepository,isDraft \
+            --jq '[.[] | select(.isCrossRepository == false) | select(.headRepositoryOwner.login == "bigfish1913")]')"
+          count="$(jq 'length' <<<"$prs")"
+          [[ "$count" == 1 ]] || { echo '::error::Expected exactly one upstream README image PR.'; exit 1; }
+          number="$(jq -r '.[0].number' <<<"$prs")"
+          is_draft="$(jq -r '.[0].isDraft' <<<"$prs")"
+          [[ "$is_draft" == false ]] || { echo '::error::README image PR must not be a draft.'; exit 1; }
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --admin --squash --delete-branch

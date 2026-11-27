@@ -23,6 +23,7 @@ use rpi_ai::types::{ImageContent, ImageContentType};
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve_with_extensions, ResolveError};
 use crate::session::{build_prepared, prepare_extensions, BuildError};
+use crate::startup_diagnostics::{Phase, StartupSpan};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
 /// for most error paths; v1 distinguishes usage errors with the conventional
@@ -80,9 +81,49 @@ pub async fn run() -> i32 {
 }
 
 async fn run_inner() -> i32 {
+    let startup = StartupSpan::start(Phase::StartupToHarness);
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
+        eprintln!("error: {error}");
+        return EXIT_USAGE;
+    }
+    // Safe old-host negotiation: callers discover this flag through --help
+    // first. Never fall through to prompts, remote clients, resource commands,
+    // trust, migration, leases, credentials, providers or DLL startup.
+    if argv
+        .iter()
+        .any(|a| a == "--resource-capabilities" || a.starts_with("--resource-capabilities="))
+    {
+        if argv.len() != 1 || argv[0] != "--resource-capabilities" {
+            println!(
+                "{}",
+                serde_json::json!({"version":1,"success":false,"error":"--resource-capabilities must be used alone"})
+            );
+            return EXIT_USAGE;
+        }
+        match serde_json::to_string(&crate::resource_selection::capabilities()) {
+            Ok(profile) if profile.len() < crate::resource_selection::MAX_CAPABILITIES_BYTES => {
+                println!("{profile}");
+                return 0;
+            }
+            _ => {
+                println!(
+                    "{}",
+                    serde_json::json!({"version":1,"success":false,"error":"capability profile exceeds bound"})
+                );
+                return EXIT_RUNTIME;
+            }
+        }
+    }
+
+    if argv
+        .iter()
+        .any(|arg| arg == "--resource-session-read" || arg.starts_with("--resource-session-read="))
+    {
+        return crate::saved_session_read::run(&argv).await;
+    }
 
     if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
@@ -93,6 +134,13 @@ async fn run_inner() -> i32 {
     // the client holds no local agent resources at all: it only connects to a
     // running `rpi --server` and renders the remote transcript.
     if let Some(addr) = take_flag_value(&argv, "--connect") {
+        if argv
+            .iter()
+            .any(|arg| arg == "--mini" || arg.starts_with("--mini="))
+        {
+            eprintln!("error: --mini cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
         let token = resolve_connect_token(&argv);
         return crate::remote::tui::run(&addr, token.as_deref()).await;
     }
@@ -146,14 +194,30 @@ async fn run_inner() -> i32 {
                 return EXIT_USAGE;
             }
             let trusted = crate::session::resolve_project_trust(&args, &cwd);
-            let extension_session = crate::session::load_extensions(&args, &cwd, trusted, None);
+            let _resource_leases = match crate::resource_management::host_leases(&cwd) {
+                Ok(leases) => leases,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return EXIT_RUNTIME;
+                }
+            };
+            let extension_session = crate::session::load_extensions(
+                &crate::config::AgentHome::process(),
+                &args,
+                &cwd,
+                trusted,
+                None,
+            );
             return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
                 .await;
         }
         Some("events") => return crate::events::run(&argv[1..]).await,
+        Some("session") => return crate::session_gc::run(&argv[1..]).await,
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
+        Some("extension") => return crate::packages::run_extension(&argv[1..]),
+        Some("resource") => return crate::resource_management::run(&argv[1..]),
         Some("package") => return crate::packages::run(&argv[1..]),
         // These historical aliases are intentionally rejected instead of
         // falling through to the prompt path.
@@ -179,11 +243,22 @@ async fn run_inner() -> i32 {
         return code;
     }
 
+    if dev_options.is_some() && parsed.mini {
+        eprintln!("error: --mini cannot be combined with dev/dev-local");
+        return EXIT_USAGE;
+    }
+    if dev_options.is_some()
+        && (parsed.resource_config.is_some() || parsed.resource_transition.is_some())
+    {
+        eprintln!(
+            "error: --resource-config is restart-only and cannot be combined with dev/dev-local"
+        );
+        return EXIT_USAGE;
+    }
     let cwd = match resolve_cwd() {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-
     // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
     // set (an explicit override is its own layout).
@@ -202,12 +277,7 @@ async fn run_inner() -> i32 {
         return list_models(search, &parsed, &cwd).await;
     }
 
-    // Build before provider resolution so compiler errors do not require
-    // valid model credentials. The staged directory joins normal discovery.
-    let dev_extension = match prepare_dev_extension(dev_options.as_ref(), &cwd, &mut parsed) {
-        Ok(extension) => extension,
-        Err(code) => return code,
-    };
+    // Dev compilation is deferred until after native session resource preflight.
 
     // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
     // immediately opens the latest session. Resolve the picker result before
@@ -235,6 +305,9 @@ async fn run_inner() -> i32 {
         parsed.mode == crate::args::Mode::Rpc || parsed.unknown_flags.contains_key("server");
 
     // ---- @file attachments → text (TS processFileArguments, text branch only) ----
+    // Deliberately runs BEFORE the cwd adoption below: `@file` paths come from
+    // the shell that launched `rpi`, so they resolve against the launch cwd no
+    // matter which directory the restored session points at.
     let (file_text, file_images) = match process_file_args(&parsed.file_args, &cwd) {
         Ok(t) => t,
         Err(msg) => {
@@ -243,16 +316,133 @@ async fn run_inner() -> i32 {
         }
     };
 
+    if parsed.mini {
+        drop(argv);
+        let mut messages = std::mem::take(&mut parsed.messages).into_iter();
+        let mut parts = read_piped_stdin()
+            .into_iter()
+            .chain((!file_text.is_empty()).then_some(file_text))
+            .chain(messages.next());
+        let initial = parts.next().map(|mut text| {
+            for part in parts {
+                text.push_str(&part);
+            }
+            text
+        });
+        let prompts = initial
+            .or_else(|| (!file_images.is_empty()).then(String::new))
+            .into_iter()
+            .chain(messages);
+        startup.finish();
+        return crate::mini::run(&parsed, &cwd, prompts, file_images).await;
+    }
+
+    // ---- restored-session working directory (adopted before any resource load) ----
+    // A session records the cwd it was created in; restoring one must return
+    // the agent to that directory, because every tool resolves relative paths
+    // against the run's cwd. Adopting it here — before trust resolution,
+    // extension preparation, and the harness build — makes the whole run (tool
+    // env, system prompt, context files, extensions, footer) agree on one
+    // working directory. `@file` args above intentionally stay launch-cwd.
+    //
+    // The session ROOT is frozen first, for the same reason: settings and
+    // `RPI_CODING_AGENT_SESSION_DIR` may change while extensions load, and the
+    // adopted cwd belongs to another project's tree. Pinning the resolved root
+    // into `args` makes `prepare_extensions` and the build below read one root.
+    let session_root = crate::session::configured_session_dir(&parsed, &cwd);
+    parsed.session_dir = Some(session_root.clone());
+    let mut startup_notices: Vec<String> = Vec::new();
+    // The peek and the build both derive their selection from this frozen root,
+    // so they can never inspect one session and open another.
+    let selection = crate::session::select_session_in_dir(&parsed, session_root);
+    let cwd_lookup = StartupSpan::start(Phase::CwdLookup);
+    let restored_cwd = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
+    cwd_lookup.finish();
+    // Pin the session the peek resolved: `-c` re-lists the directory when the
+    // build runs, and another `rpi` may have written a newer session in
+    // between. Adopting one session's directory while opening another would
+    // put the tools in a directory the opened conversation never used, which is
+    // the failure this adoption exists to prevent.
+    if let Some(restored) = &restored_cwd {
+        crate::session::pin_restored_selection(&mut parsed, restored);
+    }
+    let launch_cwd = cwd;
+    let cwd = match &restored_cwd {
+        Some(restored) => match &restored.adopted {
+            Some(adopted) => {
+                // Adopting a directory is a behaviour change the user must see:
+                // tools, context files, and extensions all switch projects.
+                // `-c` in the project the session was created in adopts nothing
+                // (`adopted` IS `launch_cwd`), so the note is only produced for
+                // a real move.
+                startup_notices.extend(crate::session_cwd::moved_session_cwd_note(
+                    &launch_cwd,
+                    adopted,
+                ));
+                adopted.clone()
+            }
+            None => {
+                startup_notices.push(crate::session_cwd::missing_session_cwd_note(
+                    &restored.recorded,
+                    &launch_cwd,
+                ));
+                launch_cwd.clone()
+            }
+        },
+        None => launch_cwd.clone(),
+    };
+
     // ---- provider + model resolution ----
+    // Trust is resolved against the (possibly adopted) cwd: a session recorded
+    // in another project must not inherit the launch directory's trust decision.
     let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
-    let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
+    if !project_trusted && !crate::session_cwd::is_same_directory(&cwd, &launch_cwd) {
+        startup_notices.push(crate::session_cwd::untrusted_session_cwd_note(&cwd));
+    }
+    // Development preflight precedes prepare_extensions: protect its registry
+    // reads at orchestration too; the fact reader itself stays non-mutating.
+    let _dev_resource_leases = if dev_options.is_some() {
+        match crate::resource_management::host_leases(&cwd) {
+            Ok(leases) => Some(leases),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        }
+    } else {
+        None
+    };
+    // Reject a bound exact session before dev can build or stage any code.
+    if dev_options.is_some() {
+        if let Err(error) =
+            crate::session::preflight_extension_startup(&parsed, &cwd, project_trusted)
+        {
+            print_build_error(&error);
+            return EXIT_RUNTIME;
+        }
+    }
+    let dev_extension = match prepare_dev_extension(dev_options.as_ref(), &launch_cwd, &mut parsed)
+    {
+        Ok(extension) => extension,
+        Err(code) => return code,
+    };
+    let extension_prepare = StartupSpan::start(Phase::ExtensionPrepare);
+    let prepared = match prepare_extensions(
+        &crate::config::AgentHome::process(),
+        &parsed,
+        &cwd,
+        project_trusted,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             print_build_error(&error);
             return EXIT_RUNTIME;
         }
     };
+    extension_prepare.finish();
+    let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(
+        &crate::config::AgentHome::process(),
         &parsed,
         &cwd,
         project_trusted,
@@ -268,6 +458,7 @@ async fn run_inner() -> i32 {
         }
     };
 
+    model_resolve.finish();
     for warning in &resolved.compat_warnings {
         eprintln!("warning: models.json: {warning}");
     }
@@ -306,16 +497,26 @@ async fn run_inner() -> i32 {
     }
 
     // ---- harness build ----
-    let (harness, event_rx, mut reload_context) =
-        match build_prepared(&resolved, &parsed, &cwd, project_trusted, prepared).await {
-            Ok(triple) => triple,
-            Err(e) => {
-                print_build_error(&e);
-                return EXIT_RUNTIME;
-            }
-        };
+    let harness_build = StartupSpan::start(Phase::HarnessBuild);
+    let (harness, event_rx, mut reload_context) = match build_prepared(
+        &crate::config::AgentHome::process(),
+        &resolved,
+        &parsed,
+        &cwd,
+        project_trusted,
+        prepared,
+    )
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            print_build_error(&e);
+            return EXIT_RUNTIME;
+        }
+    };
+    harness_build.finish();
+    startup.finish();
     reload_context.dev_extension = dev_extension;
-
     // ---- post-load stdin claim + initial message ----
     // Extensions are loaded by `build()` (above). A plugin may have declared
     // `{"ownsStdio":true}`: this process's stdio belongs to it (an ACP/MCP stdio
@@ -345,7 +546,7 @@ async fn run_inner() -> i32 {
         })
         .unwrap_or(false);
     if web_requested && (!web_registered || !stdio_claimed) {
-        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-package\nThen restart with: rpi --web");
+        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-extension\nThen restart with: rpi --web");
         return EXIT_USAGE;
     }
     let stdio_lifecycle = reload_context
@@ -404,6 +605,17 @@ async fn run_inner() -> i32 {
     // otherwise the host would start a TUI/print run that writes to a stream the
     // plugin owns.
     let mode = if stdio_claimed { RunMode::Rpc } else { mode };
+    // ---- startup notices (restored-session cwd) ----
+    // The interactive TUI renders them as transcript notes (they must survive
+    // into the alternate screen); headless modes print them to stderr like the
+    // other startup warnings.
+    if matches!(mode, RunMode::Interactive) {
+        reload_context.startup_notices = startup_notices;
+    } else {
+        for notice in &startup_notices {
+            eprintln!("warning: {notice}");
+        }
+    }
 
     let dev_cleanup = reload_context.dev_extension.clone();
     let dev_watcher = if matches!(mode, RunMode::Interactive) {
@@ -462,15 +674,18 @@ async fn run_inner() -> i32 {
             // up on SessionShutdown, exactly as in interactive mode. This is why
             // `rpi --server` works headless: the SessionStart hook fires and the
             // extension brings up the TCP server.
+            let before_start = StartupSpan::start(Phase::BeforeStartHooks);
             let veto = crate::session::dispatch_session_event_async(
                 &reload_context,
                 rpi_plugin_sdk::EventTag::BeforeTuiStart,
             )
             .await;
+            before_start.finish();
             if let Some(reason) = veto {
                 eprintln!("[rpi] startup vetoed by extension: {reason}");
                 EXIT_VETOED
             } else {
+                let session_start = StartupSpan::start(Phase::SessionStartHooks);
                 if let Some(reason) = crate::session::dispatch_session_event_async(
                     &reload_context,
                     rpi_plugin_sdk::EventTag::SessionStart,
@@ -481,6 +696,7 @@ async fn run_inner() -> i32 {
                         "[rpi] extension vetoed SessionStart (headless, advisory): {reason}"
                     );
                 }
+                session_start.finish();
 
                 let code = if parsed.unknown_flags.contains_key("server") || stdio_claimed {
                     // Server mode OR a plugin-claimed stdio server: the extension
@@ -513,12 +729,16 @@ async fn run_inner() -> i32 {
                         let session = reload_context.extension_session.lock().unwrap();
                         session.snapshot_arc()
                     };
-                    crate::modes::rpc(
+                    crate::modes::rpc_with_durable_home(
                         &harness,
                         Some(event_rx),
                         model_catalog,
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
+                        Some(reload_context.extension_session.clone()),
+                        parsed.rpc_message_updates,
+                        parsed.native_durable,
+                        crate::config::AgentHome::process(),
                     )
                     .await
                 };
@@ -687,15 +907,17 @@ fn emit_startup_warnings(parsed: &Args) {
 /// fuzzy-ish substring over provider, id, and display name.
 async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
     let trusted = crate::session::resolve_project_trust(args, cwd);
-    let prepared = match prepare_extensions(args, cwd, trusted) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            print_build_error(&error);
-            return EXIT_RUNTIME;
-        }
-    };
+    let prepared =
+        match prepare_extensions(&crate::config::AgentHome::process(), args, cwd, trusted) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                print_build_error(&error);
+                return EXIT_RUNTIME;
+            }
+        };
     let manifests = crate::provider::manifests_from_session(&prepared.extension_session);
-    let catalog = match crate::provider::catalog_with_diagnostics(&manifests) {
+    let home = crate::config::AgentHome::process();
+    let catalog = match crate::provider::catalog_with_diagnostics(&home, &manifests) {
         Ok((models, warnings)) => {
             for warning in warnings {
                 eprintln!("warning: models.json: {warning}");
@@ -889,7 +1111,7 @@ fn image_content_from_bytes(bytes: &[u8]) -> Option<ImageContent> {
     let mime_type = rpi_tools::detect_supported_image_mime_type(bytes)?;
     Some(ImageContent {
         kind: ImageContentType,
-        data: rpi_tools::encode_base64(bytes),
+        data: rpi_tools::encode_base64(bytes).into(),
         mime_type: mime_type.to_string(),
     })
 }
@@ -926,7 +1148,7 @@ fn build_initial_message(
 
 /// Print a model-resolution error with env-specific guidance. Mirrors the TS
 /// auth-guidance / model-resolver error formatting (condensed to stderr lines).
-fn print_resolve_error(e: &ResolveError) {
+pub(crate) fn print_resolve_error(e: &ResolveError) {
     match e {
         ResolveError::NoApiKey { hint } => {
             eprintln!("error: {e}");

@@ -65,6 +65,12 @@ pub type AfterToolResults = Arc<
 /// `() -> Vec<AgentMessage>` — messages to inject mid-run after a tool batch.
 pub type GetSteeringMessages = Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 
+/// `() -> usize` — how many messages are queued right now, **without draining**.
+///
+/// Sync (not a future) on purpose: it runs on the settle path of every turn
+/// and only needs to read two `Mutex<VecDeque>` lengths.
+pub type PendingMessageCount = Arc<dyn Fn() -> usize + Send + Sync>;
+
 /// `() -> Vec<AgentMessage>` — messages to inject after the loop would stop.
 pub type GetFollowUpMessages = Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 
@@ -121,8 +127,20 @@ pub struct AgentLoopConfig {
     pub after_tool_results: Option<AfterToolResults>,
     pub get_steering_messages: Option<GetSteeringMessages>,
     pub get_follow_up_messages: Option<GetFollowUpMessages>,
+    /// Read-only count of what is **still queued** (steering + follow-up).
+    ///
+    /// Needed because `get_steering_messages` / `get_follow_up_messages` are
+    /// **draining** hooks — calling them to ask "how many are left?" would
+    /// consume the queue. `TurnEnd` reports this count as `pending_messages`
+    /// so a plugin can show an "N queued" indicator.
+    pub pending_message_count: Option<PendingMessageCount>,
     pub before_tool_call: Option<BeforeToolCall>,
     pub after_tool_call: Option<AfterToolCall>,
+    /// Called after each provider stream resolves with its terminal assistant
+    /// message. This is the host-side equivalent of pi's
+    /// `after_provider_response` observation and runs before `MessageEnd` is
+    /// emitted, so provider usage is visible to extensions for the same turn.
+    pub provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
 
     /// Per-batch execution mode. Default `Parallel`.
     pub tool_execution: ToolExecutionMode,
@@ -171,6 +189,7 @@ impl std::fmt::Debug for AgentLoopConfig {
             )
             .field("before_tool_call", &self.before_tool_call.is_some())
             .field("after_tool_call", &self.after_tool_call.is_some())
+            .field("provider_hooks", &self.provider_hooks.is_some())
             .finish()
     }
 }

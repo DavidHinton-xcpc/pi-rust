@@ -326,8 +326,21 @@ renderers and discovered resources.
 ```bash
 rpi install rpi-todo                    # prebuilt extension; no Rust toolchain needed
 rpi install my-ext --path ../my-ext     # local, for development
+rpi extension update [name]             # all eligible extensions, or one by name
+rpi extension update --cdn <URL>         # use a CDN for prebuilt extension archives
 rpi dev                                 # build + watch + live reload
 ```
+
+Use `rpi extension update` to update all project-linked extensions and globally
+installed registry/prebuilt extensions, or `rpi extension update <name>` to select
+one by name. Use `rpi extension update --cdn <URL>` to download prebuilt
+archives through an HTTPS CDN; manifests remain on GitHub and failed CDN
+requests fall back to GitHub. The option does not affect project-linked or
+Cargo-built extensions. Updates preserve the original Cargo build backend or explicit GitHub
+source. Global development installs made with `--path` are excluded. The old
+`rpi package update [name]` remains compatible; prefer `extension update` for
+extension updates. Project linking commands remain `rpi package link`,
+`rpi package list`, and `rpi package unlink`.
 
 The host loads project `.rpi/extensions`, then global
 `~/.rpi/agent/extensions`, then any `--extensions-dir`.
@@ -341,7 +354,7 @@ and it does not replace `rpi-plugin-sdk`; a simple tool plugin should not add it
 unnecessarily.
 
 Ready-to-install extensions live in the companion
-[`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
+[`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension) repository, with
 an [online catalog](https://rpi.bigfisharc.cn/packages.html).
 
 ### Optional web and subagent tools
@@ -404,11 +417,11 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.10.1](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
+| Current release | **[0.29.0](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
-| Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
-| Binary release targets | Linux (x86_64/aarch64), macOS (Intel/Apple silicon), Windows (x86_64) |
+| Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |
+| Binary release targets | Linux (x86_64 GNU/musl, aarch64 GNU), macOS (Intel/Apple silicon), Windows (x86_64) |
 
 `rpi` is a self-contained Rust coding-agent stack. No Node component is
 required and none is loaded.
@@ -481,4 +494,4 @@ The `rpi-*` crates are a Rust-native coding-agent stack.
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-extension&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-extension&Date)

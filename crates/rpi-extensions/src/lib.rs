@@ -65,38 +65,46 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn, ProviderRequestFn,
-    ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent,
-    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
-    ToolPollFn,
+    BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestControlFn,
+    OAuthRequestFn, ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn,
+    RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString, StbStringRef, ToolCancelFn,
+    ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
 pub use actions::{
     reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
-    RuntimeActionHost, SideQuestionSink, UiDialogMailbox, UiDialogRequest,
+    ReloadModelsMailbox, ReloadModelsRequest, RuntimeActionHost, SideQuestionSink, UiDialogMailbox,
+    UiDialogRequest,
 };
-pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
+pub use editor_text::{EditorDraft, EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use loader::{
-    load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
-    LoadedPlugin, PluginKeepalive, PluginLoadError,
+    load_dir, load_one, load_session, load_session_mixed, load_session_mixed_guarded,
+    merge_registries, ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
 pub use oauth::{
-    list as list_oauth_providers, request as request_oauth, OAuthActionResponse,
-    OAuthExtensionError, OAuthProviderInfo, OAuthResponseKind,
+    list as list_oauth_providers, request as request_oauth,
+    request_with_cancel as request_oauth_with_cancel, OAuthActionResponse, OAuthExtensionError,
+    OAuthProviderInfo, OAuthResponseKind,
 };
 pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
-    assert_active, current_platform, platform_allows, BeforeAgentStartHandler, ExtensionRegistry,
-    ExtensionTool, ProviderManifest, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider,
-    RegisteredProvider, RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut,
-    RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler, DEFAULT_PRIORITY,
+    assert_active, current_platform, platform_allows, ArgumentSuggester, BeforeAgentStartHandler,
+    ExtensionRegistry, ExtensionTool, ProviderManifest, RegisteredAutocompleteProvider,
+    RegisteredCommand, RegisteredCommandCompletions, RegisteredFlag, RegisteredHandler,
+    RegisteredOAuthProvider, RegisteredProvider, RegisteredRenderer, RegisteredRendererKind,
+    RegisteredShortcut, RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler,
+    ToolPromptMetadata, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
+pub use suggest_service::{SuggestItem, SuggestService};
+pub use tool_result_transform::{
+    emit_tool_result, emit_tool_result_with_status, with_tool_result_transform,
+};
 mod panel;
 pub use panel::{ExtensionPanel, PanelAnchor, PanelHighlight, PanelHighlightColor, PanelLayout};
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
@@ -118,7 +126,11 @@ mod registry;
 mod resources;
 mod status;
 mod stdio;
+mod suggest_service;
 mod tool;
+#[cfg(test)]
+mod tool_prompt_tests;
+mod tool_result_transform;
 mod translate;
 
 /// A diagnostics/event sink the host wires so the loader + adapter can report
@@ -308,6 +320,7 @@ impl HostApi {
             register_tool: Some(trampoline_register_tool),
             register_tool_with_wake: Some(trampoline_register_tool_with_wake),
             register_plugin_lifecycle: Some(trampoline_register_plugin_lifecycle),
+            register_tool_prompt: Some(trampoline_register_tool_prompt),
             register_command: Some(trampoline_register_command),
             register_shortcut: Some(trampoline_register_shortcut),
             register_flag: Some(trampoline_register_flag),
@@ -322,6 +335,13 @@ impl HostApi {
             // offset (a plugin built against the previous layout keeps working).
             register_before_agent_start: Some(trampoline_register_before_agent_start),
             register_oauth_provider: Some(trampoline_register_oauth_provider),
+            register_oauth_provider_cancellable: Some(
+                trampoline_register_oauth_provider_cancellable,
+            ),
+            register_tool_result: Some(trampoline_register_tool_result),
+            register_autocomplete_provider: Some(trampoline_register_autocomplete_provider),
+            register_command_completions: Some(trampoline_register_command_completions),
+            register_argument_suggester: Some(trampoline_register_argument_suggester),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -518,6 +538,34 @@ fn register_tool(
     } else {
         -1
     }
+}
+
+extern "C" fn trampoline_register_tool_prompt(
+    name: StbStringRef,
+    metadata_json: StbStringRef,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(-1, || {
+        with_current_api(|api| {
+            // SAFETY: plugin-supplied refs are borrowed for this registration call.
+            let name = unsafe { name.as_str() };
+            let json = unsafe { metadata_json.as_str() };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+                return 2;
+            };
+            if !value.is_object() {
+                return 2;
+            }
+            let Ok(prompt) = serde_json::from_value::<ToolPromptMetadata>(value) else {
+                return 2;
+            };
+            match api.with_registry(|reg| reg.register_tool_prompt(name, prompt)) {
+                Some(true) => 0,
+                Some(false) => 1,
+                None => -1,
+            }
+        })
+        .unwrap_or(-1)
+    })
 }
 
 extern "C" fn trampoline_register_command(
@@ -767,11 +815,58 @@ extern "C" fn unsupported_one_shot_provider_request(
 
 /// Register an OAuth provider manifest and action callback. The manifest is
 /// copied immediately; token-bearing responses remain plugin-owned and are
-/// reclaimed through the plugin free function when invoked by a future host
-/// OAuth bridge.
+/// reclaimed through the plugin free function when invoked by the host OAuth
+/// bridge. The legacy callback cannot observe cancellation.
 extern "C" fn trampoline_register_oauth_provider(
     manifest_json: StbStringRef,
     request_fn: OAuthRequestFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    register_oauth_provider_record(
+        manifest_json,
+        request_fn,
+        None,
+        plugin_free_string,
+        user_data,
+    )
+}
+
+/// Register an OAuth provider whose action callback takes an
+/// [`rpi_plugin_sdk::OAuthRequestControl`]. The host passes a control that
+/// reflects cancellation of each action. Otherwise identical to
+/// [`trampoline_register_oauth_provider`].
+extern "C" fn trampoline_register_oauth_provider_cancellable(
+    manifest_json: StbStringRef,
+    request_fn: OAuthRequestControlFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    register_oauth_provider_record(
+        manifest_json,
+        unsupported_legacy_oauth_request,
+        Some(request_fn),
+        plugin_free_string,
+        user_data,
+    )
+}
+
+/// Placeholder legacy callback for a cancellable registration. The host always
+/// prefers `control_fn` when it is present, so this fails loudly if a future code
+/// path ever calls it, rather than dereferencing a null pointer.
+extern "C" fn unsupported_legacy_oauth_request(
+    _req_json: StbStringRef,
+    _out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    tracing::error!("a cancellable OAuth provider was driven through the legacy request path");
+    1
+}
+
+fn register_oauth_provider_record(
+    manifest_json: StbStringRef,
+    request_fn: OAuthRequestFn,
+    control_fn: Option<OAuthRequestControlFn>,
     plugin_free_string: FreeStringFn,
     user_data: *mut c_void,
 ) -> i32 {
@@ -783,6 +878,7 @@ extern "C" fn trampoline_register_oauth_provider(
         plugin: with_current_api(|api| api.name.clone()).unwrap_or_default(),
         manifest_json: manifest,
         request_fn,
+        control_fn,
         plugin_free_string,
         user_data,
     };
@@ -906,6 +1002,107 @@ extern "C" fn trampoline_register_resources_discover(
     } else {
         -1
     }
+}
+
+/// `register_tool_result` trampoline. Same shape as
+/// [`trampoline_register_before_agent_start`].
+extern "C" fn trampoline_register_tool_result(
+    handler: rpi_plugin_sdk::ToolResultFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| reg.register_tool_result(handler, plugin_free_string, user_data))
+            .is_some()
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `register_autocomplete_provider` trampoline. Stores the handler with the
+/// plugin's own `plugin_free_string` (the `out` StbString it produces is
+/// plugin-owned) and its opaque `user_data`, exactly like a `tool_result`
+/// transform.
+extern "C" fn trampoline_register_autocomplete_provider(
+    handler: rpi_plugin_sdk::AutocompleteProviderFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| {
+            reg.register_autocomplete_provider(handler, plugin_free_string, user_data)
+        })
+        .is_some()
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `register_argument_suggester` trampoline. The response string the handler
+/// later produces is plugin-owned, so the registration carries the plugin's
+/// own `plugin_free_string`.
+extern "C" fn trampoline_register_argument_suggester(
+    command: rpi_plugin_sdk::StbStringRef,
+    handler: rpi_plugin_sdk::ArgumentSuggesterFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // SAFETY: the plugin guarantees the ref is valid for this call.
+    let command = unsafe { command.as_str().to_string() };
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| {
+            reg.register_argument_suggester(&command, handler, plugin_free_string, user_data)
+        })
+        .is_some()
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `register_command_completions` trampoline. Attaches the callback to an
+/// already-registered command: `0` on success, `1` when no such command exists
+/// (the plugin never registered it, or another plugin won the name first-wins),
+/// `-1` outside registration.
+extern "C" fn trampoline_register_command_completions(
+    name: StbStringRef,
+    handler: rpi_plugin_sdk::CommandArgumentCompletionFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    rpi_plugin_sdk::guard_or(-1, || {
+        // SAFETY: plugin-supplied ref is borrowed for this registration call.
+        let name = unsafe { name.as_str() };
+        match with_current_api(|api| {
+            api.with_registry(|reg| {
+                reg.set_command_completions(name, handler, plugin_free_string, user_data)
+            })
+        }) {
+            Some(Some(true)) => 0,
+            Some(Some(false)) => 1,
+            _ => -1,
+        }
+    })
 }
 
 /// `register_before_agent_start` trampoline. Same shape as

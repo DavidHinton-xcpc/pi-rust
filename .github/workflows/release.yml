@@ -2,6 +2,12 @@ name: Release automation
 
 on:
   workflow_call:
+    inputs:
+      prepare:
+        description: 'Allow this run to prepare or update the stable Release PR'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -12,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     outputs:
       release: ${{ steps.detect.outputs.release }}
       version: ${{ steps.detect.outputs.version }}
@@ -33,8 +39,11 @@ jobs:
   prepare:
     name: Prepare the next Release PR
     needs: detect
-    if: needs.detect.outputs.release == 'false'
+    if: needs.detect.outputs.release == 'false' && inputs.prepare == true
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     timeout-minutes: 30
     concurrency:
       group: release-pr-main
@@ -54,6 +63,11 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Return the existing Release PR to draft before updating it
+        id: draft-release-pr
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: python3 scripts/release-automation.py draft-release-prs
       - name: Prepare versions and changelog
         id: release-pr
         uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
@@ -66,7 +80,27 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
           RELEASE_PR_JSON: ${{ steps.release-pr.outputs.pr }}
+          EXISTING_RELEASE_PR_JSON: ${{ steps.draft-release-pr.outputs.pr }}
         run: bash scripts/sync-release-pr.sh
+      - name: Request Auto-merge for the Release PR
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+            --json number,headRefName,headRepositoryOwner,isDraft \
+            --jq '[.[] | select(.headRefName | startswith("release-plz-")) | select(.headRepositoryOwner.login == "bigfish1913")]')"
+          count="$(jq 'length' <<<"$prs")"
+          if [[ "$count" == 0 ]]; then
+            echo 'No Release PR was created; release-plz found no publishable package changes.'
+            exit 0
+          fi
+          [[ "$count" == 1 ]] || { echo '::error::Multiple upstream Release PRs are open.'; exit 1; }
+          number="$(jq -r '.[0].number' <<<"$prs")"
+          is_draft="$(jq -r '.[0].isDraft' <<<"$prs")"
+          [[ "$is_draft" == false ]] || { echo '::error::Release PR is still draft.'; exit 1; }
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
 
   publish:
     name: Publish crates and tag the tested Release PR
@@ -110,6 +144,7 @@ jobs:
     uses: ./.github/workflows/release-binaries.yml
     permissions:
       contents: write
+      id-token: write
     with:
       tag: ${{ needs.detect.outputs.tag }}
     secrets: inherit

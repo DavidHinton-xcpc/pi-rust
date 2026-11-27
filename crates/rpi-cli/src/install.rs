@@ -15,6 +15,8 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::prebuilt_extensions::{asset_paths_conflict, validate_asset_path};
+
 const INSTALLER_MANIFEST: &str = "rpi-extension-installer";
 const NATIVE_PACKAGES_FILE: &str = "native-packages.json";
 const NATIVE_PACKAGES_LOCK_FILE: &str = "native-packages.lock";
@@ -45,8 +47,27 @@ pub struct InstalledNativePackage {
 impl InstalledNativePackage {
     /// Prebuilt provenance also uses `source`; only local development builds
     /// should be excluded from registry update discovery and commands.
+    ///
+    /// Hosts that predate exact prebuilt provenance recorded only the
+    /// `prebuilt:<repository>` source marker. Those installs are still
+    /// registry-updatable, otherwise they would silently never see an update
+    /// again — including the ones published before a repository move.
     pub(crate) fn supports_registry_update(&self) -> bool {
-        self.source.is_none() || self.prebuilt.is_some()
+        self.source.is_none()
+            || self.prebuilt.is_some()
+            || self.legacy_prebuilt_repository().is_some()
+    }
+
+    /// Repository from the `prebuilt:<repository>` marker written by hosts
+    /// without exact prebuilt provenance, when it is a usable GitHub URL.
+    pub(crate) fn legacy_prebuilt_repository(&self) -> Option<&str> {
+        if self.prebuilt.is_some() {
+            return None;
+        }
+        self.source
+            .as_deref()?
+            .strip_prefix("prebuilt:")
+            .filter(|repository| repository.starts_with("https://github.com/"))
     }
 }
 
@@ -104,10 +125,30 @@ impl NativePackageRegistry {
 
 struct NativePackageMutationLock {
     file: Option<std::fs::File>,
+    _resource_lease: crate::resource_management::Lease,
 }
 
 impl NativePackageMutationLock {
     fn acquire(metadata_path: &Path) -> Result<Self, String> {
+        let parent = metadata_path
+            .parent()
+            .ok_or_else(|| "native package metadata has no parent".to_string())?;
+        let resource_lease = crate::resource_management::shared_lease(parent)?;
+        Self::acquire_with_lease(metadata_path, resource_lease)
+    }
+
+    fn acquire_exclusive(metadata_path: &Path) -> Result<Self, String> {
+        let parent = metadata_path
+            .parent()
+            .ok_or_else(|| "native package metadata has no parent".to_string())?;
+        let resource_lease = crate::resource_management::mutation_lease(parent)?;
+        Self::acquire_with_lease(metadata_path, resource_lease)
+    }
+
+    fn acquire_with_lease(
+        metadata_path: &Path,
+        resource_lease: crate::resource_management::Lease,
+    ) -> Result<Self, String> {
         let parent = metadata_path
             .parent()
             .ok_or_else(|| "native package metadata has no parent".to_string())?;
@@ -127,7 +168,10 @@ impl NativePackageMutationLock {
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
             format!("could not lock native package state (another install may be running): {error}")
         })?;
-        Ok(Self { file: Some(file) })
+        Ok(Self {
+            file: Some(file),
+            _resource_lease: resource_lease,
+        })
     }
 }
 
@@ -148,6 +192,7 @@ struct InstallOptions {
     force: bool,
     build: bool,
     repository: Option<String>,
+    cdn_base: Option<reqwest::Url>,
 }
 
 /// Default to the versioned prebuilt distribution protocol. Cargo builds are
@@ -188,6 +233,7 @@ pub async fn run_async(args: &[String]) -> i32 {
         options.version.as_deref(),
         options.repository.as_deref(),
         options.force,
+        options.cdn_base.as_ref(),
     )
     .await
     {
@@ -266,7 +312,7 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
 
-    if let Err(error) = cargo_command("fetch", &manifest, &options, false) {
+    if let Err(error) = cargo_command("fetch", &manifest, &options) {
         eprintln!("error: could not resolve `{}`: {error}", options.package);
         return 1;
     }
@@ -325,13 +371,16 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
 
-    if let Err(error) = cargo_command("build", &manifest, &options, true) {
-        eprintln!("error: failed to build `{}`: {error}", options.package);
-        return 1;
-    }
+    let built = match cargo_build(&manifest, &options, &cdylib_targets) {
+        Ok(built) => built,
+        Err(error) => {
+            eprintln!("error: failed to build `{}`: {error}", options.package);
+            return 1;
+        }
+    };
 
     let artifact_dir = temp.path().join("target").join("release");
-    let artifacts = match find_artifacts(&artifact_dir, &cdylib_targets) {
+    let artifacts = match built.into_artifacts(&artifact_dir, &cdylib_targets) {
         Ok(artifacts) => artifacts,
         Err(error) => {
             eprintln!("error: {error}");
@@ -387,6 +436,7 @@ pub fn run(args: &[String]) -> i32 {
     for target in installed {
         println!("installed {}", target.display());
     }
+    gc_retired_native_artifacts(&agent_dir);
     println!("rpi will load this extension on the next start.");
     0
 }
@@ -418,7 +468,7 @@ pub fn uninstall(args: &[String]) -> i32 {
     };
     let extension_dir = agent.join("extensions");
     let metadata_path = agent.join(NATIVE_PACKAGES_FILE);
-    let _lock = match NativePackageMutationLock::acquire(&metadata_path) {
+    let _lock = match NativePackageMutationLock::acquire_exclusive(&metadata_path) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("error: cannot safely uninstall: {error}");
@@ -434,6 +484,18 @@ pub fn uninstall(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let mut asset_targets = Vec::new();
+    for record in records.iter().filter(|record| record.name == name) {
+        for asset in recorded_asset_paths(record) {
+            match checked_asset_target(&extension_dir, asset) {
+                Ok(path) => asset_targets.push(path),
+                Err(error) => {
+                    eprintln!("error: cannot safely uninstall: {error}");
+                    return 1;
+                }
+            }
+        }
+    }
     let had_record = records.iter().any(|record| record.name == name);
     let wanted = normalize_name(&name);
     let artifact_names: std::collections::HashSet<String> = records
@@ -446,21 +508,28 @@ pub fn uninstall(args: &[String]) -> i32 {
     if let Ok(entries) = std::fs::read_dir(&extension_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_artifact = artifact_names.contains(
-                &path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ) || (use_legacy_name_fallback
-                && path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
-                    .unwrap_or(false));
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let is_artifact = artifact_names.contains(&file_name)
+                || is_versioned_artifact_for_package(&file_name, &wanted)
+                || (use_legacy_name_fallback
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
+                        .unwrap_or(false));
             if is_artifact && is_dynamic_library(&path) {
                 artifact_targets.push(path);
             }
         }
+    }
+    if let Err(error) =
+        crate::resource_management::legacy_unowned_targets(&agent, &artifact_targets)
+    {
+        eprintln!("error: {error}");
+        return 1;
     }
     let mut remaining: Vec<_> = records
         .into_iter()
@@ -471,6 +540,7 @@ pub fn uninstall(args: &[String]) -> i32 {
     }
     let mut replacements = Vec::new();
     let mut removals = artifact_targets.clone();
+    removals.extend(asset_targets.iter().cloned());
     if had_record {
         if remaining.is_empty() {
             removals.push(metadata_path.clone());
@@ -499,10 +569,11 @@ pub fn uninstall(args: &[String]) -> i32 {
         eprintln!("error: could not uninstall Rust extension {name}: {error}");
         return 1;
     }
-    for path in &artifact_targets {
+    prune_empty_dirs(&extension_dir, &asset_targets);
+    for path in artifact_targets.iter().chain(&asset_targets) {
         println!("removed {}", path.display());
     }
-    let removed = artifact_targets.len();
+    let removed = artifact_targets.len() + asset_targets.len();
     if removed == 0 && !had_record {
         println!("Rust extension is not installed: {name}");
         return 0;
@@ -589,6 +660,116 @@ pub(crate) fn installed_native_packages_strict() -> Result<Vec<InstalledNativePa
     read_native_package_registry().map(NativePackageRegistry::into_records)
 }
 
+/// Resolve the active global native package libraries without scanning the
+/// extension directory. New records name the active files explicitly; older
+/// records had no artifact ledger, so they retain the historical crate-name
+/// scan as a compatibility fallback.
+pub fn active_global_native_package_artifacts() -> Vec<PathBuf> {
+    let Ok(agent_dir) = crate::config::agent_dir() else {
+        return Vec::new();
+    };
+    active_global_native_package_artifacts_at(&agent_dir).unwrap_or_default()
+}
+
+/// Resolve unmanaged legacy libraries from the global extension directory.
+/// Managed versioned artifacts are deliberately omitted: only the active
+/// artifact list above may be loaded for an installed native package.
+pub fn unregistered_global_native_package_artifacts() -> Vec<PathBuf> {
+    let Ok(agent_dir) = crate::config::agent_dir() else {
+        return Vec::new();
+    };
+    unregistered_global_native_package_artifacts_at(&agent_dir).unwrap_or_default()
+}
+
+pub(crate) fn active_global_native_package_artifacts_at(
+    agent_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let destination = agent_dir.join("extensions");
+    let records =
+        read_native_package_registry_at(&agent_dir.join(NATIVE_PACKAGES_FILE))?.into_records();
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for record in records {
+        if record.artifacts.is_empty() {
+            let wanted = normalize_name(&record.name);
+            let Ok(entries) = std::fs::read_dir(&destination) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!("could not inspect native extension directory: {error}")
+                })?;
+                let path = entry.path();
+                let matches = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
+                    .unwrap_or(false);
+                if matches && is_dynamic_library(&path) {
+                    let identity = transaction_path_identity(&path);
+                    if seen.insert(identity) {
+                        paths.push(path);
+                    }
+                }
+            }
+        } else {
+            for artifact in record.artifacts {
+                let path = checked_registered_artifact_path(&destination, &artifact)?;
+                if seen.insert(transaction_path_identity(&path)) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+pub(crate) fn unregistered_global_native_package_artifacts_at(
+    agent_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let destination = agent_dir.join("extensions");
+    let records =
+        read_native_package_registry_at(&agent_dir.join(NATIVE_PACKAGES_FILE))?.into_records();
+    let managed = records
+        .iter()
+        .flat_map(|record| record.artifacts.iter())
+        .map(|artifact| native_artifact_identity(artifact))
+        .collect::<HashSet<_>>();
+    let legacy_names = records
+        .iter()
+        .filter(|record| record.artifacts.is_empty())
+        .map(|record| normalize_name(&record.name))
+        .collect::<HashSet<_>>();
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&destination) else {
+        return Ok(paths);
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("could not inspect native extension directory: {error}"))?
+            .path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let legacy_managed = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| legacy_names.contains(&normalize_name(stem.trim_start_matches("lib"))))
+            .unwrap_or(false);
+        if !is_dynamic_library(&path)
+            || managed.contains(&native_artifact_identity(name))
+            || is_versioned_artifact_name(name)
+            || legacy_managed
+        {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 #[cfg(test)]
 fn record_native_package_at(path: &Path, record: &InstalledNativePackage) -> Result<(), String> {
     let mut records = read_native_package_registry_at(path)?.into_records();
@@ -621,6 +802,13 @@ struct NativeBackup {
     backup: PathBuf,
 }
 
+/// A sidecar file of a prebuilt package, already verified against its archive
+/// index. `path` is the relative store path, such as `runtime/main.mjs`.
+pub(crate) struct NativeAssetFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
 pub(crate) fn install_native_package_at(
     destination: &Path,
     metadata_path: &Path,
@@ -628,11 +816,25 @@ pub(crate) fn install_native_package_at(
     artifacts: &[PathBuf],
     force: bool,
 ) -> Result<Vec<PathBuf>, String> {
+    install_native_package_with_assets_at(destination, metadata_path, record, artifacts, &[], force)
+}
+
+/// Install a library and its sidecar assets as one transaction. The returned paths
+/// are the library followed by every asset that was activated.
+pub(crate) fn install_native_package_with_assets_at(
+    destination: &Path,
+    metadata_path: &Path,
+    record: InstalledNativePackage,
+    artifacts: &[PathBuf],
+    assets: &[NativeAssetFile],
+    force: bool,
+) -> Result<Vec<PathBuf>, String> {
     install_native_package_at_with_hook(
         destination,
         metadata_path,
         record,
         artifacts,
+        assets,
         force,
         |_, _| Ok(()),
     )
@@ -643,6 +845,7 @@ fn install_native_package_at_with_hook(
     metadata_path: &Path,
     mut record: InstalledNativePackage,
     artifacts: &[PathBuf],
+    assets: &[NativeAssetFile],
     force: bool,
     mut before_activate: impl FnMut(usize, &Path) -> Result<(), String>,
 ) -> Result<Vec<PathBuf>, String> {
@@ -673,8 +876,8 @@ fn install_native_package_at_with_hook(
         return Ok(Vec::new());
     }
 
-    let mut new_artifacts = Vec::with_capacity(artifacts.len());
-    let mut new_keys = HashSet::new();
+    let mut source_artifacts = Vec::with_capacity(artifacts.len());
+    let mut source_keys = HashSet::new();
     for artifact in artifacts {
         let metadata = std::fs::symlink_metadata(artifact).map_err(|error| {
             format!(
@@ -689,14 +892,31 @@ fn install_native_package_at_with_hook(
             ));
         }
         let name = artifact_file_name(artifact)?;
-        let key = native_artifact_identity(&name);
-        if !new_keys.insert(key) {
+        if !source_keys.insert(native_artifact_identity(&name)) {
             return Err(format!("duplicate built artifact name `{name}`"));
         }
-        new_artifacts.push((name, artifact.clone()));
+        source_artifacts.push((name, artifact.clone()));
     }
-    if new_artifacts.is_empty() {
+    if source_artifacts.is_empty() {
         return Err("Cargo produced no installable cdylib artifacts".to_string());
+    }
+
+    // Upgrades get a fresh, version-bearing filename, so an already loaded
+    // DLL/SO/DYLIB is never replaced or unlinked. First installs retain the
+    // historical stable name for compatibility; later upgrades switch to the
+    // immutable versioned name.
+    let mut new_artifacts = Vec::with_capacity(source_artifacts.len());
+    let mut new_keys = HashSet::new();
+    for (name, source) in source_artifacts {
+        let target_name = if previous.is_some() || (force && destination.join(&name).exists()) {
+            versioned_artifact_name(&name, &record.version, destination)?
+        } else {
+            name
+        };
+        if !new_keys.insert(native_artifact_identity(&target_name)) {
+            return Err(format!("duplicate versioned artifact name `{target_name}`"));
+        }
+        new_artifacts.push((target_name, source));
     }
 
     for other in records
@@ -714,38 +934,23 @@ fn install_native_package_at_with_hook(
         }
     }
 
-    let mut stale_targets = Vec::new();
-    let mut owned_keys = HashSet::new();
-    if let Some(previous) = &previous {
-        if previous.artifacts.is_empty() {
-            let wanted = normalize_name(&record.name);
-            for entry in std::fs::read_dir(destination).map_err(|error| {
-                format!(
-                    "could not inspect extension directory {}: {error}",
-                    destination.display()
-                )
-            })? {
-                let entry = entry.map_err(|error| {
-                    format!("could not inspect installed extension artifact: {error}")
-                })?;
-                let path = entry.path();
-                let matches_legacy_name = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
-                    .unwrap_or(false);
-                if matches_legacy_name && is_dynamic_library(&path) {
-                    owned_keys.insert(native_artifact_identity(&artifact_file_name(&path)?));
-                    stale_targets.push(path);
-                }
-            }
-        } else {
-            for old_name in &previous.artifacts {
-                let old_path = checked_registered_artifact_path(destination, old_name)?;
-                owned_keys.insert(native_artifact_identity(old_name));
-                if !new_keys.contains(&native_artifact_identity(old_name)) {
-                    stale_targets.push(old_path);
-                }
+    // Sidecars share the store namespace with every package's artifacts and assets.
+    validate_new_assets(&record, assets, &new_artifacts)?;
+    for other in records
+        .iter()
+        .filter(|candidate| candidate.name != record.name)
+    {
+        for owned in recorded_asset_paths(other) {
+            let clash = new_artifacts
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .chain(assets.iter().map(|asset| asset.path.as_str()))
+                .find(|new| asset_paths_conflict(new, owned));
+            if let Some(new) = clash {
+                return Err(format!(
+                    "`{new}` conflicts with asset `{owned}` owned by installed package `{}`",
+                    other.name
+                ));
             }
         }
     }
@@ -754,12 +959,47 @@ fn install_native_package_at_with_hook(
         .iter()
         .map(|(name, _)| destination.join(name))
         .collect::<Vec<_>>();
-    if !force {
-        for target in &installed_targets {
-            if owned_keys.contains(&native_artifact_identity(&artifact_file_name(target)?)) {
-                continue;
+    crate::resource_management::legacy_unowned_targets(metadata_parent, &installed_targets)?;
+    for target in &installed_targets {
+        match std::fs::symlink_metadata(target) {
+            Ok(_) => {
+                return Err(format!(
+                    "versioned extension target {} already exists",
+                    target.display()
+                ))
             }
-            match std::fs::symlink_metadata(target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect extension target {}: {error}",
+                    target.display()
+                ))
+            }
+        }
+    }
+
+    let previous_assets: Vec<String> = previous
+        .as_ref()
+        .map(|package| {
+            recorded_asset_paths(package)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut asset_targets = Vec::with_capacity(assets.len());
+    for asset in assets {
+        let target = checked_asset_target(destination, &asset.path)?;
+        // Same identity rule as the transaction and the stale check. A case-folded name is
+        // owned only when it is the recorded file itself (a case-insensitive store), never a
+        // different file that merely differs in case.
+        let owned = previous_assets.iter().any(|old| {
+            native_artifact_identity(old) == native_artifact_identity(&asset.path)
+                || (old.eq_ignore_ascii_case(&asset.path)
+                    && same_file(&destination.join(old), &target))
+        });
+        if !force && !owned {
+            match std::fs::symlink_metadata(&target) {
                 Ok(_) => {
                     return Err(format!(
                         "extension {} already exists; use --force to replace it",
@@ -775,6 +1015,18 @@ fn install_native_package_at_with_hook(
                 }
             }
         }
+        asset_targets.push(target);
+    }
+    let mut stale_asset_targets = Vec::new();
+    for old in &previous_assets {
+        // On a case-sensitive store a case-only rename is a different file, and leaving
+        // the old one would orphan it. Windows folds identities, as the transaction does.
+        if !assets
+            .iter()
+            .any(|asset| native_artifact_identity(&asset.path) == native_artifact_identity(old))
+        {
+            stale_asset_targets.push(checked_asset_target(destination, old)?);
+        }
     }
 
     record.artifacts = new_artifacts.iter().map(|(name, _)| name.clone()).collect();
@@ -788,21 +1040,335 @@ fn install_native_package_at_with_hook(
     }
     records.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let mut replacements = Vec::with_capacity(new_artifacts.len() + 1);
+    let mut replacements = Vec::with_capacity(new_artifacts.len() + assets.len() + 1);
     for ((_, source), target) in new_artifacts.iter().zip(&installed_targets) {
         replacements.push(NativeReplacement {
             staged: stage_native_artifact(source, target)?,
             target: target.clone(),
         });
     }
+    // Sidecars are written into a private directory on the store's filesystem, so
+    // the transaction can rename each one into place. Nothing reaches the store
+    // until every replacement has been staged.
+    let stage = if assets.is_empty() {
+        None
+    } else {
+        Some(StagedDirectory::create(destination)?)
+    };
+    if let Some(stage) = &stage {
+        for (asset, target) in assets.iter().zip(&asset_targets) {
+            let staged = stage.path.join(&asset.path);
+            if let Some(parent) = staged.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            write_staged_asset(&asset.bytes, &staged)?;
+            replacements.push(NativeReplacement {
+                staged: StagedNativeFile { path: staged },
+                target: target.clone(),
+            });
+        }
+    }
     let registry = serde_json::to_vec_pretty(&records).map_err(|error| error.to_string())?;
     replacements.push(NativeReplacement {
         staged: stage_native_bytes(&registry, metadata_path)?,
         target: metadata_path.to_path_buf(),
     });
+    // Directories this transaction creates, so a failed install can remove them again.
+    let mut created_dirs = Vec::new();
+    for target in &asset_targets {
+        if let Some(parent) = target.parent() {
+            created_dirs.extend(
+                parent
+                    .ancestors()
+                    .take_while(|dir| *dir != destination && !dir.exists())
+                    .map(Path::to_path_buf),
+            );
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                remove_created_dirs(&mut created_dirs);
+                return Err(format!(
+                    "could not create extension directory {}: {error}",
+                    parent.display()
+                ));
+            }
+        }
+    }
 
-    activate_native_transaction(&replacements, &stale_targets, &mut before_activate)?;
-    Ok(installed_targets)
+    // Dynamic-library artifacts are intentionally retained across upgrades.
+    // Only replaceable sidecar files follow the old cleanup behavior.
+    let mut removals = Vec::new();
+    removals.extend(stale_asset_targets.iter().cloned());
+    if let Err(error) = activate_native_transaction(&replacements, &removals, &mut before_activate)
+    {
+        remove_created_dirs(&mut created_dirs);
+        return Err(error);
+    }
+    prune_empty_dirs(destination, &stale_asset_targets);
+    Ok(installed_targets.into_iter().chain(asset_targets).collect())
+}
+
+/// Assets must match the registry ledger exactly, and each must be a valid,
+/// non-overlapping store path that no library artifact of this package occupies.
+fn validate_new_assets(
+    record: &InstalledNativePackage,
+    assets: &[NativeAssetFile],
+    artifacts: &[(String, PathBuf)],
+) -> Result<(), String> {
+    let declared: Vec<&str> = assets.iter().map(|asset| asset.path.as_str()).collect();
+    if recorded_asset_paths(record) != declared {
+        return Err("internal error: sidecar ledger does not match the staged assets".into());
+    }
+    for (index, asset) in assets.iter().enumerate() {
+        validate_asset_path(&asset.path)?;
+        if assets[..index]
+            .iter()
+            .any(|other| asset_paths_conflict(&other.path, &asset.path))
+        {
+            return Err(format!(
+                "duplicate or overlapping asset path `{}`",
+                asset.path
+            ));
+        }
+        if artifacts
+            .iter()
+            .any(|(name, _)| asset_paths_conflict(name, &asset.path))
+        {
+            return Err(format!(
+                "asset `{}` collides with a library artifact",
+                asset.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recorded_asset_paths(package: &InstalledNativePackage) -> Vec<&str> {
+    package
+        .prebuilt
+        .iter()
+        .flat_map(|prebuilt| prebuilt.assets.iter().map(|asset| asset.path.as_str()))
+        .collect()
+}
+
+/// Resolve a declared sidecar under the store without following links. Existing
+/// ancestors must be real directories; missing ones are created by the transaction.
+fn checked_asset_target(destination: &Path, relative: &str) -> Result<PathBuf, String> {
+    validate_asset_path(relative)?;
+    let parts: Vec<&str> = relative.split('/').collect();
+    let mut current = destination.to_path_buf();
+    for part in &parts[..parts.len() - 1] {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "asset parent {} is not a plain directory",
+                    current.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect asset parent {}: {error}",
+                    current.display()
+                ))
+            }
+        }
+    }
+    Ok(destination.join(relative))
+}
+
+/// A private staging directory, removed on every exit path.
+struct StagedDirectory {
+    path: PathBuf,
+}
+
+impl StagedDirectory {
+    fn create(destination: &Path) -> Result<Self, String> {
+        let path = destination.join(format!(
+            ".rpi-assets-stage-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&path).map_err(|error| {
+            format!(
+                "could not create asset staging directory {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for StagedDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn write_staged_asset(bytes: &[u8], path: &Path) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("could not create staged asset {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not write staged asset {}: {error}", path.display()))
+}
+
+/// Remove directories a failed transaction created, deepest first. A directory that is
+/// not empty (for example after a failed rollback) is kept.
+fn remove_created_dirs(dirs: &mut [PathBuf]) {
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in dirs.iter() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Remove directories left empty by removed sidecars. The store itself is kept.
+fn prune_empty_dirs(root: &Path, removed: &[PathBuf]) {
+    for path in removed {
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            if dir == root || !dir.starts_with(root) || std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
+}
+
+fn is_versioned_artifact_name(name: &str) -> bool {
+    let Some(stem) = Path::new(name).file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some((prefix, token)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    prefix.rsplit_once("-v").is_some()
+        && token.len() == 32
+        && token.bytes().all(|value| value.is_ascii_hexdigit())
+}
+
+fn is_versioned_artifact_for_package(name: &str, normalized_package: &str) -> bool {
+    let Some(stem) = Path::new(name).file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some((prefix, _)) = stem.rsplit_once("-v") else {
+        return false;
+    };
+    is_versioned_artifact_name(name)
+        && normalize_name(prefix.trim_start_matches("lib")) == normalized_package
+}
+
+/// Outcome of a best-effort retired-native-artifact cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiredGcOutcome {
+    /// Cleanup ran; surviving stale artifacts are not loadable via the registry-aware discovery.
+    Completed,
+    /// A live host or mutation held the lease, so on-disk cleanup was skipped.
+    Deferred,
+}
+
+/// Best-effort cleanup for retired native artifacts. The exclusive resource
+/// lease is the proof that no host is currently holding the old libraries; a
+/// live host therefore only causes cleanup to be deferred until a later
+/// install or explicit maintenance command.
+pub(crate) fn gc_retired_native_artifacts(agent_dir: &Path) -> RetiredGcOutcome {
+    let metadata_path = agent_dir.join(NATIVE_PACKAGES_FILE);
+    let lease = match crate::resource_management::mutation_lease(agent_dir) {
+        Ok(lease) => lease,
+        Err(_) => return RetiredGcOutcome::Deferred,
+    };
+    let _lock = match NativePackageMutationLock::acquire_with_lease(&metadata_path, lease) {
+        Ok(lock) => lock,
+        Err(_) => return RetiredGcOutcome::Deferred,
+    };
+    let records = match read_native_package_registry_at(&metadata_path) {
+        Ok(registry) => registry.into_records(),
+        Err(_) => return RetiredGcOutcome::Deferred,
+    };
+    let active = records
+        .iter()
+        .flat_map(|record| record.artifacts.iter())
+        .map(|artifact| native_artifact_identity(artifact))
+        .collect::<HashSet<_>>();
+    let destination = agent_dir.join("extensions");
+    let Ok(entries) = std::fs::read_dir(&destination) else {
+        return RetiredGcOutcome::Completed;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_dynamic_library(&path)
+            || !is_versioned_artifact_name(name)
+            || active.contains(&native_artifact_identity(name))
+        {
+            continue;
+        }
+        if crate::resource_management::legacy_unowned_targets(
+            agent_dir,
+            std::slice::from_ref(&path),
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_file() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    RetiredGcOutcome::Completed
+}
+
+pub(crate) fn versioned_artifact_name(
+    original: &str,
+    version: &str,
+    destination: &Path,
+) -> Result<String, String> {
+    let path = Path::new(original);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("artifact has no UTF-8 file stem: {original}"))?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("artifact has no dynamic-library extension: {original}"))?;
+    let version = version
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_') {
+                value
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let version = if version.is_empty() {
+        "unknown"
+    } else {
+        &version
+    };
+    for _ in 0..8 {
+        let name = format!(
+            "{stem}-v{version}-{}.{}",
+            uuid::Uuid::new_v4().simple(),
+            extension
+        );
+        let target = destination.join(&name);
+        if matches!(std::fs::symlink_metadata(&target), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(name);
+        }
+    }
+    Err(format!(
+        "could not allocate a unique versioned artifact for {original}"
+    ))
 }
 
 fn artifact_file_name(path: &Path) -> Result<String, String> {
@@ -830,6 +1396,25 @@ fn native_artifact_identity(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// Whether two paths name the same existing file (one inode). Windows already folds case
+/// in `native_artifact_identity`, so only Unix needs the inode check.
+#[cfg(unix)]
+fn same_file(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::symlink_metadata(left),
+        std::fs::symlink_metadata(right),
+    ) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &Path, _: &Path) -> bool {
+    false
 }
 
 fn transaction_path_identity(path: &Path) -> String {
@@ -869,6 +1454,46 @@ fn adjacent_transaction_path(target: &Path, kind: &str) -> Result<PathBuf, Strin
         "could not allocate a transaction path beside {}",
         target.display()
     ))
+}
+
+/// macOS only: give a freshly copied native artifact an ad-hoc signature.
+///
+/// Why this is mandatory and not cosmetic (2026-11-07, 35 SIGKILLs in one
+/// afternoon): cargo linker-signs a cdylib and that signature records the
+/// file's mtime (`cs_mtime`). Any copy — `io::copy`, `fs::copy`, `rename` of a
+/// rewritten file — gives the copy a **new** mtime, and when the kernel maps a
+/// code page it compares `cs_mtime` against it. On mismatch it refuses the page
+/// and **kills the whole host process**:
+///
+/// ```text
+/// CODE SIGNING: process 20087[rpi]: rejecting invalid page at address 0x…
+///   in file "~/.pidd/rpi-agent/extensions/librpi_superagent.dylib"
+///   (cs_mtime:1794052202.55 != mtime:1794056571.77)
+/// ```
+///
+/// Nothing is printed and no exit code reaches the terminal except 137, so the
+/// symptom reads as "rpi will not start any session any more". `codesign -v`
+/// still reports the copy as valid on disk, so verification is useless here —
+/// only re-signing realigns `cs_mtime` with the file mtime.
+pub(crate) fn resign_staged_native(path: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let out = std::process::Command::new("/usr/bin/codesign")
+        // Pin the identifier: `--sign -` otherwise derives it from the file NAME,
+        // so the same bytes staged under different names sign to different bytes.
+        .args(["--force", "--sign", "-", "--identifier", "com.rpi.native"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("could not run codesign on {}: {error}", path.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "re-signing {} failed (the kernel will refuse to load it): {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 fn stage_native_artifact(source: &Path, target: &Path) -> Result<StagedNativeFile, String> {
@@ -911,7 +1536,8 @@ fn stage_native_artifact(source: &Path, target: &Path) -> Result<StagedNativeFil
                 "could not preserve permissions on staged artifact {}: {error}",
                 stage.display()
             )
-        })
+        })?;
+        resign_staged_native(&stage)
     })();
     if let Err(error) = result {
         let _ = std::fs::remove_file(&stage);
@@ -1080,6 +1706,7 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
     let mut force = false;
     let mut build = false;
     let mut repository = None;
+    let mut cdn = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1091,6 +1718,10 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
             "--github" => {
                 i += 1;
                 repository = Some(value(args, i, "--github")?);
+            }
+            "--cdn" => {
+                i += 1;
+                cdn = Some(value(args, i, "--cdn")?);
             }
             "--version" | "-V" => {
                 i += 1;
@@ -1132,6 +1763,11 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
     if !valid_package_name(&package) {
         return Err(format!("invalid Cargo package name `{package}`"));
     }
+    let cdn_base = if build || path.is_some() {
+        None
+    } else {
+        crate::cdn::resolve_base(cdn.as_deref())?
+    };
     Ok(InstallOptions {
         package,
         version,
@@ -1140,6 +1776,7 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
         force,
         build,
         repository,
+        cdn_base,
     })
 }
 
@@ -1206,7 +1843,7 @@ fn help_requested() -> &'static str {
 }
 
 pub fn print_help() {
-    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
+    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata, and a repository move is followed for version discovery while previously published releases stay installable.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --cdn <URL>           Download release archives from this HTTPS CDN; manifests remain on GitHub\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
 }
 
 fn print_uninstall_help() {
@@ -1251,22 +1888,16 @@ fn write_manifest(path: &Path, options: &InstallOptions) -> Result<(), String> {
     std::fs::write(path, contents).map_err(|error| error.to_string())
 }
 
+/// Run the Cargo commands whose output only needs to reach the terminal
+/// (`fetch`). The `build` step has its own runner so it can capture the JSON
+/// machine messages that report artifact paths.
 fn cargo_command(
     subcommand: &str,
     manifest: &Path,
     options: &InstallOptions,
-    build: bool,
 ) -> Result<(), String> {
     let mut command = Command::new("cargo");
     command.arg(subcommand).arg("--manifest-path").arg(manifest);
-    if build {
-        command
-            .arg("--package")
-            .arg(&options.package)
-            .arg("--release")
-            .arg("--target-dir")
-            .arg(manifest.parent().unwrap().join("target"));
-    }
     if options.locked {
         command.arg("--locked");
     }
@@ -1284,6 +1915,145 @@ fn cargo_command(
     } else {
         Err(format!("cargo {subcommand} exited with {status}"))
     }
+}
+
+/// Result of `cargo build --message-format=json-render-diagnostics` for the
+/// temporary installer workspace.
+///
+/// Cargo's build-dir layout is explicitly internal and changed in 1.100.0
+/// (#15010), which dropped `<profile>/deps` in favour of
+/// `<profile>/build/<pkg>/<meta>/out`. The JSON machine messages are the
+/// supported way to learn where a cdylib actually landed, so the artifact paths
+/// are collected here and the directory scan is only a legacy fallback.
+struct CargoBuild {
+    artifacts: Vec<PathBuf>,
+}
+
+impl CargoBuild {
+    /// Resolve exactly one cdylib per requested target, in target order.
+    ///
+    /// Paths reported by Cargo win; only targets Cargo did not name fall back
+    /// to scanning the build directory.
+    fn into_artifacts(
+        self,
+        release_dir: &Path,
+        targets: &[&CargoTarget],
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut artifacts = Vec::with_capacity(targets.len());
+        let mut unresolved = Vec::new();
+        for target in targets {
+            match self
+                .artifacts
+                .iter()
+                .find(|path| artifact_matches_name(path, &target.name))
+            {
+                Some(path) => artifacts.push(path.clone()),
+                None => unresolved.push(*target),
+            }
+        }
+        if !unresolved.is_empty() {
+            // `find_artifacts` reports a single missing target per call, so ask
+            // it for the remaining ones together and preserve their order.
+            let fallback = find_artifacts(release_dir, &unresolved)?;
+            artifacts.extend(fallback);
+        }
+        Ok(artifacts)
+    }
+}
+
+/// Match a built dynamic library against a cdylib target name, tolerating the
+/// platform `lib` prefix and a Cargo metadata hash suffix.
+fn artifact_matches_name(path: &Path, target: &str) -> bool {
+    if !is_dynamic_library(path) {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let stem = normalize_name(stem.trim_start_matches("lib"));
+    let wanted = normalize_name(target);
+    stem == wanted || stem.starts_with(&format!("{wanted}."))
+}
+
+fn cargo_build(
+    manifest: &Path,
+    options: &InstallOptions,
+    targets: &[&CargoTarget],
+) -> Result<CargoBuild, String> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--package")
+        .arg(&options.package)
+        .arg("--release")
+        .arg("--target-dir")
+        .arg(manifest.parent().unwrap().join("target"))
+        .arg("--message-format=json-render-diagnostics");
+    if options.locked {
+        command.arg("--locked");
+    }
+    if crate::args::offline_env_enabled() {
+        command.arg("--offline");
+    }
+    // Keep Cargo's diagnostics on the terminal while the machine messages on
+    // stdout are parsed for artifact locations.
+    command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
+    let output = command
+        .output()
+        .map_err(|error| format!("could not execute cargo: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("cargo build exited with {}", output.status));
+    }
+    let wanted: Vec<String> = targets
+        .iter()
+        .map(|target| normalize_name(&target.name))
+        .collect();
+    let mut artifacts = Vec::new();
+    let mut diagnostics = String::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(rendered) = value
+            .get("message")
+            .and_then(|message| message.get("rendered"))
+            .and_then(|rendered| rendered.as_str())
+        {
+            // `json-render-diagnostics` moves diagnostics onto stdout, so the
+            // rendered text has to be replayed for the user.
+            diagnostics.push_str(rendered);
+            continue;
+        }
+        if value.get("reason").and_then(|reason| reason.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(name) = value
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(|name| name.as_str())
+        else {
+            continue;
+        };
+        if !wanted.contains(&normalize_name(name)) {
+            continue;
+        }
+        artifacts.extend(
+            value
+                .get("filenames")
+                .and_then(|filenames| filenames.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|filename| filename.as_str())
+                .map(PathBuf::from)
+                .filter(|path| is_dynamic_library(path) && path.is_file()),
+        );
+    }
+    if !diagnostics.is_empty() {
+        eprint!("{diagnostics}");
+    }
+    Ok(CargoBuild { artifacts })
 }
 
 fn cargo_metadata(manifest: &Path, options: &InstallOptions) -> Result<CargoMetadata, String> {
@@ -1312,13 +2082,27 @@ fn cargo_metadata(manifest: &Path, options: &InstallOptions) -> Result<CargoMeta
 
 fn find_artifacts(release_dir: &Path, targets: &[&CargoTarget]) -> Result<Vec<PathBuf>, String> {
     let mut artifacts = Vec::new();
+    // Legacy layout (<profile>/ and <profile>/deps) plus the 1.100.0 build-dir
+    // layout (<profile>/build/<pkg>/<meta>/out). Only used as a fallback when
+    // Cargo's JSON messages did not name the artifact.
+    let mut dirs = vec![release_dir.to_path_buf(), release_dir.join("deps")];
+    dirs.extend(build_dir_outputs(release_dir));
     for target in targets {
         let wanted = normalize_name(&target.name);
         let mut matches = Vec::new();
-        for dir in [release_dir.to_path_buf(), release_dir.join("deps")] {
-            let entries = std::fs::read_dir(&dir).map_err(|error| {
-                format!("could not inspect build output {}: {error}", dir.display())
-            })?;
+        for dir in &dirs {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                // Cargo omits `deps/` under the 1.100.0 layout; a missing
+                // candidate directory just contributes no matches.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not inspect build output {}: {error}",
+                        dir.display()
+                    ));
+                }
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !is_dynamic_library(&path) {
@@ -1350,7 +2134,29 @@ fn normalize_name(name: &str) -> String {
     name.replace('-', "_").to_ascii_lowercase()
 }
 
-fn is_dynamic_library(path: &Path) -> bool {
+/// Collect `<profile>/build/<pkg>/<meta>/out` directories created by the
+/// Cargo 1.100.0 build-dir layout. Absent directories simply yield no
+/// candidates so older Cargo versions keep working unchanged.
+fn build_dir_outputs(release_dir: &Path) -> Vec<PathBuf> {
+    let mut outputs = Vec::new();
+    let Ok(packages) = std::fs::read_dir(release_dir.join("build")) else {
+        return outputs;
+    };
+    for package in packages.flatten() {
+        let Ok(units) = std::fs::read_dir(package.path()) else {
+            continue;
+        };
+        for unit in units.flatten() {
+            let out = unit.path().join("out");
+            if out.is_dir() {
+                outputs.push(out);
+            }
+        }
+    }
+    outputs
+}
+
+pub(crate) fn is_dynamic_library(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|extension| extension.to_str())
@@ -1363,6 +2169,34 @@ fn is_dynamic_library(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A staged native artifact must not keep the build-time signature.
+    ///
+    /// The copy's mtime no longer matches the `cs_mtime` inside the linker
+    /// signature, and the kernel answers that mismatch by SIGKILLing the host
+    /// that maps the page (2026-11-07: 35 silent deaths of `rpi`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_native_artifact_is_resigned_before_activation() {
+        let dir = std::env::temp_dir().join(format!("rpi-resign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stage = dir.join("libstaged.dylib");
+        // Any real Mach-O: the copy gets a fresh mtime and a stale signature.
+        std::fs::copy("/bin/cp", &stage).unwrap();
+        resign_staged_native(&stage).unwrap();
+        let out = std::process::Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=4"])
+            .arg(&stage)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !text.contains("linker-signed"),
+            "the staged artifact stayed linker-signed: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -1453,14 +2287,16 @@ mod tests {
                 true,
             )
             .unwrap();
-            assert_eq!(
-                std::fs::read(destination.join("demo.dll")).unwrap(),
-                b"rebuilt"
-            );
             let records = read_native_package_registry_at(&metadata)
                 .unwrap()
                 .into_records();
             assert_eq!(records[0].version, forced.version);
+            let active = destination.join(&records[0].artifacts[0]);
+            assert_eq!(std::fs::read(active).unwrap(), b"rebuilt");
+            assert_eq!(
+                std::fs::read(destination.join("demo.dll")).unwrap(),
+                b"installed"
+            );
         }
         assert_no_native_transaction_files(&destination);
     }
@@ -1475,15 +2311,14 @@ mod tests {
         std::fs::write(destination.join("unowned.dll"), b"unowned").unwrap();
         write_native_packages_at(&metadata, &[native_record("demo")]).unwrap();
         let original_registry = std::fs::read(&metadata).unwrap();
-        let artifact = temp.path().join("unowned.dll");
+        let artifact = temp.path().join("build-unowned.dll");
         std::fs::write(&artifact, b"new").unwrap();
         let mut upgraded = native_record("demo");
         upgraded.version = "2.0.0".into();
-        assert!(
-            install_native_package_at(&destination, &metadata, upgraded, &[artifact], false,)
-                .unwrap_err()
-                .contains("already exists")
-        );
+        let installed =
+            install_native_package_at(&destination, &metadata, upgraded, &[artifact], false)
+                .unwrap();
+        assert_eq!(installed.len(), 1);
         assert_eq!(
             std::fs::read(destination.join("demo.dll")).unwrap(),
             b"installed"
@@ -1492,7 +2327,7 @@ mod tests {
             std::fs::read(destination.join("unowned.dll")).unwrap(),
             b"unowned"
         );
-        assert_eq!(std::fs::read(&metadata).unwrap(), original_registry);
+        assert_ne!(std::fs::read(&metadata).unwrap(), original_registry);
         assert_no_native_transaction_files(&destination);
     }
 
@@ -1600,6 +2435,41 @@ mod tests {
     }
 
     #[test]
+    fn legacy_prebuilt_markers_remain_registry_updatable() {
+        let record: InstalledNativePackage = serde_json::from_value(serde_json::json!({
+            "name":"demo", "version":"1.2.3",
+            "source":"prebuilt:https://github.com/pi-rust/rpi-package",
+            "artifacts":["custom.so"]
+        }))
+        .unwrap();
+        assert!(record.supports_registry_update());
+        assert_eq!(
+            record.legacy_prebuilt_repository(),
+            Some("https://github.com/pi-rust/rpi-package")
+        );
+        // Exact provenance wins; local development builds stay excluded.
+        let mut exact = record.clone();
+        exact.prebuilt = Some(crate::prebuilt_extensions::PrebuiltRecord {
+            repository: "https://github.com/pi-rust/rpi-package".into(),
+            target: "x86_64-apple-darwin".into(),
+            manifest_sha256: "a".repeat(64),
+            source_commit: "b".repeat(40),
+            sdk_version: "0.4.0".into(),
+            plugin_abi: 4,
+            archive_sha256: "c".repeat(64),
+            library_sha256: "d".repeat(64),
+            custom_repository: true,
+            assets: Vec::new(),
+        });
+        assert!(exact.supports_registry_update());
+        assert_eq!(exact.legacy_prebuilt_repository(), None);
+        let mut local = record;
+        local.source = Some("../local-ext".into());
+        assert!(!local.supports_registry_update());
+        assert_eq!(local.legacy_prebuilt_repository(), None);
+    }
+
+    #[test]
     fn uninstall_prebuilt_package_uses_its_recorded_library_name() {
         let agent = TempAgent::new();
         let directory = agent.temp.path().join("extensions");
@@ -1674,6 +2544,38 @@ mod tests {
     }
 
     #[test]
+    fn active_global_artifacts_exclude_retired_versioned_files() {
+        let agent = tempfile::tempdir().unwrap();
+        let extensions = agent.path().join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        let active = "libdemo-v2.0.0-0123456789abcdef0123456789abcdef.dll";
+        let retired = "libdemo-v1.0.0-abcdef0123456789abcdef0123456789.dll";
+        std::fs::write(extensions.join(active), b"active").unwrap();
+        std::fs::write(extensions.join(retired), b"retired").unwrap();
+        std::fs::write(extensions.join("legacy.dll"), b"legacy").unwrap();
+        write_native_packages_at(
+            &agent.path().join(NATIVE_PACKAGES_FILE),
+            &[InstalledNativePackage {
+                name: "demo".into(),
+                version: "2.0.0".into(),
+                source: None,
+                prebuilt: None,
+                artifacts: vec![active.into()],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            active_global_native_package_artifacts_at(agent.path()).unwrap(),
+            vec![extensions.join(active)]
+        );
+        assert_eq!(
+            unregistered_global_native_package_artifacts_at(agent.path()).unwrap(),
+            vec![extensions.join("legacy.dll")]
+        );
+    }
+
+    #[test]
     fn registry_read_rejects_corrupt_json() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(NATIVE_PACKAGES_FILE);
@@ -1705,7 +2607,7 @@ mod tests {
     }
 
     #[test]
-    fn native_install_transaction_replaces_artifacts_and_removes_stale_ones() {
+    fn native_install_transaction_preserves_loaded_artifacts_and_publishes_new_ones() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("extensions");
         let metadata_path = temp.path().join(NATIVE_PACKAGES_FILE);
@@ -1740,25 +2642,32 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(installed.len(), 2);
+        assert!(installed.iter().all(|path| path.exists()));
         assert_eq!(
-            installed,
-            vec![destination.join("new.dll"), destination.join("same.dll")]
-        );
-        assert!(!destination.join("old.dll").exists());
-        assert_eq!(
-            std::fs::read(destination.join("new.dll")).unwrap(),
-            b"new-only"
+            std::fs::read(destination.join("old.dll")).unwrap(),
+            b"old-only"
         );
         assert_eq!(
             std::fs::read(destination.join("same.dll")).unwrap(),
-            b"new-shared"
+            b"old-shared"
         );
+        assert!(installed
+            .iter()
+            .any(|path| { std::fs::read(path).ok().as_deref() == Some(b"new-only".as_slice()) }));
+        assert!(installed
+            .iter()
+            .any(|path| { std::fs::read(path).ok().as_deref() == Some(b"new-shared".as_slice()) }));
         let records = read_native_package_registry_at(&metadata_path)
             .unwrap()
             .into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].version, "2.0.0");
-        assert_eq!(records[0].artifacts, vec!["new.dll", "same.dll"]);
+        let active_names = installed
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0].artifacts, active_names);
         assert_no_native_transaction_files(temp.path());
         assert_no_native_transaction_files(&destination);
     }
@@ -1796,6 +2705,7 @@ mod tests {
                 artifacts: Vec::new(),
             },
             &[build.join("new.dll"), build.join("same.dll")],
+            &[],
             false,
             |_, target| {
                 if target == metadata_path {
@@ -1822,11 +2732,72 @@ mod tests {
         assert_no_native_transaction_files(&destination);
     }
 
+    #[test]
+    fn registry_aware_gc_removes_stale_versioned_cdylibs_but_keeps_active_and_legacy() {
+        let agent = TempAgent::new();
+        let extensions = agent.temp.path().join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        let active = "librpi_web_extension-v0.1.64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.so";
+        let stale = "librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so";
+        let stale_old = "librpi_web_extension-v0.1.63-cccccccccccccccccccccccccccccccc.so";
+        let legacy = "legacy_custom.so";
+        for name in [active, stale, stale_old, legacy] {
+            std::fs::write(extensions.join(name), b"cdylib").unwrap();
+        }
+        write_native_packages_at(
+            &agent.metadata_path(),
+            &[InstalledNativePackage {
+                name: "rpi-web".into(),
+                version: "0.1.64".into(),
+                source: None,
+                prebuilt: None,
+                artifacts: vec![active.into()],
+            }],
+        )
+        .unwrap();
+
+        // `tempfile` hands back `/var/folders/...` on macOS, and the resource
+        // lease rejects a root reached through a symlink (`/var` -> `/private/var`),
+        // so canonicalize before asking for the lease.
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
+        assert_eq!(
+            gc_retired_native_artifacts(&agent_dir),
+            RetiredGcOutcome::Completed
+        );
+        assert!(extensions.join(active).exists());
+        assert!(extensions.join(legacy).exists());
+        assert!(!extensions.join(stale).exists());
+        assert!(!extensions.join(stale_old).exists());
+    }
+
+    #[test]
+    fn registry_aware_gc_is_deferred_while_a_host_holds_the_lease() {
+        let agent = TempAgent::new();
+        let extensions = agent.temp.path().join("extensions");
+        let cwd = agent.temp.path().join("project");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let stale = "librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so";
+        std::fs::write(extensions.join(stale), b"cdylib").unwrap();
+        let _leases = crate::resource_management::host_leases(&cwd).unwrap();
+
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
+        assert_eq!(
+            gc_retired_native_artifacts(&agent_dir),
+            RetiredGcOutcome::Deferred
+        );
+        assert!(extensions.join(stale).exists());
+    }
+
     fn assert_no_native_transaction_files(directory: &Path) {
         for entry in std::fs::read_dir(directory).unwrap() {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
             assert!(!name.contains(".rpi-stage-"), "left staged file: {name}");
             assert!(!name.contains(".rpi-backup-"), "left backup file: {name}");
+            assert!(
+                !name.contains(".rpi-assets-stage-"),
+                "left asset stage: {name}"
+            );
         }
     }
 
@@ -1923,5 +2894,618 @@ mod tests {
         assert!(!agent.metadata_path().exists());
         assert_no_native_transaction_files(agent.temp.path());
         assert_no_native_transaction_files(&extension_dir);
+    }
+
+    /// A prebuilt record whose ledger names `assets`, as the archive installer writes it.
+    fn prebuilt_record(
+        name: &str,
+        version: &str,
+        assets: &[(&str, &[u8])],
+    ) -> InstalledNativePackage {
+        InstalledNativePackage {
+            name: name.into(),
+            version: version.into(),
+            source: Some(format!("prebuilt:https://github.com/owner/{name}")),
+            prebuilt: Some(crate::prebuilt_extensions::PrebuiltRecord {
+                repository: format!("https://github.com/owner/{name}"),
+                target: "x86_64-unknown-linux-gnu".into(),
+                manifest_sha256: "a".repeat(64),
+                source_commit: "b".repeat(40),
+                sdk_version: "0.3.23".into(),
+                plugin_abi: 4,
+                archive_sha256: "c".repeat(64),
+                library_sha256: "d".repeat(64),
+                custom_repository: false,
+                assets: assets
+                    .iter()
+                    .map(|(path, bytes)| crate::prebuilt_extensions::PrebuiltAsset {
+                        path: (*path).into(),
+                        sha256: crate::prebuilt_extensions::hash(bytes),
+                    })
+                    .collect(),
+            }),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn sidecars(assets: &[(&str, &[u8])]) -> Vec<NativeAssetFile> {
+        assets
+            .iter()
+            .map(|(path, bytes)| NativeAssetFile {
+                path: (*path).into(),
+                bytes: bytes.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_asset_upgrade_replaces_sidecars_and_prunes_stale_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"library v1").unwrap();
+        let v1 = [
+            ("runtime/main.mjs", &b"v1"[..]),
+            ("runtime/old.mjs", &b"old"[..]),
+        ];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &v1),
+            std::slice::from_ref(&library),
+            &sidecars(&v1),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("runtime/old.mjs")).unwrap(),
+            b"old"
+        );
+
+        std::fs::write(&library, b"library v2").unwrap();
+        let v2 = [
+            ("runtime/main.mjs", &b"v2"[..]),
+            ("runtime/deep/lib.mjs", &b"deep"[..]),
+        ];
+        let installed = install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "2.0.0", &v2),
+            std::slice::from_ref(&library),
+            &sidecars(&v2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(installed.len(), 3);
+        let active_library = installed
+            .iter()
+            .find(|path| is_dynamic_library(path))
+            .expect("installed library");
+        assert_ne!(active_library, &destination.join("libdemo.so"));
+        assert_eq!(std::fs::read(active_library).unwrap(), b"library v2");
+        assert_eq!(
+            std::fs::read(destination.join("libdemo.so")).unwrap(),
+            b"library v1"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"v2"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("runtime/deep/lib.mjs")).unwrap(),
+            b"deep"
+        );
+        assert!(!destination.join("runtime/old.mjs").exists());
+        let records = read_native_package_registry_at(&metadata)
+            .unwrap()
+            .into_records();
+        assert_eq!(records[0].version, "2.0.0");
+        let ledger: Vec<&str> = recorded_asset_paths(&records[0]);
+        assert_eq!(ledger, vec!["runtime/main.mjs", "runtime/deep/lib.mjs"]);
+        // Dropping every sidecar removes the files and the directories they emptied.
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "3.0.0", &[]),
+            std::slice::from_ref(&library),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(!destination.join("runtime").exists());
+        let records = read_native_package_registry_at(&metadata)
+            .unwrap()
+            .into_records();
+        let active_library = destination.join(&records[0].artifacts[0]);
+        assert_eq!(std::fs::read(active_library).unwrap(), b"library v2");
+        assert_eq!(
+            std::fs::read(destination.join("libdemo.so")).unwrap(),
+            b"library v1"
+        );
+        assert_no_native_transaction_files(temp.path());
+        assert_no_native_transaction_files(&destination);
+    }
+
+    #[test]
+    fn native_asset_failure_during_activation_restores_the_previous_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"old library").unwrap();
+        let v1 = [("runtime/main.mjs", &b"v1"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &v1),
+            std::slice::from_ref(&library),
+            &sidecars(&v1),
+            false,
+        )
+        .unwrap();
+        let original_registry = std::fs::read(&metadata).unwrap();
+
+        std::fs::write(&library, b"new library").unwrap();
+        let v2 = [
+            ("runtime/main.mjs", &b"v2"[..]),
+            ("runtime/extra.mjs", &b"extra"[..]),
+        ];
+        // Replacements activate in order: library, main.mjs, extra.mjs, registry.
+        let error = install_native_package_at_with_hook(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "2.0.0", &v2),
+            std::slice::from_ref(&library),
+            &sidecars(&v2),
+            false,
+            |index, _| {
+                if index == 2 {
+                    Err("injected sidecar activation failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("injected sidecar activation failure"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("libdemo.so")).unwrap(),
+            b"old library"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"v1"
+        );
+        assert!(!destination.join("runtime/extra.mjs").exists());
+        assert_eq!(std::fs::read(&metadata).unwrap(), original_registry);
+        assert_no_native_transaction_files(temp.path());
+        assert_no_native_transaction_files(&destination);
+        assert_no_native_transaction_files(&destination.join("runtime"));
+
+        // The same upgrade succeeds once the failure is gone.
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "2.0.0", &v2),
+            std::slice::from_ref(&library),
+            &sidecars(&v2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"v2"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("runtime/extra.mjs")).unwrap(),
+            b"extra"
+        );
+    }
+
+    #[test]
+    fn native_asset_conflicts_and_overlaps_fail_before_any_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"demo library").unwrap();
+        let other = temp.path().join("libother.so");
+        std::fs::write(&other, b"other library").unwrap();
+        let shared = [("runtime/shared.mjs", &b"other"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("other", "1.0.0", &shared),
+            std::slice::from_ref(&other),
+            &sidecars(&shared),
+            false,
+        )
+        .unwrap();
+        let original_registry = std::fs::read(&metadata).unwrap();
+
+        let attempts: [&[(&str, &[u8])]; 3] = [
+            &[("runtime/shared.mjs", &b"demo"[..])],
+            &[("Runtime/Shared.mjs", &b"demo"[..])],
+            &[("runtime", &b"file"[..]), ("runtime/own.mjs", &b"own"[..])],
+        ];
+        for assets in attempts {
+            let error = install_native_package_with_assets_at(
+                &destination,
+                &metadata,
+                prebuilt_record("demo", "1.0.0", assets),
+                std::slice::from_ref(&library),
+                &sidecars(assets),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("conflicts with asset")
+                    || error.contains("duplicate or overlapping"),
+                "{error}"
+            );
+            assert!(!destination.join("libdemo.so").exists());
+            assert_eq!(
+                std::fs::read(destination.join("runtime/shared.mjs")).unwrap(),
+                b"other"
+            );
+            assert_eq!(std::fs::read(&metadata).unwrap(), original_registry);
+            assert_eq!(
+                std::fs::read_dir(destination.join("runtime"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_no_native_transaction_files(&destination);
+        }
+    }
+
+    #[test]
+    fn native_asset_replacing_an_unowned_file_requires_force() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"demo library").unwrap();
+        std::fs::create_dir_all(destination.join("runtime")).unwrap();
+        std::fs::write(destination.join("runtime/main.mjs"), b"user file").unwrap();
+        let assets = [("runtime/main.mjs", &b"demo"[..])];
+
+        let error = install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &assets),
+            std::slice::from_ref(&library),
+            &sidecars(&assets),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("use --force to replace it"), "{error}");
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"user file"
+        );
+        assert!(!metadata.exists());
+
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &assets),
+            std::slice::from_ref(&library),
+            &sidecars(&assets),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"demo"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_recorded_sidecars_and_only_the_directories_they_empty() {
+        let agent = TempAgent::new();
+        let extension_dir = agent.temp.path().join("extensions");
+        std::fs::create_dir_all(extension_dir.join("runtime/deep")).unwrap();
+        std::fs::write(extension_dir.join("libdemo.so"), b"library").unwrap();
+        std::fs::write(extension_dir.join("runtime/main.mjs"), b"main").unwrap();
+        std::fs::write(extension_dir.join("runtime/deep/lib.mjs"), b"deep").unwrap();
+        std::fs::write(extension_dir.join("runtime/user.mjs"), b"user").unwrap();
+        let mut record = prebuilt_record(
+            "demo",
+            "1.0.0",
+            &[
+                ("runtime/main.mjs", &b"main"[..]),
+                ("runtime/deep/lib.mjs", &b"deep"[..]),
+            ],
+        );
+        record.artifacts = vec!["libdemo.so".into()];
+        write_native_packages_at(&agent.metadata_path(), &[record]).unwrap();
+
+        assert_eq!(uninstall(&args(&["demo"])), 0);
+        assert!(!extension_dir.join("libdemo.so").exists());
+        assert!(!extension_dir.join("runtime/main.mjs").exists());
+        assert!(!extension_dir.join("runtime/deep").exists());
+        assert_eq!(
+            std::fs::read(extension_dir.join("runtime/user.mjs")).unwrap(),
+            b"user"
+        );
+        assert!(!agent.metadata_path().exists());
+        assert_no_native_transaction_files(agent.temp.path());
+        assert_no_native_transaction_files(&extension_dir);
+    }
+
+    #[test]
+    fn native_asset_case_only_rename_prunes_the_old_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"library v1").unwrap();
+        let first = [("Runtime/main.mjs", &b"worker v1"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &first),
+            std::slice::from_ref(&library),
+            &sidecars(&first),
+            false,
+        )
+        .unwrap();
+        let second = [("runtime/main.mjs", &b"worker v2"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.1.0", &second),
+            std::slice::from_ref(&library),
+            &sidecars(&second),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"worker v2"
+        );
+        // The old name is no longer recorded, so it must not survive beside the new one.
+        fn store_files(dir: &Path) -> usize {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        store_files(&path)
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+        assert_eq!(store_files(&destination), 3);
+    }
+
+    #[test]
+    fn native_asset_case_variant_of_an_owned_sidecar_is_not_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"library").unwrap();
+        let first = [("Runtime/main.mjs", &b"worker v1"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &first),
+            std::slice::from_ref(&library),
+            &sidecars(&first),
+            false,
+        )
+        .unwrap();
+        std::fs::create_dir_all(destination.join("runtime")).unwrap();
+        std::fs::write(destination.join("runtime/main.mjs"), b"user file").unwrap();
+        if std::fs::read(destination.join("Runtime/main.mjs")).unwrap() == b"user file" {
+            return; // case-insensitive store: the two names are one file, nothing to test
+        }
+
+        let second = [("runtime/main.mjs", &b"worker v2"[..])];
+        let error = install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.1.0", &second),
+            std::slice::from_ref(&library),
+            &sidecars(&second),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("--force"), "{error}");
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"user file"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("Runtime/main.mjs")).unwrap(),
+            b"worker v1"
+        );
+
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.1.0", &second),
+            std::slice::from_ref(&library),
+            &sidecars(&second),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"worker v2"
+        );
+        assert!(!destination.join("Runtime").exists());
+    }
+
+    #[test]
+    fn native_asset_failed_first_install_removes_the_directories_it_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"library").unwrap();
+        std::fs::create_dir_all(destination.join("keep")).unwrap();
+        let assets = [("runtime/deep/x.mjs", &b"x"[..]), ("keep/y.mjs", &b"y"[..])];
+        // Replacements activate in order: library, x.mjs, y.mjs, registry.
+        let error = install_native_package_at_with_hook(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &assets),
+            std::slice::from_ref(&library),
+            &sidecars(&assets),
+            false,
+            |index, _| {
+                if index == 2 {
+                    Err("injected sidecar activation failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected"), "{error}");
+        assert!(!destination.join("runtime").exists());
+        // A directory that existed before the install is left alone, even though it is empty.
+        assert!(destination.join("keep").is_dir());
+        assert!(!destination.join("libdemo.so").exists());
+        assert!(!metadata.exists());
+        assert_no_native_transaction_files(temp.path());
+        assert_no_native_transaction_files(&destination);
+    }
+
+    #[test]
+    fn native_asset_overlap_within_one_package_is_rejected_before_any_write() {
+        // No other package is installed, so only the intra-package check can reject this.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"demo library").unwrap();
+        let assets = [("runtime", &b"file"[..]), ("runtime/own.mjs", &b"own"[..])];
+
+        let error = install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &assets),
+            std::slice::from_ref(&library),
+            &sidecars(&assets),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate or overlapping"), "{error}");
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        assert!(!metadata.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_asset_parent_links_are_refused_without_writing_through_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let outside = temp.path().join("outside");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"demo library").unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("runtime")).unwrap();
+        let assets = [("runtime/main.mjs", &b"demo"[..])];
+
+        let error = install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &assets),
+            std::slice::from_ref(&library),
+            &sidecars(&assets),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("is not a plain directory"), "{error}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!destination.join("libdemo.so").exists());
+    }
+
+    fn cdylib_target(name: &'static str) -> CargoTarget {
+        CargoTarget {
+            name: name.to_string(),
+            crate_types: vec!["cdylib".to_string()],
+        }
+    }
+
+    #[test]
+    fn find_artifacts_locates_cargo_1_100_build_dir_layout() {
+        // Cargo 1.100.0 moved intermediate artifacts to
+        // `<profile>/build/<pkg>/<meta>/out` and stopped creating `deps`.
+        let temp = tempfile::tempdir().unwrap();
+        let release_dir = temp.path().join("target").join("release");
+        let out = release_dir
+            .join("build")
+            .join("rpi-web")
+            .join("0123456789abcdef")
+            .join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let library = out.join(format!(
+            "{}rpi_web_extension{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        std::fs::write(&library, b"cdylib").unwrap();
+
+        let target = cdylib_target("rpi_web_extension");
+        let found = find_artifacts(&release_dir, &[&target]).unwrap();
+        assert_eq!(found, vec![library]);
+    }
+
+    #[test]
+    fn find_artifacts_skips_missing_build_directories() {
+        // With no `deps/` and no `build/`, the scan must report the missing
+        // artifact instead of failing on the absent directory itself.
+        let temp = tempfile::tempdir().unwrap();
+        let release_dir = temp.path().join("target").join("release");
+        let target = cdylib_target("rpi_web_extension");
+
+        let error = find_artifacts(&release_dir, &[&target]).unwrap_err();
+        assert!(error.contains("no cdylib artifact was found"), "{error}");
+        assert!(!error.contains("could not inspect build output"), "{error}");
+    }
+
+    #[test]
+    fn reported_artifacts_win_over_directory_scans() {
+        // Paths from Cargo's JSON messages are authoritative even when the
+        // legacy layout also contains a matching library.
+        let temp = tempfile::tempdir().unwrap();
+        let release_dir = temp.path().join("target").join("release");
+        std::fs::create_dir_all(release_dir.join("deps")).unwrap();
+        let stale = release_dir.join("deps").join(format!(
+            "{}rpi_web_extension{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        std::fs::write(&stale, b"stale").unwrap();
+        let reported = temp.path().join(format!(
+            "{}rpi_web_extension.abc123{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        std::fs::write(&reported, b"reported").unwrap();
+
+        let target = cdylib_target("rpi_web_extension");
+        let found = CargoBuild {
+            artifacts: vec![reported.clone()],
+        }
+        .into_artifacts(&release_dir, &[&target])
+        .unwrap();
+        assert_eq!(found, vec![reported]);
     }
 }

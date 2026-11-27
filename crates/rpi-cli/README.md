@@ -94,7 +94,7 @@ rpi dev                                        # build + watch a local extension
 
 `rpi install <name>` installs or upgrades an extension without `--force`. An already installed version is skipped; use `--force` to reinstall the same version or allow a downgrade. These rules also apply to explicit Cargo builds and local installs.
 
-`rpi package update` updates all linked project packages and globally installed registry/prebuilt extensions; `rpi package update <name>` selects one package. Updates retain the original Cargo build backend or explicit GitHub repository. Global development installs made with `--path` are excluded from registry updates.
+`rpi extension update` updates all project-linked extensions and globally installed registry/prebuilt extensions; `rpi extension update <name>` selects one extension by name. Add `--cdn <URL>` to download prebuilt archives through an HTTPS CDN; manifests remain on GitHub, CDN failures fall back to GitHub, and project-linked/Cargo-built extensions are unchanged. Updates retain the original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old `rpi package update [name]` remains compatible, but `rpi extension update [name]` is recommended for extension updates. Project linking commands remain `rpi package link`, `rpi package list`, and `rpi package unlink`.
 
 ## Remote mode
 
@@ -127,6 +127,74 @@ For building your own agent, depend on
 [`rpi-agent`](https://crates.io/crates/rpi-agent) and
 [`rpi-harness`](https://crates.io/crates/rpi-harness) directly instead — see
 [docs/agent/project-structure.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent/project-structure.md).
+
+## RPC message identity, images and client text files
+
+`rpi --mode rpc` exposes additive, explicitly negotiated native contracts for
+optional durable message identity, ordered inline PNG/JPEG prompt input, and
+client-authoritative text I/O through the existing built-in read/write/edit
+tools. Legacy text/local operation remains the default; client terminal support
+and an OS filesystem sandbox are not implied. See the
+[native protocol contract](../../docs/message-image-file-io-rpc.md) for gates,
+wire shapes, limits, authority combinations and validation scope. Consumers must
+check `ready` capabilities rather than infer support from a crate version.
+
+## Custom-entry branch queries (RPC and runtime actions)
+
+`get_session_branch` is a filtered custom-entry query, not an unfiltered
+transcript export. RPC example:
+
+```json
+{"id":"preview-1","type":"get_session_branch","customTypes":["durable-state","other-custom-type"],"afterSeq":42,"limit":20,"order":"newestFirst"}
+```
+
+`customTypes` is required and must be a non-empty array of non-blank strings.
+Type identifiers match exactly as written by `append_entry`: whitespace and
+case are preserved, and only exact duplicate identifiers are deduplicated.
+Only `afterSeq` (non-negative integer), `limit` (positive integer), and `order`
+(`oldestFirst`, the default, or `newestFirst`) are optional query arguments.
+The cursor is exclusive in the selected order: `seq > afterSeq` for
+`oldestFirst`, `seq < afterSeq` for `newestFirst`. Type filtering and
+branch ancestry apply before global ordering and limit across all requested
+types. Results are `{"entries":[...],"count":N,"filtered":true}`.
+
+Runtime action `GetSessionBranch` accepts the same query, without RPC's `type`
+and `id` envelope. Both surfaces reject `{}`, unknown fields, and the retired
+query keys `customType`, `custom_type`, `custom_types`, and `after_seq`, even
+when mixed with valid modern keys. This canonical contract has no alias fallback.
+`append_entry` / `AppendEntry` still use singular `customType` for writes.
+
+### Migration from unfiltered hosts
+
+This is a breaking query-contract change: replace unfiltered `{}` or legacy
+arguments with an explicit `customTypes` list. Upgrade the host and consumers
+together. Older hosts may accept the new arguments but ignore them; clients
+requiring filtering **must require `filtered == true`** in the reply and reject
+unsupported hosts rather than treating an unfiltered branch as filtered data.
+Plugin ABI compatibility alone does not establish this query capability.
+`get_messages`, `get_history`, and the append/write protocol are unchanged.
+
+## ToolProgram live branch identity (additive)
+
+`ready.toolProgramBranch` is exactly
+`{"version":1,"command":"get_tool_program_branch","identity":"bindingAndLaneGeneration"}`.
+`{"type":"get_tool_program_branch","id":"branch-1"}` accepts no query arguments.
+Its data is `{sessionId, lane, bindingId, generation, leafId}`: one pinned native
+binding and atomic lane snapshot, bounded to validated identity strings.
+`bindingId` is a live UUIDv4, shared by clones/pins and replaced on every facade
+storage rebind (including back to the same storage); it is not authorization.
+`generation` is the sequence of the latest explicit lane create/move mutation
+(zero for the initial main lane), not the ordinary entry sequence. Appending
+entries does not change it; navigation away/back does. Memory, JSONL cold/warm
+replay and SQLite derive it from existing authoritative lane mutations, without
+a new transcript field or migration. Unsupported custom/experimental backends
+reject the identity read rather than guessing a generation.
+
+Consumers bracket bounded snapshot/live proofs with this identity and keep
+checking retained native begin/phase membership; equal generation alone is not
+child-event proof. The frozen child-query/event v1 profiles, SDK/ABI, cursors,
+permissions, journal and accounting semantics are unchanged. Older hosts retain
+read-only child recovery but do not qualify the new live-proof path.
 
 ## Documentation
 

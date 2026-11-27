@@ -1,8 +1,18 @@
 use super::*;
 use rpi_tui::Component;
 
+mod autocomplete_flicker;
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
+mod clipboard_persistence;
+mod context_panel;
 mod enter_completion;
+mod entry_rendering;
+mod extension_arguments;
+mod native_durable;
 mod session_regressions;
+mod skill_commands;
+mod startup_wiring;
+mod updown_cursor;
 
 #[test]
 fn changelog_command_shows_current_release_and_all_is_explicit() {
@@ -436,13 +446,18 @@ fn markdown_flag_only_comes_from_an_explicit_true() {
 
 /// Minimal `TuiState` for unit tests that only touch state flags. Mirrors
 /// the explicit literals other tests build, but keeps one copy in sync.
-fn test_tui_state() -> Arc<TuiState> {
+pub(super) fn test_tui_state() -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
+        history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -466,6 +481,7 @@ fn test_tui_state() -> Arc<TuiState> {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -477,6 +493,9 @@ fn test_tui_state() -> Arc<TuiState> {
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
+        active_theme_spec: std::sync::Mutex::new(None),
+        theme_watcher: std::sync::Mutex::new(None),
+        theme_registry: std::sync::RwLock::new(crate::themes::ThemeRegistry::default()),
         tui: None,
         current_model_id: std::sync::Mutex::new(String::new()),
         show_images: std::sync::Mutex::new(true),
@@ -485,6 +504,7 @@ fn test_tui_state() -> Arc<TuiState> {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -712,6 +732,66 @@ async fn dequeue_restores_both_queues_images_and_folded_draft_without_aborting()
 }
 
 #[test]
+fn model_selection_dispatches_provider_payload_while_idle() {
+    use rpi_extensions::{ExtensionRegistry, ExtensionSession, PluginKeepalive};
+    use rpi_plugin_sdk::{EventTag, StablePluginEvent};
+
+    static EVENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    extern "C" fn record(raw: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+        // SAFETY: the host keeps the event alive for the duration of the callback.
+        let event = unsafe { rpi_plugin_sdk::events::EventView::from_raw(&raw) };
+        EVENTS
+            .lock()
+            .unwrap()
+            .push(event.data_text().expect("model_select payload"));
+        0
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            EVENTS.lock().unwrap().clear();
+            let harness = AgentHarness::create(Default::default()).await.unwrap();
+            let lane: Arc<dyn AgentLane> = harness.lane("main");
+            let state = test_tui_state();
+            let mut registry = ExtensionRegistry::new();
+            registry.register_event_handler(
+                "test".into(),
+                EventTag::ModelSelect,
+                record,
+                std::ptr::null_mut(),
+            );
+            *state.extension_session.lock().unwrap() = ExtensionSession::from_parts(
+                Arc::new(registry.snapshot()),
+                PluginKeepalive::empty(),
+                vec![],
+                None,
+            );
+            let model = rpi_ai::Model::new(
+                "selected-model",
+                "Selected",
+                rpi_ai::Api::OpenaiCompletions,
+                "selected-provider",
+                "http://selected.invalid",
+            );
+
+            apply_model_selection(&lane, &state, model, false)
+                .await
+                .unwrap();
+
+            let events = EVENTS.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            let payload: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+            assert_eq!(payload["model"]["provider"], "selected-provider");
+            assert_eq!(payload["model"]["id"], "selected-model");
+            drop(events);
+            harness.close().await.unwrap();
+        });
+}
+
+#[test]
 fn hot_cycle_crosses_providers_and_anchors_duplicate_ids_to_the_live_lane() {
     with_isolated_config_dir(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -896,6 +976,43 @@ fn settings_menu_covers_the_wired_settings_surface() {
     assert_eq!(value("cache-miss-notices"), "false");
     assert_eq!(value("terminal-progress"), "true");
     assert_eq!(value("collapse-changelog"), "false");
+}
+
+#[test]
+fn enabling_images_on_an_unsupported_terminal_says_so() {
+    // Driven through the public setting entry point, and the expectation is
+    // derived from the same capability the note is built from, so the probe is
+    // deterministic on any developer terminal (Kitty/Ghostty/WezTerm on CI).
+    // It is a behaviour assertion, not a compile assertion: on the previous
+    // code the note is always "Inline images enabled." and the `None` cell
+    // below fails.
+    let state = test_tui_state();
+    let mut settings = crate::settings::Settings::default();
+    let supported = rpi_tui::get_capabilities().protocol != rpi_tui::ImageProtocol::None;
+
+    let note = apply_setting_change(&state, "show-images", "true", &mut settings)
+        .expect("user-visible note");
+    assert_eq!(settings.show_images, Some(true));
+    assert!(*state.show_images.lock().unwrap());
+
+    if supported {
+        assert_eq!(note, "Inline images enabled.");
+    } else {
+        assert!(
+            note.contains("cannot display them"),
+            "a terminal without an image protocol must not be told images are on: {note}"
+        );
+        assert!(
+            note.contains("placeholder"),
+            "the note must say what the user will see instead: {note}"
+        );
+    }
+
+    // Disabling never carries the capability warning: it is always accurate.
+    let note = apply_setting_change(&state, "show-images", "false", &mut settings)
+        .expect("user-visible note");
+    assert_eq!(note, "Inline images disabled.");
+    assert!(!*state.show_images.lock().unwrap());
 }
 
 #[test]
@@ -1267,16 +1384,22 @@ fn test_layout_renders_welcome_message() {
         StackChild::Entry(StackEntry::new(footer)),
     ]);
 
-    let frame = rpi_tui::render_layout_frame(Arc::new(root), 80, 24);
+    // The badge and welcome hints need a taller viewport.
+    let frame = rpi_tui::render_layout_frame(Arc::new(root), 80, 48);
 
     let all: String = frame.lines.join("\n");
+    let logo_rows = all
+        .lines()
+        .take(crate::brand::render::ROWS)
+        .filter(|l| !l.trim().is_empty())
+        .count();
     assert!(
-        all.contains("rpi"),
-        "Welcome message not found. Rendered: {}",
+        logo_rows >= 8,
+        "Welcome logo not found (only {logo_rows} inked rows). Rendered: {}",
         all
     );
     assert!(
-        all.contains("Type your message"),
+        all.contains("Enter send · Shift+Enter newline"),
         "Help text not found. Rendered: {}",
         all
     );
@@ -1361,17 +1484,15 @@ fn reload_updates_context_header_and_context_panel_without_stale_paths() {
     assert!(header.contains("/new/APPEND_SYSTEM.md"));
     assert!(!header.contains("/old/SYSTEM.md"));
     assert_eq!(*shared.lock().unwrap(), fresh);
-    let panel = Arc::new(Container::new());
-    show_context_panel(&panel, &shared.lock().unwrap());
-    let output = strip_ansi(&panel.render(120).join("\n"));
+    let output = context_panel_lines(&shared.lock().unwrap()).join("\n");
     assert!(output.contains("/new/CLAUDE.md"));
     assert!(!output.contains("/old/SYSTEM.md"));
 
     update_resource_listing(&shared, Some(&listing), Default::default());
     assert!(!strip_ansi(&chat.render(120).join("\n")).contains("Context"));
-    let panel = Arc::new(Container::new());
-    show_context_panel(&panel, &shared.lock().unwrap());
-    assert!(strip_ansi(&panel.render(120).join("\n")).contains("no context files loaded"));
+    assert!(context_panel_lines(&shared.lock().unwrap())
+        .join("\n")
+        .contains("no context files loaded"));
 }
 
 #[test]
@@ -1381,17 +1502,22 @@ fn welcome_header_renders_the_brand_mark() {
     let lines: Vec<String> = chat.render(80).iter().map(|l| strip_ansi(l)).collect();
     let all = lines.join("\n");
 
-    // The three-bar mark: the bottom row carries all three bars, and the
-    // wordmark sits on its baseline next to the middle bar.
+    // The fixed-width lockup is rendered with single-cell half blocks and spans
+    // the first rows of the welcome header.
+    let logo: Vec<&String> = lines.iter().take(crate::brand::render::ROWS).collect();
     assert!(
-        lines.iter().any(|l| l.contains("██ ██ ██")),
-        "brand mark missing: {all}"
+        logo.iter().filter(|l| !l.trim().is_empty()).count() >= 8,
+        "brand logo missing: {all}"
     );
     assert!(
-        all.contains("rpi"),
-        "the mark must carry the product name: {all}"
+        logo.iter()
+            .any(|l| l.contains('█') || l.contains('▀') || l.contains('▄')),
+        "brand logo has no solid ink: {all}"
     );
-
+    assert!(
+        all.contains("interactive TUI"),
+        "the welcome tagline is missing: {all}"
+    );
     // Regression guard for the layout bug this replaced: `π` is East-Asian
     // Ambiguous — width 1 normally, width 2 under a CJK locale — which
     // walked the old box borders out of alignment depending on the user's
@@ -1717,6 +1843,7 @@ fn test_registry_visible_entries_cover_dispatch() {
         "/images",
         "/thinking",
         "/usage",
+        "/context",
         "/skills",
     ] {
         assert!(
@@ -1725,7 +1852,7 @@ fn test_registry_visible_entries_cover_dispatch() {
         );
     }
     // Hidden commands stay off the list.
-    for hidden in ["/context", "/q", "/m", "/v", "/think", "/resume", "/?"] {
+    for hidden in ["/q", "/m", "/v", "/think", "/resume", "/?"] {
         assert!(
             !names.contains(&hidden.to_string()),
             "{hidden} should be hidden from autocomplete"
@@ -1743,11 +1870,16 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
     };
 
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
+        history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -1771,6 +1903,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -1782,6 +1915,9 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
+        active_theme_spec: std::sync::Mutex::new(None),
+        theme_watcher: std::sync::Mutex::new(None),
+        theme_registry: std::sync::RwLock::new(crate::themes::ThemeRegistry::default()),
         tui: None,
         current_model_id: std::sync::Mutex::new(String::new()),
         show_images: std::sync::Mutex::new(true),
@@ -1790,6 +1926,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -1829,6 +1966,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
                 arguments: serde_json::json!({"command": "echo hi"}),
                 thought_signature: None,
                 namespace: None,
+                recorded: None,
             }),
         ],
         api: rpi_ai::Api::AnthropicMessages,
@@ -2254,6 +2392,561 @@ fn provider_login_saves_deepseek_key_and_restores_editor() {
     });
 }
 
+/// A login cancelled with Esc while its exchange ran must not save the
+/// credential that exchange returns late, and a newer flow does not adopt it.
+#[test]
+fn a_cancelled_provider_login_never_saves_a_late_credential() {
+    with_isolated_config_dir(|| {
+        let state = test_tui_state();
+        let editor_container = Arc::new(Container::new());
+        let editor = state.editor.clone();
+        editor_container.add_child(editor.clone());
+        let tui = Arc::new(TuiAltScreen::new(
+            Box::new(ProcessTerminal::new()),
+            true,
+            None,
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let late = || {
+            Ok(serde_json::json!({
+                "version": 1,
+                "kind": "credential",
+                "payload": {"access": "late-access", "refresh": "late-refresh", "expires_at": 0}
+            }))
+        };
+
+        begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+        let Ok(TuiMessage::ProviderOAuthAction {
+            flow_id: cancelled, ..
+        }) = rx.try_recv()
+        else {
+            panic!("begin was not sent");
+        };
+        finish_provider_login(&state, &editor_container, &editor, &tui);
+        handle_provider_oauth_result(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            "acme",
+            "exchange",
+            late(),
+            ProviderOAuthPurpose::Login,
+            cancelled,
+        );
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_none());
+
+        begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+        handle_provider_oauth_result(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            "acme",
+            "exchange",
+            late(),
+            ProviderOAuthPurpose::Login,
+            cancelled,
+        );
+        assert!(
+            crate::config::read_oauth_token("acme").unwrap().is_none(),
+            "a newer flow saved the cancelled flow's credential"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the newer flow's own begin is still sent"
+        );
+        assert!(rx.try_recv().is_err(), "the stale result must not act");
+    });
+}
+
+/// Esc ends an OAuth flow through `finish_provider_login`, which cancels the
+/// call the flow started. The begin call and the exchange each carry the flow's
+/// token, so Esc reaches whichever call is running.
+#[test]
+fn provider_oauth_escape_cancels_the_in_flight_call() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    // Esc while `begin` is running.
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction {
+        action,
+        cancel: begin_cancel,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("begin was not sent");
+    };
+    assert_eq!(action, "begin");
+    assert!(!begin_cancel.is_cancelled());
+    finish_provider_login(&state, &editor_container, &editor, &tui);
+    assert!(begin_cancel.is_cancelled());
+
+    // Esc while `exchange` is running: submit from the input stage, then Esc.
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction {
+        cancel: second_begin_cancel,
+        flow_id,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("second begin was not sent");
+    };
+    assert!(
+        !second_begin_cancel.is_cancelled(),
+        "a new flow must not inherit the cancelled token"
+    );
+    let payload = serde_json::json!({
+        "display": {"title": "Authorize", "url": "https://example.test/auth"}
+    });
+    begin_provider_oauth_input(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        payload,
+        flow_id,
+    );
+    let input = state.active_provider_input.lock().unwrap().clone().unwrap();
+    input.handle_paste("code-value");
+    assert!(handle_provider_login_key(
+        &state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+    let Ok(TuiMessage::ProviderOAuthAction {
+        action,
+        cancel: exchange_cancel,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("exchange was not sent");
+    };
+    assert_eq!(action, "exchange");
+    assert!(!exchange_cancel.is_cancelled());
+    finish_provider_login(&state, &editor_container, &editor, &tui);
+    assert!(exchange_cancel.is_cancelled());
+    // After the flow ends, a stray submit gets an already-cancelled token, and
+    // so does one from that flow after a newer flow began.
+    assert!(state.provider_auth_token(flow_id).is_cancelled());
+    let (newer, newer_cancel) = state.begin_provider_auth();
+    assert!(state.provider_auth_token(flow_id).is_cancelled());
+    assert!(!state.provider_auth_token(newer).is_cancelled());
+    assert!(!newer_cancel.is_cancelled());
+}
+
+/// Esc during logout initialization: one Esc lands after the flow began but
+/// before its status screen showed, which sends no revoke and leaves the editor
+/// usable; one lands on the status screen, which cancels the queued revoke so a
+/// late success for that flow leaves the stored credential alone.
+#[test]
+fn escape_during_logout_initialization_never_revokes_or_sticks() {
+    with_isolated_config_dir(|| {
+        let state = test_tui_state();
+        let editor_container = Arc::new(Container::new());
+        let editor = state.editor.clone();
+        editor_container.add_child(editor.clone());
+        let tui = Arc::new(TuiAltScreen::new(
+            Box::new(ProcessTerminal::new()),
+            true,
+            None,
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        crate::config::upsert_oauth_token("acme", "kept".into(), "kept".into(), 0).unwrap();
+        let logout = || {
+            begin_provider_oauth_logout(
+                &state,
+                &editor_container,
+                &editor,
+                &tui,
+                &tx,
+                "acme",
+                "kept".into(),
+                "kept".into(),
+            )
+        };
+
+        // Esc between the flow start and the status screen.
+        let escape_won = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        settings::AFTER_PROVIDER_FLOW_BEGIN.with(|hook| {
+            let (state, editor_container, editor, tui, escape_won) = (
+                state.clone(),
+                editor_container.clone(),
+                editor.clone(),
+                tui.clone(),
+                escape_won.clone(),
+            );
+            hook.set(Some(Box::new(move || {
+                let won = finish_provider_login(&state, &editor_container, &editor, &tui);
+                escape_won.store(won, std::sync::atomic::Ordering::SeqCst);
+            })))
+        });
+        logout();
+        assert!(
+            escape_won.load(std::sync::atomic::Ordering::SeqCst),
+            "the flow was not live when Esc landed"
+        );
+        assert!(rx.try_recv().is_err(), "a cancelled logout sent a revoke");
+        assert!(editor.is_focused(), "the status screen covered the editor");
+        assert_eq!(
+            state
+                .provider_auth_flow_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+
+        // Esc on the status screen, before the revoke is dispatched.
+        logout();
+        let Ok(TuiMessage::ProviderOAuthAction {
+            action,
+            purpose: ProviderOAuthPurpose::Logout,
+            flow_id,
+            cancel,
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("revoke was not sent");
+        };
+        assert_eq!(action, "revoke");
+        assert!(!cancel.is_cancelled());
+        assert!(finish_provider_login(
+            &state,
+            &editor_container,
+            &editor,
+            &tui
+        ));
+        assert!(
+            cancel.is_cancelled(),
+            "the queued revoke must observe the cancel"
+        );
+        handle_provider_oauth_result(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            "acme",
+            "revoke",
+            Ok(serde_json::json!({"version": 1, "kind": "success", "payload": {}})),
+            ProviderOAuthPurpose::Logout,
+            flow_id,
+        );
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_some());
+        assert!(rx.try_recv().is_err());
+    });
+}
+
+/// An Esc during logout initialization followed at once by a new login leaves
+/// that login running: the logout's late screen check neither cancels it nor
+/// sends a revoke.
+#[test]
+fn a_late_logout_screen_check_leaves_a_newer_flow_running() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    settings::AFTER_PROVIDER_FLOW_BEGIN.with(|hook| {
+        let (state, editor_container, editor, tui, tx) = (
+            state.clone(),
+            editor_container.clone(),
+            editor.clone(),
+            tui.clone(),
+            tx.clone(),
+        );
+        hook.set(Some(Box::new(move || {
+            assert!(finish_provider_login(
+                &state,
+                &editor_container,
+                &editor,
+                &tui
+            ));
+            begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+        })))
+    });
+    begin_provider_oauth_logout(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        "kept".into(),
+        "kept".into(),
+    );
+    let Ok(TuiMessage::ProviderOAuthAction {
+        action,
+        flow_id,
+        cancel,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("the newer login's begin was not sent");
+    };
+    assert_eq!(action, "begin");
+    assert!(rx.try_recv().is_err(), "the cancelled logout sent a revoke");
+    assert!(!cancel.is_cancelled(), "the newer login was cancelled");
+    assert_eq!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        flow_id
+    );
+}
+
+/// A flow's id is published under the token lock, together with its token, so
+/// a reader holding that lock (as Esc does) never sees a flow without its token.
+#[test]
+fn provider_auth_flow_id_is_published_with_its_token() {
+    let state = test_tui_state();
+    let slot = state.provider_auth_cancel.lock().unwrap();
+    let begin = std::thread::spawn({
+        let state = state.clone();
+        move || state.begin_provider_auth()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the flow id was published before its token"
+    );
+    drop(slot);
+    let (flow_id, cancel) = begin.join().unwrap();
+    assert_eq!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        flow_id
+    );
+    assert!(state.end_provider_auth());
+    assert!(cancel.is_cancelled());
+}
+
+/// An interaction result whose flow Esc ended while the form was being shown
+/// leaves the editor usable instead of a form no Esc can dismiss.
+#[test]
+fn an_interaction_form_for_an_ended_flow_restores_the_editor() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction { flow_id, .. }) = rx.try_recv() else {
+        panic!("begin was not sent");
+    };
+    assert!(finish_provider_login(
+        &state,
+        &editor_container,
+        &editor,
+        &tui
+    ));
+    begin_provider_oauth_input(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        serde_json::json!({"display": {"title": "Authorize"}}),
+        flow_id,
+    );
+    assert!(state.active_provider_input.lock().unwrap().is_none());
+    assert!(editor.is_focused());
+    assert!(rx.try_recv().is_err());
+}
+
+/// A failed result that lost its flow to Esc, after which the user began a
+/// newer flow, neither ends that newer flow nor reports an error for it.
+#[test]
+fn a_stale_failed_result_leaves_a_newer_flow_running() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction { flow_id: stale, .. }) = rx.try_recv() else {
+        panic!("begin was not sent");
+    };
+    let newer = Arc::new(std::sync::Mutex::new(None));
+    settings::BEFORE_PROVIDER_FLOW_CLAIM.with(|hook| {
+        let (state, editor_container, editor, tui, tx, newer) = (
+            state.clone(),
+            editor_container.clone(),
+            editor.clone(),
+            tui.clone(),
+            tx.clone(),
+            newer.clone(),
+        );
+        hook.set(Some(Box::new(move || {
+            finish_provider_login(&state, &editor_container, &editor, &tui);
+            begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+            *newer.lock().unwrap() = Some(
+                state.provider_auth_token(
+                    state
+                        .provider_auth_flow_id
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+            );
+        })))
+    });
+    let messages_before = state.chat_container.child_count();
+    handle_provider_oauth_result(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        "begin",
+        Err("network down".to_string()),
+        ProviderOAuthPurpose::Login,
+        stale,
+    );
+    let newer = newer.lock().unwrap().take().expect("Esc did not land");
+    assert!(
+        !newer.is_cancelled(),
+        "the stale result cancelled the newer flow"
+    );
+    assert_ne!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        state.chat_container.child_count(),
+        messages_before,
+        "the stale result reported an error"
+    );
+}
+
+/// Esc that lands after a result passed its flow check, but before the write,
+/// wins the flow: neither the login credential nor the logout delete touches
+/// the store. A completion that claims first leaves Esc nothing to cancel.
+#[test]
+fn escape_between_the_flow_check_and_the_write_keeps_the_store_unchanged() {
+    with_isolated_config_dir(|| {
+        let state = test_tui_state();
+        let editor_container = Arc::new(Container::new());
+        let editor = state.editor.clone();
+        editor_container.add_child(editor.clone());
+        let tui = Arc::new(TuiAltScreen::new(
+            Box::new(ProcessTerminal::new()),
+            true,
+            None,
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let escape_won = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arm_escape = || {
+            let (state, editor_container, editor, tui, escape_won) = (
+                state.clone(),
+                editor_container.clone(),
+                editor.clone(),
+                tui.clone(),
+                escape_won.clone(),
+            );
+            settings::BEFORE_PROVIDER_FLOW_CLAIM.with(|hook| {
+                hook.set(Some(Box::new(move || {
+                    let won = finish_provider_login(&state, &editor_container, &editor, &tui);
+                    escape_won.store(won, std::sync::atomic::Ordering::SeqCst);
+                })))
+            });
+        };
+        let credential = || {
+            Ok(serde_json::json!({
+                "version": 1,
+                "kind": "credential",
+                "payload": {"access": "late-access", "refresh": "late-refresh", "expires_at": 0}
+            }))
+        };
+        let result = |flow_id, purpose, value| {
+            handle_provider_oauth_result(
+                &state,
+                &editor_container,
+                &editor,
+                &tui,
+                &tx,
+                "acme",
+                "exchange",
+                value,
+                purpose,
+                flow_id,
+            )
+        };
+        let begin = |rx: &mut mpsc::UnboundedReceiver<TuiMessage>| {
+            begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+            let Ok(TuiMessage::ProviderOAuthAction { flow_id, .. }) = rx.try_recv() else {
+                panic!("begin was not sent");
+            };
+            flow_id
+        };
+
+        // Login: Esc lands between the check and the write.
+        let flow_id = begin(&mut rx);
+        arm_escape();
+        result(flow_id, ProviderOAuthPurpose::Login, credential());
+        assert!(escape_won.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_none());
+        assert!(rx.try_recv().is_err(), "a cancelled login must not reload");
+
+        // Logout: the revoke succeeded, but Esc won, so the credential stays.
+        crate::config::upsert_oauth_token("acme", "kept".into(), "kept".into(), 0).unwrap();
+        let flow_id = begin(&mut rx);
+        arm_escape();
+        result(
+            flow_id,
+            ProviderOAuthPurpose::Logout,
+            Ok(serde_json::json!({"version": 1, "kind": "success", "payload": {}})),
+        );
+        assert!(escape_won.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_some());
+        assert!(rx.try_recv().is_err());
+
+        // The completion claims first: it saves, and a later Esc ends nothing.
+        crate::config::delete_credential("acme").unwrap();
+        let flow_id = begin(&mut rx);
+        result(flow_id, ProviderOAuthPurpose::Login, credential());
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_some());
+        assert!(!finish_provider_login(
+            &state,
+            &editor_container,
+            &editor,
+            &tui
+        ));
+    });
+}
+
 #[test]
 fn provider_form_saves_provider_to_models_json() {
     with_isolated_config_dir(|| {
@@ -2348,7 +3041,11 @@ fn switch_provider_for_test(
         .block_on(async {
             let harness = AgentHarness::create(Default::default()).await.unwrap();
             let lane = harness.lane("main");
-            let available = crate::provider::catalog_with_manifests(manifests).unwrap();
+            let available = crate::provider::catalog_with_manifests(
+                &crate::config::AgentHome::process(),
+                manifests,
+            )
+            .unwrap();
             let result = switch_provider(input, manifests, &available, &lane).await;
             if let Ok((model, _)) = &result {
                 assert_eq!(lane.get_model().await.unwrap(), *model);
@@ -2412,11 +3109,14 @@ fn provider_switch_applies_live_and_keeps_configured_protocol_for_duplicate_mode
         .unwrap();
         crate::config::save_models_config(&cfg).unwrap();
         let manifest = command_package_manifest("deepseek", "deepseek-flash", true);
-        let response_model = crate::provider::catalog_with_manifests(&[manifest.clone()])
-            .unwrap()
-            .into_iter()
-            .find(|model| model.provider == "deepseek" && model.api == rpi_ai::Api::OpenaiResponses)
-            .unwrap();
+        let response_model = crate::provider::catalog_with_manifests(
+            &crate::config::AgentHome::process(),
+            &[manifest.clone()],
+        )
+        .unwrap()
+        .into_iter()
+        .find(|model| model.provider == "deepseek" && model.api == rpi_ai::Api::OpenaiResponses)
+        .unwrap();
         let available = vec![manifest.models[0].clone(), response_model];
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2601,7 +3301,11 @@ fn provider_commands_respect_package_model_overrides_and_config_removal() {
             "baseUrl": "http://override.example/v1", "models": [{"id": "openrouter/auto", "name": "Override"}]
         }}})).unwrap();
         crate::config::save_models_config(&cfg).unwrap();
-        let catalog = crate::provider::catalog_with_manifests(&manifests).unwrap();
+        let catalog = crate::provider::catalog_with_manifests(
+            &crate::config::AgentHome::process(),
+            &manifests,
+        )
+        .unwrap();
         let models: Vec<_> = catalog
             .iter()
             .filter(|model| model.provider == "openrouter")
@@ -2627,7 +3331,11 @@ fn package_catalog_resolves_header_references_without_binding_credentials() {
             "apiKey":"secret-value", "headers":{"Authorization":"$RPI_TEST_MISSING_PACKAGE_HEADER"}, "models":[]
         }}})).unwrap();
         crate::config::save_models_config(&cfg).unwrap();
-        let catalog = crate::provider::catalog_with_manifests(&manifests).unwrap();
+        let catalog = crate::provider::catalog_with_manifests(
+            &crate::config::AgentHome::process(),
+            &manifests,
+        )
+        .unwrap();
         let model = catalog
             .iter()
             .find(|model| model.provider == "package-gateway")
@@ -2811,11 +3519,16 @@ fn test_autocomplete_slash_suggestions_render() {
     // The autocomplete container should render at least one suggestion
     // line when the editor holds a `/` prefix, and clear when it doesn't.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
+        history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -2839,6 +3552,7 @@ fn test_autocomplete_slash_suggestions_render() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2850,6 +3564,9 @@ fn test_autocomplete_slash_suggestions_render() {
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
+        active_theme_spec: std::sync::Mutex::new(None),
+        theme_watcher: std::sync::Mutex::new(None),
+        theme_registry: std::sync::RwLock::new(crate::themes::ThemeRegistry::default()),
         tui: None,
         current_model_id: std::sync::Mutex::new(String::new()),
         show_images: std::sync::Mutex::new(true),
@@ -2858,6 +3575,7 @@ fn test_autocomplete_slash_suggestions_render() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -2904,11 +3622,16 @@ fn test_select_list_swap_restores_editor() {
     // child; closing restores it. Verify the container child count + the
     // active_selector flag round-trip.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
+        history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -2932,6 +3655,7 @@ fn test_select_list_swap_restores_editor() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2943,6 +3667,9 @@ fn test_select_list_swap_restores_editor() {
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
+        active_theme_spec: std::sync::Mutex::new(None),
+        theme_watcher: std::sync::Mutex::new(None),
+        theme_registry: std::sync::RwLock::new(crate::themes::ThemeRegistry::default()),
         tui: None,
         current_model_id: std::sync::Mutex::new(String::new()),
         show_images: std::sync::Mutex::new(true),
@@ -2951,6 +3678,7 @@ fn test_select_list_swap_restores_editor() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3000,11 +3728,16 @@ fn test_message_history_browse_restores_draft() {
     // messages, browse older → newer → back past the newest restores the
     // draft the user was typing.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
+        history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3028,6 +3761,7 @@ fn test_message_history_browse_restores_draft() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -3039,6 +3773,9 @@ fn test_message_history_browse_restores_draft() {
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
+        active_theme_spec: std::sync::Mutex::new(None),
+        theme_watcher: std::sync::Mutex::new(None),
+        theme_registry: std::sync::RwLock::new(crate::themes::ThemeRegistry::default()),
         tui: None,
         current_model_id: std::sync::Mutex::new(String::new()),
         show_images: std::sync::Mutex::new(true),
@@ -3047,6 +3784,7 @@ fn test_message_history_browse_restores_draft() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3099,11 +3837,16 @@ fn test_message_history_browse_restores_draft() {
 fn test_accept_top_suggestion_replaces_prefix() {
     // `/he` + Tab → `/help ` (slash command provider inserts a space).
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
+        history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3127,6 +3870,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -3138,6 +3882,9 @@ fn test_accept_top_suggestion_replaces_prefix() {
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
+        active_theme_spec: std::sync::Mutex::new(None),
+        theme_watcher: std::sync::Mutex::new(None),
+        theme_registry: std::sync::RwLock::new(crate::themes::ThemeRegistry::default()),
         tui: None,
         current_model_id: std::sync::Mutex::new(String::new()),
         show_images: std::sync::Mutex::new(true),
@@ -3146,6 +3893,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3184,11 +3932,16 @@ fn test_accept_top_suggestion_replaces_prefix() {
 /// installed by each test).
 fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
+        history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3212,6 +3965,7 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -3223,6 +3977,9 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
+        active_theme_spec: std::sync::Mutex::new(None),
+        theme_watcher: std::sync::Mutex::new(None),
+        theme_registry: std::sync::RwLock::new(crate::themes::ThemeRegistry::default()),
         tui: None,
         current_model_id: std::sync::Mutex::new(String::new()),
         show_images: std::sync::Mutex::new(true),
@@ -3231,6 +3988,7 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3757,7 +4515,7 @@ fn ask_user_freeform_submit_releases_dialog_locks_before_callback() {
             }))
             .unwrap();
     }
-    let request = bridge.take_pending().unwrap();
+    let request = bridge.take_pending_for_tui().unwrap();
     let input = Arc::new(Input::new());
     input.handle_paste("自定义回答");
     let state_submit = state.clone();
@@ -3783,7 +4541,7 @@ fn ask_user_freeform_submit_releases_dialog_locks_before_callback() {
         mailbox.poll("freeform").unwrap()["answer"]["text"],
         "自定义回答"
     );
-    assert_eq!(bridge.take_pending().unwrap().request_id, "next");
+    assert_eq!(bridge.take_pending_for_tui().unwrap().request_id, "next");
 }
 
 #[test]
@@ -3857,8 +4615,8 @@ fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {
 #[test]
 fn ask_user_bridge_answers_and_cancels_by_request_id() {
     let mailbox = rpi_extensions::UiDialogMailbox::new();
-    mailbox.attach();
     let bridge = AskUserBridge::new(mailbox.clone());
+    assert!(bridge.attach());
 
     // Two concurrent requests must not cross answers.
     mailbox
@@ -3874,16 +4632,16 @@ fn ask_user_bridge_answers_and_cancels_by_request_id() {
         }))
         .unwrap();
 
-    let first = bridge.take_pending().expect("r1 visible");
+    let first = bridge.take_pending_for_tui().expect("r1 visible");
     assert_eq!(first.request_id, "r1");
     assert!(
-        bridge.take_pending().is_none(),
+        bridge.take_pending_for_tui().is_none(),
         "only one request occupies the input slot"
     );
     bridge.respond("r1", serde_json::json!({"text": "7897"}));
     assert_eq!(mailbox.poll("r1").unwrap()["answer"]["text"], "7897");
 
-    let second = bridge.take_pending().expect("r2 visible");
+    let second = bridge.take_pending_for_tui().expect("r2 visible");
     assert_eq!(second.request_id, "r2");
     bridge.cancel("r2");
     assert_eq!(mailbox.poll("r2").unwrap()["status"], "cancelled");
@@ -4624,7 +5382,7 @@ fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory()
     std::fs::write(&completed, "review fixture").unwrap();
     assert!(!temporary.path().join("report.txt").exists());
     let prefix = format!("@{}", nested.join("repo").display());
-    let expected = format!("@{} ", completed.display());
+    let expected = format!("@{} ", completed.display()).replace('\\', "/");
     let state = test_tui_state();
     state
         .autocomplete
@@ -4642,6 +5400,28 @@ fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory()
         expected,
         "Enter must complete the basename without discarding the directory from the file reference"
     );
+}
+
+#[test]
+fn final_review_pr106_quoted_at_completion_closes_the_quote() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("notes.txt");
+    std::fs::write(&path, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let input = "@\"not";
+    editor.set_text(input);
+    set_editor_cursor_offset(&editor, input, input.len());
+
+    let completion = resolve_enter_completion(&state, &editor).expect("a quoted @ decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(editor.get_text(), "@\"notes.txt\" ");
 }
 
 /// A path candidate that disappears between the decision and the apply must
@@ -4754,7 +5534,7 @@ fn final_review_pr106_path_segment_covers_the_text_after_the_caret() {
     );
     assert_eq!(
         editor.get_text(),
-        format!("@{} ", completed.display()),
+        format!("@{} ", completed.display()).replace('\\', "/"),
         "the whole basename segment is completed, not just the part before the caret"
     );
 
@@ -5011,7 +5791,7 @@ fn final_review_pr106_tab_path_completion_must_preserve_the_parent_directory() {
     );
     assert_eq!(
         editor.get_text(),
-        format!("@{} ", report.display()),
+        format!("@{} ", report.display()).replace('\\', "/"),
         "Tab must complete the basename without discarding the directory"
     );
 

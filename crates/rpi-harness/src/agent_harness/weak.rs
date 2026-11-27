@@ -11,9 +11,13 @@ pub struct WeakAgentHarness {
     bus: HarnessEventBus,
     lane: String,
     message_writes: Arc<tokio::sync::Mutex<()>>,
+    write_failures: Arc<Mutex<Vec<HarnessWriteFailure>>>,
+    unsaved_messages: Arc<Mutex<Vec<UnsavedMessage>>>,
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
+    /// Shared with the owner so a stop request reaches the run loop.
+    stop_round: Arc<std::sync::atomic::AtomicBool>,
 }
 impl AgentHarness {
     pub fn downgrade(&self) -> WeakAgentHarness {
@@ -23,9 +27,12 @@ impl AgentHarness {
             bus: self.bus.clone(),
             lane: self.lane.clone(),
             message_writes: self.message_writes.clone(),
+            write_failures: Arc::clone(&self.write_failures),
+            unsaved_messages: Arc::clone(&self.unsaved_messages),
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
+            stop_round: Arc::clone(&self.stop_round),
         }
     }
 }
@@ -37,9 +44,12 @@ impl WeakAgentHarness {
             bus: self.bus.clone(),
             lane: self.lane.clone(),
             message_writes: self.message_writes.clone(),
+            write_failures: Arc::clone(&self.write_failures),
+            unsaved_messages: Arc::clone(&self.unsaved_messages),
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
+            stop_round: Arc::clone(&self.stop_round),
         })
     }
 }

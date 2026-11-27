@@ -176,6 +176,8 @@ pub struct AgentHarnessStreamOptions {
     pub headers: Option<BTreeMap<String, String>>,
     pub metadata: Option<BTreeMap<String, String>>,
     pub cache_retention: Option<CacheRetention>,
+    /// Budgets for budget-based thinking (settings `thinkingBudgets`).
+    pub thinking_budgets: Option<rpi_ai::ThinkingBudgets>,
 }
 
 /// The harness's pinned subset folded into a real [`SimpleStreamOptions`] per
@@ -214,6 +216,9 @@ impl AgentHarnessStreamOptions {
         }
         if let Some(c) = self.cache_retention {
             base.cache_retention = c;
+        }
+        if self.thinking_budgets.is_some() {
+            base.thinking_budgets = self.thinking_budgets;
         }
         base
     }
@@ -401,6 +406,16 @@ pub struct AgentHarnessOptions {
     /// existing transcript and keeps appending to the same file.
     pub allow_existing_session: bool,
 
+    /// Opt-in native control-journal admission policy, independent of tools.
+    /// Validate each lane's current branch before startup recovery or publishing
+    /// a replacement session, the candidate branch before tree navigation, and
+    /// the current lane before admitted-run/explicit-compaction recovery or
+    /// execution, and again at threshold-triggered automatic compaction boundaries.
+    /// Legacy journals require explicit import; copied receipts do not adopt a
+    /// new session identity. No tools/context are enabled
+    /// by this policy, and default embedders retain their existing behavior.
+    pub require_native_durable: bool,
+
     /// Provider registry keyed by `model.provider`. The harness resolves which
     /// provider serves the configured `model` (and any compaction model) and
     /// calls `provider.stream_simple` inside the `StreamFn` it builds. Mirrors
@@ -502,6 +517,7 @@ impl Default for AgentHarnessOptions {
                 None,
             ),
             allow_existing_session: false,
+            require_native_durable: false,
             models: Vec::new(),
             to_provider_messages: None,
             entry_projectors: BTreeMap::new(),
@@ -562,6 +578,26 @@ mod tests {
         .apply(&mut overlay);
         assert_eq!(overlay.headers, None);
         assert_eq!(overlay.metadata.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn thinking_budgets_reach_the_provider_options() {
+        let budgets = rpi_ai::ThinkingBudgets {
+            high: Some(24576),
+            ..Default::default()
+        };
+        let options = super::AgentHarnessStreamOptions {
+            thinking_budgets: Some(budgets),
+            ..Default::default()
+        };
+        let merged = options.merge_into(rpi_ai::SimpleStreamOptions::default());
+        assert_eq!(merged.thinking_budgets, Some(budgets));
+        let unset = super::AgentHarnessStreamOptions::default().merge_into(merged);
+        assert_eq!(
+            unset.thinking_budgets,
+            Some(budgets),
+            "unset keeps the caller's budgets"
+        );
     }
 
     #[test]

@@ -1,10 +1,45 @@
-//! Editor-swapping selectors for models, sessions, themes, thinking, tools, and images.
+//! Editor-swapping selectors for models, sessions, themes, context, thinking, tools, and images.
 
 use super::*;
 
 // ===========================================================================
 // Selectors — editor-container swap (TS showSelector pattern)
 // ===========================================================================
+
+/// Browse the current resource snapshot without appending notes to the chat.
+/// Both confirm and cancel only dismiss the panel; no resources are unloaded.
+pub(super) fn open_context_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    resources: &rpi_harness::types::AgentHarnessResources,
+) {
+    let items = context_panel_lines(resources)
+        .into_iter()
+        .map(|line| SelectItem::new(&line, &line))
+        .collect();
+    let list = Arc::new(SelectList::new(items, 10));
+    let close = {
+        let state = state.clone();
+        let container = editor_container.clone();
+        let editor = editor.clone();
+        let tui = tui.clone();
+        Arc::new(move || close_selector(&state, &container, &editor, &tui))
+    };
+    list.on_cancel(close.clone());
+    list.on_select(Arc::new(move |_| close()));
+    open_searchable_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        Some("Context — loaded resources"),
+        Some("Esc/Enter close · Type to filter · ↑/↓ browse · /usage for token totals"),
+        list,
+        SelectorKind::Context,
+    );
+}
 
 /// Swap the `editor_container`'s child (the editor) for a `SelectList`,
 /// hiding the editor while the selector is open. Records the selector in
@@ -126,13 +161,12 @@ pub(super) fn open_model_selector(
     catalog: &[rpi_ai::Model],
     lane: &Arc<dyn AgentLane>,
     lane_model_id: &str,
-    chat: &Arc<Container>,
     initial_search: Option<&str>,
 ) -> Option<Arc<SearchableSelectList>> {
     let items = model_selector_items(catalog, lane_model_id);
     if items.is_empty() {
         add_note_message(
-            chat,
+            &state.notice_container(),
             "No models in the catalog. Use --model at startup to select one.",
         );
         tui.request_render(false);
@@ -148,7 +182,7 @@ pub(super) fn open_model_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(model) = find_model_selector_match(&catalog_arc, &item.value) else {
@@ -163,7 +197,7 @@ pub(super) fn open_model_selector(
         let lane = lane_sel.clone();
         let state = state_sel.clone();
         let tui = tui_sel.clone();
-        tokio::spawn(async move {
+        state.session_write_tasks.clone().spawn(async move {
             report_model_selection(&lane, &state, &tui, model, false).await;
         });
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
@@ -227,6 +261,7 @@ pub(super) async fn apply_model_selection(
         .await
         .map_err(|error| format!("Could not switch model: {error}"))?;
     state.set_current_model(&model);
+    dispatch_model_select(state, &model);
     let mut note = format!(
         "Model set to {}/{} — applies to the next message.",
         model.provider, model.id
@@ -244,6 +279,21 @@ pub(super) async fn apply_model_selection(
     Ok(note)
 }
 
+/// Notify extensions immediately, including while the agent is idle. The
+/// payload mirrors the JS extension API's `model_select` event.
+pub(super) fn dispatch_model_select(state: &Arc<TuiState>, model: &rpi_ai::Model) {
+    let snapshot = state
+        .extension_session
+        .lock()
+        .ok()
+        .and_then(|session| session.snapshot_arc());
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let payload = serde_json::json!({ "model": model }).to_string();
+    rpi_extensions::dispatch_data_event(&snapshot, rpi_plugin_sdk::EventTag::ModelSelect, &payload);
+}
+
 pub(super) async fn report_model_selection(
     lane: &Arc<dyn AgentLane>,
     state: &Arc<TuiState>,
@@ -252,8 +302,8 @@ pub(super) async fn report_model_selection(
     save_default: bool,
 ) {
     match apply_model_selection(lane, state, model, save_default).await {
-        Ok(note) => add_note_message(&state.chat_container, &note),
-        Err(error) => add_error_message(&state.chat_container, &error),
+        Ok(note) => add_note_message(&state.notice_container(), &note),
+        Err(error) => add_error_message(&state.notice_container(), &error),
     }
     tui.request_render(false);
 }
@@ -308,6 +358,10 @@ pub(super) fn cycle_prev_model(
 /// selected session directory, newest-first, labelled with the session name or
 /// first prompt so two sessions are distinguishable. Header-only sessions are
 /// skipped: there is nothing to switch to.
+///
+/// The default scope is the current project (fork issue #13). Tab toggles to All,
+/// which tags rows with their project directory. The scope resets to Project on
+/// every open, so it cannot leak between sessions.
 pub(super) fn open_session_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
@@ -315,42 +369,18 @@ pub(super) fn open_session_selector(
     tui: &Arc<TuiAltScreen>,
     tx: &mpsc::UnboundedSender<TuiMessage>,
 ) {
-    let dir = &state.session_dir;
-    let mut items: Vec<SelectItem> = Vec::new();
-    for path in crate::session::list_session_files_sync(dir) {
-        let summary = crate::session::summarize_session_file(&path);
-        if summary.empty {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("(unnamed)")
-            .to_string();
-        let label = crate::session::session_display_label(&summary);
-        // The file stem is `<timestamp>_<uuid>`; the id tail disambiguates rows
-        // that share a timestamp.
-        let id_tail = stem.rsplit('_').next().unwrap_or(&stem);
-        let short_id = crate::session::short_session_id(id_tail);
-        let description = format!(
-            "{} · {}",
-            crate::session::format_session_bytes(summary.bytes),
-            short_id,
-        );
-        items.push(
-            SelectItem::new(&stem, &label)
-                .with_description(&description)
-                .with_search_text(&format!("{label} {short_id} {stem}")),
-        );
-    }
-    if items.is_empty() {
-        add_note_message(
-            &state.chat_container,
-            "No saved sessions found. Sessions are created automatically in interactive mode.",
-        );
-        tui.request_render(false);
-        return;
-    }
+    *state.session_scope.lock().unwrap() = crate::session::SessionScope::Project;
+    let scope = *state.session_scope.lock().unwrap();
+    let items = session_selector_items(state, scope);
+    // Keep the picker installed even with zero rows: it advertises Tab for All,
+    // and without an active selector the key loop cannot own Tab. The empty
+    // list renders "No matching items"; Tab then rebuilds the rows in place.
+    let description = if items.is_empty() {
+        "No sessions for this project · Tab: all projects"
+    } else {
+        "Type to filter · Tab: all projects"
+    };
+    let description = description.to_string();
     let mut list = SelectList::new(items, 10);
     list.set_layout(rpi_tui::SelectListLayoutOptions {
         min_primary_column_width: Some(56),
@@ -385,10 +415,82 @@ pub(super) fn open_session_selector(
         editor,
         tui,
         Some("Resume session"),
-        Some("Type to filter sessions"),
+        Some(&description),
         list,
         SelectorKind::Session,
     );
+}
+
+/// Key-loop hook: a bare Tab in the open `/session` selector toggles its scope.
+/// Split out of the key loop so the routing itself is probe-able (the loop's
+/// `selector_open()` branch is not reachable from a unit test).
+pub(super) fn selector_owns_key(state: &Arc<TuiState>, key: &KeyEvent) -> bool {
+    key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE && toggle_session_scope(state)
+}
+
+/// Tab in the open `/session` selector swaps the scope and rebuilds the rows in
+/// place. The typed filter is re-applied from the search input so switching
+/// scope cannot silently widen an active query. Returns false when the active
+/// selector is not the session picker, letting the key loop fall through.
+pub(super) fn toggle_session_scope(state: &Arc<TuiState>) -> bool {
+    let guard = state.active_selector.lock().unwrap();
+    let Some((SelectorView::Searchable(searchable), SelectorKind::Session)) = guard.as_ref() else {
+        return false;
+    };
+    let searchable = searchable.clone();
+    drop(guard);
+    let mut scope = state.session_scope.lock().unwrap();
+    let next = scope.toggled();
+    *scope = next;
+    drop(scope);
+    let filter = searchable.input().get_value();
+    let list = searchable.list();
+    list.set_items(session_selector_items(state, next));
+    list.set_filter(&filter);
+    true
+}
+
+/// Build rows for one scope. The All view prefixes each row with its project so
+/// a flat list stays attributable; the project view uses the cwd-encoded
+/// directory the repo itself writes into.
+fn session_selector_items(
+    state: &Arc<TuiState>,
+    scope: crate::session::SessionScope,
+) -> Vec<SelectItem> {
+    let mut items: Vec<SelectItem> = Vec::new();
+    for entry in crate::session::list_session_files_in_scope_sync(
+        &state.session_cwd,
+        &state.session_dir,
+        scope,
+    ) {
+        let summary = crate::session::summarize_session_file(&entry.path);
+        if summary.empty {
+            continue;
+        }
+        let stem = entry
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(unnamed)")
+            .to_string();
+        let label = crate::session::session_display_label(&summary);
+        let id_tail = stem.rsplit('_').next().unwrap_or(&stem);
+        let short_id = crate::session::short_session_id(id_tail);
+        let mut description = format!(
+            "{} · {}",
+            crate::session::format_session_bytes(summary.bytes),
+            short_id,
+        );
+        if let Some(project) = &entry.project {
+            description = format!("{project} · {description}");
+        }
+        items.push(
+            SelectItem::new(&stem, &label)
+                .with_description(&description)
+                .with_search_text(&format!("{label} {short_id} {stem}")),
+        );
+    }
+    items
 }
 
 pub(super) fn custom_entry_display_text(
@@ -411,6 +513,103 @@ pub(super) fn custom_entry_display_text(
     Some(format!("{label}: {text}"))
 }
 
+/// Max characters (not bytes) kept in a user-message preview. Char-boundary
+/// safe on multi-byte text — `&text[..n]` would panic there.
+const TREE_PREVIEW_MAX_CHARS: usize = 60;
+
+/// One-line preview of a user message's text content, or `None` when there is
+/// nothing meaningful to show. Only user messages get previews: assistant,
+/// toolResult, and custom entries keep the plain `type #seq` row (tool output
+/// is long and noisy), per the #387 review. Newlines and whitespace runs are
+/// collapsed to single spaces so a multi-line message cannot break the row.
+/// A message with no text but with image blocks yields an `[image]` placeholder
+/// instead of a blank line.
+fn user_message_preview(entry: &Entry) -> Option<String> {
+    let AgentMessage::User(user) = entry.as_message()? else {
+        return None;
+    };
+    // Collapse whitespace runs while copying, stopping one character past the
+    // budget: a long paste costs a bounded amount of work instead of a
+    // `collect::<Vec<_>>()` of every word plus a joined copy. The prefix built
+    // here is character-identical to `split_whitespace().join(" ")`.
+    let text = user_message_text(user);
+    let mut collapsed = String::new();
+    let mut chars = 0usize;
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !collapsed.is_empty();
+            continue;
+        }
+        if pending_space {
+            if chars > TREE_PREVIEW_MAX_CHARS {
+                break;
+            }
+            collapsed.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        if chars > TREE_PREVIEW_MAX_CHARS {
+            break;
+        }
+        collapsed.push(ch);
+        chars += 1;
+    }
+    if chars > TREE_PREVIEW_MAX_CHARS {
+        let truncated: String = collapsed.chars().take(TREE_PREVIEW_MAX_CHARS).collect();
+        return Some(format!("{truncated}…"));
+    }
+    if collapsed.is_empty() {
+        let has_image = match &user.content {
+            rpi_ai::types::UserContent::Blocks(blocks) => blocks
+                .iter()
+                .any(|block| matches!(block, Content::Image(_))),
+            rpi_ai::types::UserContent::Text(_) => false,
+        };
+        if has_image {
+            return Some("[image]".to_string());
+        }
+        return None;
+    }
+    Some(collapsed)
+}
+
+/// Build the `/tree` row for one entry. Keeps the existing `type #seq` label
+/// (`(current)` marker on the leaf), the short id, and the type/seq/id search
+/// text; a user-message preview rides along in the description and the search
+/// text so the filter box can match "what I said" (issue #387).
+fn tree_entry_item(entry: &Entry, is_current: bool) -> SelectItem {
+    let label = if is_current {
+        format!("{} #{} (current)", entry.entry_type(), entry.seq())
+    } else {
+        format!("{} #{}", entry.entry_type(), entry.seq())
+    };
+    let short_id = &entry.id()[..entry.id().len().min(12)];
+    let preview = user_message_preview(entry);
+    let description = match &preview {
+        Some(text) => format!("{short_id} — {text}"),
+        None => short_id.to_string(),
+    };
+    // Search on the entry type, sequence, and id so `/tree` stays usable in
+    // long sessions, plus the user-message preview so a remembered phrase is
+    // enough to find the right fork point.
+    let mut search_text = format!("{} {} {}", entry.entry_type(), entry.seq(), entry.id());
+    if let Some(text) = &preview {
+        search_text.push(' ');
+        search_text.push_str(text);
+    }
+    SelectItem::new(entry.id(), &label)
+        .with_description(&description)
+        .with_search_text(&search_text)
+}
+
+/// Index of the current leaf in the `/tree` entry list, so the selector opens
+/// centered on where the user already is instead of the oldest entry.
+fn tree_current_index(entries: &[Entry], current: Option<&str>) -> Option<usize> {
+    let current_id = current?;
+    entries.iter().position(|entry| entry.id() == current_id)
+}
+
 /// Open a selector for the current session's persisted entry tree. Selecting a
 /// message moves the main lane leaf to that entry, then the caller reloads the
 /// visible branch from durable storage.
@@ -420,7 +619,6 @@ pub(super) async fn open_tree_selector(
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-    chat: &Arc<Container>,
     tx: &mpsc::UnboundedSender<TuiMessage>,
 ) {
     let entries = match harness
@@ -434,7 +632,10 @@ pub(super) async fn open_tree_selector(
     {
         Ok(entries) => entries,
         Err(error) => {
-            add_error_message(chat, &format!("Could not read session tree: {error}"));
+            add_error_message(
+                &state.notice_container(),
+                &format!("Could not read session tree: {error}"),
+            );
             tui.request_render(false);
             return;
         }
@@ -442,27 +643,21 @@ pub(super) async fn open_tree_selector(
     let current = harness.session().get_leaf_id().await.ok().flatten();
     let items: Vec<SelectItem> = entries
         .iter()
-        .map(|entry| {
-            let label = if current.as_deref() == Some(entry.id()) {
-                format!("{} #{} (current)", entry.entry_type(), entry.seq())
-            } else {
-                format!("{} #{}", entry.entry_type(), entry.seq())
-            };
-            let short_id = &entry.id()[..entry.id().len().min(12)];
-            // Search on the entry type, sequence, and id so `/tree` stays
-            // usable in long sessions.
-            let search_text = format!("{} {} {}", entry.entry_type(), entry.seq(), entry.id());
-            SelectItem::new(entry.id(), &label)
-                .with_description(short_id)
-                .with_search_text(&search_text)
-        })
+        .map(|entry| tree_entry_item(entry, current.as_deref() == Some(entry.id())))
         .collect();
     if items.is_empty() {
-        add_note_message(chat, "The current session has no entries to navigate.");
+        add_note_message(
+            &state.notice_container(),
+            "The current session has no entries to navigate.",
+        );
         tui.request_render(false);
         return;
     }
     let list = Arc::new(SelectList::new(items, 12));
+    // Open centered on the current leaf instead of the first (oldest) entry.
+    if let Some(index) = tree_current_index(&entries, current.as_deref()) {
+        list.set_selected_index(index);
+    }
     let state_sel = state.clone();
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
@@ -491,44 +686,59 @@ pub(super) async fn open_tree_selector(
     );
 }
 
-/// Build + open the `/theme` selector. Built-in presets and enabled package
-/// themes are shown; selecting applies the theme live and re-renders.
+/// Build + open the `/theme` selector. Built-in presets come first, then any
+/// discovered custom themes (project + global theme dirs). Selecting applies
+/// the theme live and persists it; custom themes are parsed only on select.
 pub(super) fn open_theme_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
-    let items = vec![
+    let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
+    let registry = state
+        .theme_registry
+        .read()
+        .ok()
+        .map(|registry| registry.clone());
+    if let Some(registry) = registry {
+        for name in registry.names() {
+            items.push(SelectItem::new(name, name));
+        }
+    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = state.chat_container.clone();
+    let chat_sel = state.notice_container();
     list.on_select(Arc::new(move |item| {
-        let preset = match item.value.as_str() {
-            "light" => Some(ThemePreset::Light),
-            "monochrome" => Some(ThemePreset::Monochrome),
-            "dark" => Some(ThemePreset::Dark),
-            name => {
-                add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
-                close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
-                tui_sel.render_now(true);
-                return;
+        let registry = state_sel.theme_registry.read().ok().map(|r| r.clone());
+        match crate::themes::apply_and_persist(
+            &item.value,
+            &state_sel.theme_manager,
+            registry.as_ref(),
+        ) {
+            Ok(message) => {
+                state_sel.set_active_theme_spec(Some(item.value.clone()));
+                if let Some(registry_now) = registry.as_ref() {
+                    crate::themes::restart_theme_watcher(
+                        &state_sel.theme_watcher,
+                        Some(&item.value),
+                        registry_now,
+                        &state_sel.theme_manager,
+                        theme_watch_notify(&state_sel, tui_sel.clone()),
+                    );
+                }
+                add_note_message(&chat_sel, &message);
             }
-        };
-        let Some(preset) = preset else { return };
-        apply_theme_preset(preset);
-        state_sel.theme_manager.apply_preset(preset);
-        // A quick accent note so the user sees the change registered even if
-        // the terminal's own colors mask the preset difference.
-        add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
+            Err(message) => add_error_message(&chat_sel, &message),
+        }
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
         tui_sel.render_now(true);
     }));
@@ -571,7 +781,7 @@ pub(super) fn open_provider_selector(
     );
     if items.is_empty() {
         add_note_message(
-            &state.chat_container,
+            &state.notice_container(),
             "No providers available. Use \"Add new provider\" to configure one in ~/.rpi/agent/models.json.",
         );
         tui.request_render(false);
@@ -645,7 +855,7 @@ pub(super) fn open_login_provider_selector(
     let items = login_provider_items_with_oauth(&manifests, &oauth_providers);
     if items.is_empty() {
         add_note_message(
-            &state.chat_container,
+            &state.notice_container(),
             "No login-capable providers are loaded. Configure a provider or install an extension first.",
         );
         tui.request_render(false);
@@ -698,7 +908,7 @@ pub(super) fn open_logout_provider_selector(
     let items = stored_credential_items();
     if items.is_empty() {
         add_note_message(
-            &state.chat_container,
+            &state.notice_container(),
             "No saved provider credentials found.",
         );
         tui.request_render(false);
@@ -743,7 +953,7 @@ pub(super) fn open_provider_remove_selector(
     let items = removable_provider_items();
     if items.is_empty() {
         add_note_message(
-            &state.chat_container,
+            &state.notice_container(),
             "No removable providers. Only providers defined in ~/.rpi/agent/models.json can be removed.",
         );
         tui.request_render(false);
@@ -755,7 +965,7 @@ pub(super) fn open_provider_remove_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = state.chat_container.clone();
+    let chat_sel = state.notice_container();
     list.on_select(Arc::new(move |item| {
         match remove_provider(&item.value) {
             Ok(note) => add_note_message(&chat_sel, &note),
@@ -850,7 +1060,6 @@ pub(super) fn open_thinking_selector(
     lane: &Arc<dyn AgentLane>,
     catalog: &[rpi_ai::Model],
     lane_model_id: &str,
-    chat: &Arc<Container>,
 ) {
     // Find the current model in the catalog to read its supported levels. If
     // absent, fall back to all levels so the selector still opens.
@@ -869,7 +1078,10 @@ pub(super) fn open_thinking_selector(
         items.push(SelectItem::new(name, name).with_description(thinking_level_description(*lvl)));
     }
     if items.is_empty() {
-        add_note_message(chat, "This model has no supported thinking levels.");
+        add_note_message(
+            &state.notice_container(),
+            "This model has no supported thinking levels.",
+        );
         tui.request_render(false);
         return;
     }
@@ -879,7 +1091,7 @@ pub(super) fn open_thinking_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(level) = thinking_level_from_name(&item.value) else {
@@ -892,7 +1104,7 @@ pub(super) fn open_thinking_selector(
         };
         let lane = lane_sel.clone();
         let footer_sel = state_sel.footer.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_thinking_level(level).await;
         });
         // Reflect the chosen level in the footer's model suffix (pi parity:
@@ -931,7 +1143,6 @@ pub(super) fn open_tools_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     lane: &Arc<dyn AgentLane>,
-    chat: &Arc<Container>,
 ) {
     // Best-effort read of the current active set. The opener runs on the async
     // runtime (it's called from the main loop's channel dispatch or the submit
@@ -971,7 +1182,7 @@ pub(super) fn open_tools_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let mut next = active_captured.clone();
@@ -983,7 +1194,7 @@ pub(super) fn open_tools_selector(
         let on = next.iter().any(|a| a == &item.value);
         let lane = lane_sel.clone();
         let next_clone = next.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_active_tools(next_clone).await;
         });
         let list_str = if next.is_empty() {
@@ -1028,11 +1239,15 @@ pub(super) fn open_images_selector(
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-    chat: &Arc<Container>,
 ) {
     let current = *state.show_images.lock().unwrap();
+    // Say up front that this terminal cannot paint the images, instead of
+    // letting "Inline images enabled" imply they will appear.
+    let can_display = rpi_tui::get_capabilities().protocol != rpi_tui::ImageProtocol::None;
     let items = vec![
-        SelectItem::new("yes", "Yes").with_description(if current {
+        SelectItem::new("yes", "Yes").with_description(if !can_display {
+            "Inline images (this terminal shows placeholders)"
+        } else if current {
             "Inline images (current)"
         } else {
             "Inline images"
@@ -1049,13 +1264,13 @@ pub(super) fn open_images_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = chat.clone();
+    let chat_sel = state.notice_container();
     list.on_select(Arc::new(move |item| {
         let on = item.value == "yes";
         state_sel.set_show_images(on);
         add_note_message(
             &chat_sel,
-            &format!("Inline images {}.", if on { "enabled" } else { "disabled" }),
+            &images_setting_note(on, rpi_tui::get_capabilities().protocol),
         );
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
     }));
@@ -1075,4 +1290,281 @@ pub(super) fn open_images_selector(
         list,
         SelectorKind::Images,
     );
+}
+
+#[cfg(test)]
+mod tree_preview_tests {
+    use super::*;
+    use rpi_harness::session::types::{EntryBase, MessageEntry};
+
+    fn message_entry(seq: u64, id: &str, message: AgentMessage) -> Entry {
+        Entry::Message(MessageEntry {
+            base: EntryBase {
+                entry_type: "message".to_string(),
+                id: id.to_string(),
+                seq,
+                parent_id: None,
+                timestamp: 0,
+            },
+            message,
+            terminate: None,
+        })
+    }
+
+    fn user_entry(seq: u64, id: &str, content: rpi_ai::types::UserContent) -> Entry {
+        message_entry(
+            seq,
+            id,
+            AgentMessage::User(rpi_ai::types::UserMessage::new(content, 0)),
+        )
+    }
+
+    fn text_blocks(texts: &[&str]) -> Vec<Content> {
+        texts
+            .iter()
+            .map(|text| {
+                Content::Text(rpi_ai::types::TextContent {
+                    kind: rpi_ai::types::TextContentType,
+                    text: (*text).to_string(),
+                    text_signature: None,
+                })
+            })
+            .collect()
+    }
+
+    fn image_block() -> Content {
+        Content::Image(rpi_ai::types::ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: std::sync::Arc::from("aGk="),
+            mime_type: "image/png".to_string(),
+        })
+    }
+
+    #[test]
+    fn user_message_preview_joins_and_collapses_whitespace() {
+        let entry = user_entry(
+            1,
+            "e1",
+            rpi_ai::types::UserContent::Blocks(text_blocks(&[
+                "帮我看看\n这个 panic",
+                "  第二段  \t文本",
+            ])),
+        );
+        let preview = user_message_preview(&entry).expect("text blocks yield a preview");
+        assert_eq!(preview, "帮我看看 这个 panic 第二段 文本");
+
+        let item = tree_entry_item(&entry, false);
+        assert_eq!(item.label, "message #1");
+        assert_eq!(
+            item.description.as_deref(),
+            Some("e1 — 帮我看看 这个 panic 第二段 文本")
+        );
+        let search = item.search_text.expect("search text is always set");
+        assert!(search.starts_with("message 1 e1 "));
+        assert!(
+            search.contains("帮我看看 这个 panic"),
+            "search text must include the preview: {search}"
+        );
+    }
+
+    #[test]
+    fn user_message_preview_truncates_on_char_boundaries() {
+        let long = "好".repeat(TREE_PREVIEW_MAX_CHARS + 20);
+        let entry = user_entry(2, "e2", rpi_ai::types::UserContent::Text(long));
+        let preview = user_message_preview(&entry).expect("long text yields a preview");
+        let chars: Vec<char> = preview.chars().collect();
+        assert_eq!(chars.len(), TREE_PREVIEW_MAX_CHARS + 1);
+        assert_eq!(chars.last().copied(), Some('…'));
+        // All 60 kept characters are intact CJK chars, no split multi-byte panics.
+        assert!(chars[..TREE_PREVIEW_MAX_CHARS].iter().all(|&c| c == '好'));
+    }
+
+    #[test]
+    fn user_message_preview_stops_at_the_budget_instead_of_collapsing_everything() {
+        // Many words whose collapsed form far exceeds the budget: the preview
+        // must be exactly the first `TREE_PREVIEW_MAX_CHARS` collapsed chars
+        // plus the ellipsis, without materializing the whole collapsed string.
+        let long = "word ".repeat(10_000);
+        let entry = user_entry(20, "e20", rpi_ai::types::UserContent::Text(long));
+        let preview = user_message_preview(&entry).expect("long text yields a preview");
+        let chars: Vec<char> = preview.chars().collect();
+        assert_eq!(chars.len(), TREE_PREVIEW_MAX_CHARS + 1);
+        assert_eq!(chars.last().copied(), Some('…'));
+        let collapsed_prefix: String = "word "
+            .repeat(20)
+            .chars()
+            .take(TREE_PREVIEW_MAX_CHARS)
+            .collect();
+        assert_eq!(
+            chars[..TREE_PREVIEW_MAX_CHARS].iter().collect::<String>(),
+            collapsed_prefix,
+            "the bounded builder must match the collapsed prefix"
+        );
+
+        // Exactly at the budget: no ellipsis. One past it: ellipsis.
+        let exact = "好".repeat(TREE_PREVIEW_MAX_CHARS);
+        let exact_entry = user_entry(21, "e21", rpi_ai::types::UserContent::Text(exact.clone()));
+        assert_eq!(
+            user_message_preview(&exact_entry).as_deref(),
+            Some(exact.as_str())
+        );
+
+        let over = "好".repeat(TREE_PREVIEW_MAX_CHARS + 1);
+        let over_entry = user_entry(22, "e22", rpi_ai::types::UserContent::Text(over));
+        let over_preview = user_message_preview(&over_entry).expect("preview");
+        assert_eq!(over_preview.chars().count(), TREE_PREVIEW_MAX_CHARS + 1);
+        assert!(over_preview.ends_with('…'));
+    }
+
+    #[test]
+    fn image_only_user_message_gets_placeholder() {
+        let entry = user_entry(
+            3,
+            "e3",
+            rpi_ai::types::UserContent::Blocks(vec![image_block()]),
+        );
+        let item = tree_entry_item(&entry, false);
+        assert_eq!(user_message_preview(&entry).as_deref(), Some("[image]"));
+        assert_eq!(item.description.as_deref(), Some("e3 — [image]"));
+    }
+
+    #[test]
+    fn mixed_text_and_image_blocks_preview_text_only() {
+        let entry = user_entry(
+            4,
+            "e4",
+            rpi_ai::types::UserContent::Blocks(vec![
+                image_block(),
+                text_blocks(&["截图里的报错"])[0].clone(),
+            ]),
+        );
+        assert_eq!(
+            user_message_preview(&entry).as_deref(),
+            Some("截图里的报错"),
+            "image blocks next to text must not blank the preview"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_user_message_has_no_preview() {
+        let entry = user_entry(
+            5,
+            "e5",
+            rpi_ai::types::UserContent::Text("  \n\t ".to_string()),
+        );
+        assert_eq!(user_message_preview(&entry), None);
+        let item = tree_entry_item(&entry, false);
+        assert_eq!(item.description.as_deref(), Some("e5"));
+    }
+
+    #[test]
+    fn non_user_entries_keep_plain_rows() {
+        let assistant = {
+            let mut a = rpi_ai::types::AssistantMessage::empty(
+                rpi_ai::Api::AnthropicMessages,
+                "anthropic",
+                "m",
+                0,
+            );
+            a.content = text_blocks(&["very long assistant reply that must not appear"]);
+            a
+        };
+        let tool_result = rpi_agent::message::AgentMessage::ToolResult(Box::new(
+            rpi_ai::types::ToolResultMessage {
+                role: rpi_ai::types::ToolResultRole,
+                tool_call_id: "tc1".to_string(),
+                tool_name: "bash".to_string(),
+                content: text_blocks(&["tool output noise"]),
+                details: None,
+                usage: None,
+                added_tool_names: Vec::new(),
+                is_error: false,
+                timestamp: 0,
+            },
+        ));
+        let entries = vec![
+            message_entry(
+                6,
+                "e6",
+                rpi_agent::message::AgentMessage::Assistant(Box::new(assistant)),
+            ),
+            message_entry(7, "e7", tool_result),
+            Entry::ModelChange(rpi_harness::session::types::ModelChangeEntry {
+                base: EntryBase {
+                    entry_type: "model_change".to_string(),
+                    id: "e8".to_string(),
+                    seq: 8,
+                    parent_id: None,
+                    timestamp: 0,
+                },
+                provider: "anthropic".to_string(),
+                model_id: "m".to_string(),
+            }),
+        ];
+        for entry in &entries {
+            assert_eq!(user_message_preview(entry), None, "{entry:?}");
+            let item = tree_entry_item(entry, false);
+            assert!(
+                !item.description.as_deref().unwrap().contains("—"),
+                "{item:?}"
+            );
+            let search = item.search_text.unwrap();
+            assert!(!search.contains("noise"));
+            assert!(!search.contains("reply"));
+        }
+    }
+
+    #[test]
+    fn current_entry_keeps_marker_and_short_id() {
+        let entry = user_entry(
+            9,
+            "abcdefghijklmn",
+            rpi_ai::types::UserContent::Text("hi".into()),
+        );
+        let current = tree_entry_item(&entry, true);
+        assert_eq!(current.label, "message #9 (current)");
+        assert!(current
+            .description
+            .as_deref()
+            .unwrap()
+            .starts_with("abcdefghijkl — hi"));
+
+        let not_current = tree_entry_item(&entry, false);
+        assert_eq!(not_current.label, "message #9");
+    }
+
+    #[test]
+    fn tree_current_index_finds_leaf_position() {
+        let entries: Vec<Entry> = ["e1", "e2", "e3"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                user_entry(
+                    i as u64 + 1,
+                    id,
+                    rpi_ai::types::UserContent::Text(format!("msg {id}")),
+                )
+            })
+            .collect();
+        assert_eq!(tree_current_index(&entries, Some("e2")), Some(1));
+        assert_eq!(tree_current_index(&entries, Some("e3")), Some(2));
+    }
+
+    #[test]
+    fn tree_current_index_without_current_or_missing_id_is_none() {
+        let entries: Vec<Entry> = ["e1", "e2"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                user_entry(
+                    i as u64 + 1,
+                    id,
+                    rpi_ai::types::UserContent::Text(format!("msg {id}")),
+                )
+            })
+            .collect();
+        assert_eq!(tree_current_index(&entries, None), None);
+        assert_eq!(tree_current_index(&entries, Some("gone")), None);
+        assert_eq!(tree_current_index(&[], Some("e1")), None);
+    }
 }

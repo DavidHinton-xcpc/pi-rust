@@ -30,10 +30,10 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
@@ -58,15 +58,64 @@ use crate::args::Args;
 use crate::docs_tool::create_docs_tool;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
-    discover_append_system_prompt_file, discover_system_prompt_file, extension_dirs,
-    global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
     load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
-    project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
+    project_prompt_template_dirs, project_skill_dirs,
 };
+use crate::startup_diagnostics::{Phase, StartupSpan};
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
-    PluginDiagnostics, PluginToolAdapter, TeeEmitter,
+    PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
 };
+
+// Preserve the existing public modes::rpc signature. This CLI-only attachment
+// table holds no session/router alive and keys by storage allocation identity,
+// NOT by a durable ID (two independent restored hosts must never share routing).
+// The session/tools/ReloadContext own the actual router. RPC owns its client.
+// Reload MUST reuse ReloadContext::file_io, including a disconnected selected
+// client backend; rebuilding a default router would silently restore host file
+// authority. Missing attachments reject configuration (never infer a router or
+// install host-backed replacements). This compatibility bridge can be replaced
+// by an explicit neutral harness attachment when its public API is revised.
+type FileIOAttachment = (
+    std::sync::Weak<dyn rpi_harness::session::types::SessionStorage>,
+    std::sync::Weak<rpi_tools::file_io::FileIORouter>,
+);
+fn file_io_attachments() -> &'static Mutex<Vec<FileIOAttachment>> {
+    static ATTACHMENTS: std::sync::OnceLock<Mutex<Vec<FileIOAttachment>>> =
+        std::sync::OnceLock::new();
+    ATTACHMENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+pub(crate) fn register_file_io_router(
+    harness: &AgentHarness,
+    router: &Arc<rpi_tools::file_io::FileIORouter>,
+) {
+    let storage = harness.session().storage();
+    let mut attachments = file_io_attachments()
+        .lock()
+        .expect("file I/O attachments poisoned");
+    attachments.retain(|(s, r)| {
+        s.strong_count() > 0
+            && r.strong_count() > 0
+            && !s
+                .upgrade()
+                .is_some_and(|known| Arc::ptr_eq(&known, &storage))
+    });
+    attachments.push((Arc::downgrade(&storage), Arc::downgrade(router)));
+}
+pub(crate) fn file_io_router(
+    harness: &AgentHarness,
+) -> Option<Arc<rpi_tools::file_io::FileIORouter>> {
+    let storage = harness.session().storage();
+    let mut attachments = file_io_attachments()
+        .lock()
+        .expect("file I/O attachments poisoned");
+    attachments.retain(|(s, r)| s.strong_count() > 0 && r.strong_count() > 0);
+    attachments.iter().find_map(|(s, r)| {
+        s.upgrade()
+            .filter(|known| Arc::ptr_eq(known, &storage))
+            .and_then(|_| r.upgrade())
+    })
+}
 
 /// The coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
@@ -74,7 +123,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs
 /// The default coding system prompt for the CLI's built-in tools.
 ///
 /// This retains the two-argument API for library callers. Session startup and
-/// reload use [`default_system_prompt_with_tools`] with the actual active tools.
+/// reload use [`default_system_prompt_with_tool_prompts`] with the actual active
+/// tools and their winning extension metadata.
 pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
     let tools = BUILTIN_TOOL_NAMES
         .iter()
@@ -87,98 +137,106 @@ pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> Strin
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 ///
 /// `tools` is the active tool set after `--tools`/`--exclude-tools` and
-/// extension merging: the prompt lists only those tools and keeps only the
-/// guidelines that mention one of them, so a restricted run is never told it
-/// can edit or track todos (pi builds its list from the selected tools too).
+/// extension merging. Like pi, the text list includes only tools with an
+/// explicit prompt snippet; other active tools remain available through their
+/// provider-facing schemas. Tool-specific guidelines still follow the full
+/// active set, so restricted runs get no guidance for unavailable tools.
 pub fn default_system_prompt_with_tools(
     cwd: &str,
     prior_reasoning_replayed: bool,
     tools: &[String],
 ) -> String {
-    let has = |name: &str| tools.iter().any(|tool| tool == name);
-    let todo_hint = if has("todo") {
-        ", or the todo tool"
-    } else {
-        ""
-    };
+    default_system_prompt_with_tool_prompts(cwd, prior_reasoning_replayed, tools, &BTreeMap::new())
+}
+
+/// Render pi-style explicit prompt contributions for the active tool set.
+/// Entries override built-in metadata, including an empty entry for an
+/// extension that replaces a built-in without contributing a prompt snippet.
+/// Inactive metadata is ignored. Schemas and callable tools are not modified.
+pub fn default_system_prompt_with_tool_prompts(
+    cwd: &str,
+    prior_reasoning_replayed: bool,
+    tools: &[String],
+    overrides: &BTreeMap<String, ToolPromptMetadata>,
+) -> String {
+    let metadata: BTreeMap<_, _> = tools
+        .iter()
+        .map(|name| {
+            let prompt = overrides
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| ToolPromptMetadata {
+                    prompt_snippet: builtin_tool_snippet(name).map(str::to_owned),
+                    prompt_guidelines: Vec::new(),
+                })
+                .normalized();
+            (name.as_str(), prompt)
+        })
+        .collect();
     // The working-state rule must match what actually comes back on the next
     // request. With `compat.requiresThinkingAsText` (or the native thinking
     // channels of anthropic/responses) the model *does* see its own reasoning
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
     let working_state_rule = if prior_reasoning_replayed {
-        format!(
-            "- Keep a SHORT working plan visible (a few bullets{todo_hint}) and update it as you go.
-  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate
-  the whole plan: continue from the last unfinished step, and when a step lands, say which one.
-  Re-listing the same plan without acting on it is a bug, not progress."
-        )
+        "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
+  the plan. Continue from the last unfinished step, and when a step lands, say which one.
+  Re-stating the same plan without acting on it is a bug, not progress."
     } else {
-        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
-  carried into your next turn: only the text you write and the tool output you produce come
-  back. Before each batch of tool calls, write one short line naming the task you are on and
-  what remains. When you finish a step, say which one is done. If you keep the plan only in
-  your head you will re-derive it from scratch every turn."
-            .to_string()
+        "- Your reasoning is not carried into your next turn; only your visible replies and tool
+  output come back. Before each batch of tool calls, write one short line naming the step you
+  are on and what remains, and say which step is done when it lands.
+  Re-stating the same plan without acting on it is a bug, not progress."
     };
 
-    let tool_lines = if tools.is_empty() {
+    // The text list is a selective summary, not the tool registry. In
+    // particular, do not repeat extension tool names without a prompt snippet.
+    let tool_lines = tools
+        .iter()
+        .filter_map(|name| {
+            metadata
+                .get(name.as_str())?
+                .prompt_snippet
+                .as_ref()
+                .map(|snippet| format!("- {name:<5} — {snippet}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tool_lines = if tool_lines.is_empty() {
         "(none)".to_string()
     } else {
-        tools
-            .iter()
-            .map(|name| match builtin_tool_snippet(name) {
-                Some(snippet) => format!("- {name:<5} — {snippet}"),
-                None => format!("- {name}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        tool_lines
     };
 
-    let mut guidelines = vec![
-        "- Reply in the SAME language the user is writing in. Detect the language of the user's
-  latest message (and, when it is too short to be sure, the working language of the
-  conversation so far) and use it for your prose replies. Mirror it unless the user
-  explicitly asks for a different language; only fall back to English when the
-  user's language cannot be determined."
-            .to_string(),
-        "- Be concise in your responses".to_string(),
-        "- Show file paths clearly when working with files".to_string(),
-        "- Prefer the smallest change that solves the problem".to_string(),
-    ];
-    if has("bash") {
-        guidelines.push(
-            "- The bash tool runs Bash, even on Windows. Use ls, find, rg, and POSIX pipelines;
-  do not pass PowerShell cmdlets such as Get-ChildItem, Select-Object, or Select-String.
-  If a powershell tool is available, use it for PowerShell commands."
-                .to_string(),
-        );
-    }
-    guidelines.push(working_state_rule);
-    if has("todo") {
-        guidelines.push(
-            "- Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
-  steps once, then mark them done as you go. Re-stating the same plan without acting on it is
-  a bug, not progress."
-                .to_string(),
-        );
-    } else {
-        guidelines.push(
-            "- Re-stating the same plan without acting on it is a bug, not progress.".to_string(),
-        );
-    }
-    guidelines.push(
+    // Tool-specific rules (Bash on Windows, docs before guessing) live in the
+    // tool's own line or description, not here a second time.
+    let guidelines = [
+        "- Reply in the same language as the user's latest message (the conversation's language when
+  that message is too short to tell), unless the user asks for another.",
+        "- Be concise in your responses",
+        "- Show file paths clearly when working with files",
+        "- Prefer the smallest change that solves the problem",
+        working_state_rule,
         "- Read only what you need. If a file or search result was already shown earlier in this
-  conversation, use it instead of fetching it again."
-            .to_string(),
-    );
-    if has("docs") {
-        guidelines.push(
-            "- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing"
-                .to_string(),
-        );
-    }
-    let guidelines = guidelines.join("\n");
+  conversation, use it instead of fetching it again.",
+    ];
+    // Tools contribute rules even without snippets. Like pi, trim and dedupe
+    // across the full active set and the core rules, preserving first occurrence.
+    let mut seen = HashSet::new();
+    let tool_rules = tools
+        .iter()
+        .flat_map(|name| &metadata[name.as_str()].prompt_guidelines)
+        .map(String::as_str);
+    let core_rules = guidelines
+        .iter()
+        .map(|rule| rule.strip_prefix("- ").unwrap_or(rule));
+    let guidelines = tool_rules
+        .chain(core_rules)
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && seen.insert(*rule))
+        .map(|rule| format!("- {rule}"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
@@ -187,6 +245,8 @@ You help users by reading files, executing commands, editing code, and writing n
 Available tools:
 {tool_lines}
 
+In addition to the tools above, you may have access to other custom tools depending on the project.
+
 Guidelines:
 {guidelines}
 
@@ -194,14 +254,31 @@ Current working directory: {cwd}"
     )
 }
 
+/// Take metadata from the same winning extension definitions used for tool
+/// merging, including empty metadata for overrides. Called on startup/reload.
+fn extension_tool_prompt_metadata(
+    session: &ExtensionSession,
+) -> BTreeMap<String, ToolPromptMetadata> {
+    session
+        .snapshot()
+        .map(|snapshot| {
+            snapshot
+                .tools()
+                .iter()
+                .map(|tool| (tool.tool.name.clone(), tool.prompt.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One-line prompt descriptions of the tools rpi itself registers.
 fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
     Some(match name {
         "read" => "Read file contents",
-        "bash" => "Execute Bash commands using Bash/POSIX syntax, including on Windows",
+        "bash" => "Execute Bash commands (Bash/POSIX syntax, also on Windows)",
         "edit" => "Find/replace edits to existing files",
         "write" => "Create or overwrite files",
-        "docs" => "Look up rpi usage, extension, package, and compatibility documentation",
+        "docs" => "Look up rpi commands, extensions, Pi package compatibility and .rpi configuration instead of guessing",
         "grep" => "Search file contents for a pattern",
         "find" => "Find files by glob pattern",
         "ls" => "List directory contents",
@@ -230,25 +307,60 @@ pub enum SessionSelection {
     /// `--session-id <id>`: use the EXACT session id, creating it if missing.
     ByExactId { id: String, dir: PathBuf },
     /// `--fork <path|id>`: fork the given session into a new one and start in
-    /// the fork.
-    Fork { source: String, dir: PathBuf },
+    /// the fork. `entry_id` optionally cuts the new branch at a message;
+    /// `position` says whether that message stays (`at`) or is dropped
+    /// (`before`). `None` keeps the harness default for an explicit entry
+    /// (`before`).
+    Fork {
+        source: String,
+        dir: PathBuf,
+        entry_id: Option<String>,
+        position: Option<rpi_harness::session::types::ForkPosition>,
+    },
 }
 
 /// Decide the session selection from parsed args + the resolved cwd.
 pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
-    select_session_in_dir(args, configured_session_dir(args, cwd))
+    select_session_for(&crate::config::AgentHome::process(), args, cwd)
+}
+
+/// [`select_session`] for one agent home (library-embedded harnesses).
+pub fn select_session_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+) -> SessionSelection {
+    select_session_in_dir(args, configured_session_dir_for(home, args, cwd))
 }
 
 /// Resolve the root once at startup; runtime actions retain this selection.
 pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
+    configured_session_dir_for(&crate::config::AgentHome::process(), args, cwd)
+}
+
+pub(crate) fn configured_session_dir_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+) -> PathBuf {
     let dir = args
         .session_dir
         .clone()
         .or_else(|| {
-            crate::settings::load_settings()
+            home.settings()
                 .ok()
                 .and_then(|settings| settings.session_dir)
         })
+        // An explicitly provided home owns its transcripts; the process-wide
+        // env override only applies when the home is the process home (CLI).
+        // Otherwise a library host that passes home B while the environment
+        // still names A would silently write B's sessions into A.
+        .or_else(|| {
+            home.is_explicit()
+                .then(|| home.root().ok().map(|root| root.join("sessions")))
+                .flatten()
+        })
+        .or_else(|| std::env::var_os("RPI_CODING_AGENT_SESSION_DIR").map(PathBuf::from))
         .unwrap_or_else(|| default_session_dir(cwd));
     // Relative roots belong to the launch project, even if an extension later
     // changes the process working directory.
@@ -259,7 +371,7 @@ pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
     }
 }
 
-fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
+pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
@@ -273,6 +385,8 @@ fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
         return SessionSelection::Fork {
             source: s.clone(),
             dir,
+            entry_id: args.fork_entry.clone(),
+            position: args.fork_position,
         };
     }
     if let Some(s) = &args.session_id {
@@ -299,6 +413,10 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// Extensions are loaded exactly once before model resolution. Their action
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
+    resource_leases: Arc<Vec<crate::resource_management::Lease>>,
+    resource_selection: Option<crate::resource_selection::ResolvedSelection>,
+    session_selection: SessionSelection,
+    transition_session: Option<Session>,
     pub extension_session: ExtensionSession,
     session_dir: PathBuf,
     runtime: tokio::runtime::Handle,
@@ -310,14 +428,232 @@ pub struct PreparedExtensions {
     ext_status_mailbox: rpi_extensions::ExtensionStatusMailbox,
     editor_text_mailbox: rpi_extensions::EditorTextMailbox,
     action_bridge: Arc<rpi_extensions::ActionBridge>,
+    prepared_restore: Option<rpi_harness::session::jsonl::PreparedJsonlRestore>,
+}
+
+/// Validate native durable resource ownership BEFORE loading any executable code.
+/// The synchronous public prepare_extensions API is retained: a scoped reader
+/// thread uses its own runtime so this also works inside current-thread Tokio.
+/// It does no registration, provider callbacks, session creation, or lock claiming.
+pub(crate) fn preflight_extension_startup(
+    args: &Args,
+    cwd: &Path,
+    trusted: bool,
+) -> Result<
+    (
+        Option<crate::resource_selection::ResolvedSelection>,
+        SessionSelection,
+    ),
+    BuildError,
+> {
+    preflight_extension_startup_for(&crate::config::AgentHome::process(), args, cwd, trusted)
+}
+
+pub(crate) fn preflight_extension_startup_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    trusted: bool,
+) -> Result<
+    (
+        Option<crate::resource_selection::ResolvedSelection>,
+        SessionSelection,
+    ),
+    BuildError,
+> {
+    let (resources, (selection, _)) =
+        preflight_extension_startup_with_restore(home, args, cwd, trusted, false)?;
+    Ok((resources, selection))
+}
+
+fn preflight_extension_startup_with_restore(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    trusted: bool,
+    prepare_restore: bool,
+) -> Result<
+    (
+        Option<crate::resource_selection::ResolvedSelection>,
+        (
+            SessionSelection,
+            Option<rpi_harness::session::jsonl::PreparedJsonlRestore>,
+        ),
+    ),
+    BuildError,
+> {
+    let resource_selection_load = StartupSpan::start(Phase::ResourceSelectionLoad);
+    let mut resources =
+        crate::resource_selection::ResolvedSelection::load_for(home, args, cwd, trusted)
+            .map_err(BuildError::HarnessCreate)?;
+    let selection = select_session_for(home, args, cwd);
+    resource_selection_load.finish();
+    let pinned = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?
+                    .block_on(async {
+                        if let Some(selected) = &mut resources {
+                            let skill_validate = StartupSpan::start(Phase::SkillValidate);
+                            let env: Arc<dyn rpi_tools::ExecutionEnv> =
+                                Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
+                            selected
+                                .validate_skills(&env)
+                                .await
+                                .map_err(BuildError::HarnessCreate)?;
+                            skill_validate.finish();
+                        }
+                        let restore_target = StartupSpan::start(Phase::RestoreTarget);
+                        let cwd_str = cwd.to_string_lossy();
+                        let target = match &selection {
+                            SessionSelection::Fork { source, dir, .. } => {
+                                match session_metadata_at(Path::new(source)) {
+                                    Some(meta) => Some(meta),
+                                    None => find_session_metadata(source, &cwd_str, dir).await?,
+                                }
+                            }
+                            _ => resolve_restore_target(&selection, &cwd_str).await?,
+                        };
+                        restore_target.finish();
+                        let Some(meta) = target else {
+                            if resources.as_ref().is_some_and(|r| r.transition.is_some()) {
+                                return Err(BuildError::SessionOpen("resource transition requires an existing native session".into()));
+                            }
+                            return Ok((selection.clone(), None));
+                        };
+                        if resources.as_ref().is_some_and(|r| r.transition.is_some()) && matches!(selection, SessionSelection::Fork { .. }) {
+                            return Err(BuildError::SessionOpen("resource transition cannot fork".into()));
+                        }
+                        use rpi_harness::session::jsonl::{
+                            JsonlSessionRepo, JsonlSessionRepoOptions,
+                        };
+                        let dir = selection_dir(&selection);
+                        let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+                            fs: Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())),
+                            sessions_root: dir.to_string_lossy().into_owned(),
+                            clock: Arc::new(SystemClock),
+                            ids: Arc::new(DefaultIdGenerator::new()),
+                        });
+                        let transition = resources.as_ref().is_some_and(|r| r.transition.is_some());
+                        let fork = matches!(selection, SessionSelection::Fork { .. });
+                        let (facts, prepared) = if transition {
+                            (
+                                rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
+                                    Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &meta.path,
+                                    Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
+                                )
+                                .await
+                                .map_err(|e| BuildError::SessionOpen(e.to_string()))?,
+                                None,
+                            )
+                        } else if fork {
+                            (
+                                repo.read_facts_by_jsonl_metadata(&meta)
+                                    .await
+                                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?,
+                                None,
+                            )
+                        } else if prepare_restore {
+                            let prepared_replay = StartupSpan::start(Phase::PreparedReplay);
+                            let prepared = repo
+                                .prepare_restore_by_jsonl_metadata(&meta)
+                                .await
+                                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                            prepared_replay.finish();
+                            let prepared_facts = StartupSpan::start(Phase::PreparedFacts);
+                            let facts = prepared
+                                .facts()
+                                .await
+                                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                            prepared_facts.finish();
+                            (facts, Some(prepared))
+                        } else {
+                            (
+                                repo.read_facts_by_jsonl_metadata(&meta)
+                                    .await
+                                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?,
+                                None,
+                            )
+                        };
+                        let binding_validate = StartupSpan::start(Phase::BindingValidate);
+                        crate::resource_selection::validate_session_binding(
+                            &facts.values,
+                            resources.as_ref(),
+                        )
+                        .map_err(BuildError::SessionOpen)?;
+                        binding_validate.finish();
+                        Ok((
+                            match selection {
+                                SessionSelection::Fork {
+                                    entry_id,
+                                    position,
+                                    ..
+                                } => SessionSelection::Fork {
+                                    source: meta.path,
+                                    dir,
+                                    entry_id: entry_id.clone(),
+                                    position,
+                                },
+                                _ => SessionSelection::ByExactId { id: meta.id, dir },
+                            },
+                            prepared,
+                        ))
+                    })
+            })
+            .join()
+            .map_err(|_| BuildError::SessionOpen("resource preflight reader panicked".into()))?
+    })?;
+    Ok((resources, pinned))
 }
 
 pub fn prepare_extensions(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
-    let session_dir = configured_session_dir(args, cwd);
+    crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
+    let resource_leases = crate::resource_management::host_leases_for(home, cwd)
+        .map_err(BuildError::HarnessCreate)?;
+    let preflight_prepare = StartupSpan::start(Phase::PreflightPrepare);
+    let (resource_selection, (session_selection, prepared_restore)) =
+        preflight_extension_startup_with_restore(home, args, cwd, project_trusted, true)?;
+    preflight_prepare.finish();
+    // Transition hosts own the writer before any DLL registration. The strict
+    // loader cannot repair history/progress or migrate metadata on rejection.
+    let transition_session = if resource_selection
+        .as_ref()
+        .is_some_and(|r| r.transition.is_some())
+    {
+        Some(std::thread::scope(|scope| {
+            scope.spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?.block_on(async {
+                    let meta = resolve_restore_target(&session_selection, &cwd.to_string_lossy()).await?
+                        .ok_or_else(|| BuildError::SessionOpen("transition session disappeared".into()))?;
+                    let path = std::fs::canonicalize(&meta.path).map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    let storage = rpi_harness::session::jsonl::JsonlSessionStorage::load_for_resource_transition(
+                        Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &path.to_string_lossy(),
+                        Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
+                    ).await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    storage.acquire_writer_lease().await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    let session = Session::new(Arc::new(storage), None);
+                    crate::resource_selection::bind_session(&session, resource_selection.as_ref()).await.map_err(BuildError::SessionOpen)?;
+                    Ok::<_, BuildError>(session)
+                })
+        }).join().map_err(|_| BuildError::SessionOpen("transition writer preparation panicked".into()))?
+        })?)
+    } else {
+        None
+    };
+    let session_dir = if matches!(session_selection, SessionSelection::Ephemeral) {
+        configured_session_dir_for(home, args, cwd)
+    } else {
+        selection_dir(&session_selection)
+    };
     let cwd_str = cwd.to_string_lossy().to_string();
     let tool_context = rpi_extensions::ToolCallContext::new(cwd_str.clone());
     if !project_trusted && args.verbose {
@@ -354,7 +690,12 @@ pub fn prepare_extensions(
         args.unknown_flags.clone(),
         tool_context.clone(),
     );
-    let action_host = Arc::new(action_host.with_session_dir(session_dir.clone()));
+    let action_host = Arc::new(
+        action_host
+            .with_session_dir(session_dir.clone())
+            .with_fresh_session_only(false)
+            .with_native_durable(args.native_durable),
+    );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
     // `Handle` to `spawn_blocking` the sync `ProviderRequestFn`), so clone here.
@@ -390,10 +731,36 @@ pub fn prepare_extensions(
         editor_text_mailbox.clone(),
     );
 
-    let extension_session = if args.no_extensions {
+    let extension_register = StartupSpan::start(Phase::ExtensionRegister);
+    let extension_session = if let Some(selected) = &resource_selection {
+        let session = rpi_extensions::load_session_mixed_guarded(
+            &[],
+            &selected.extensions,
+            Arc::new(NullDiagnostics),
+            Some(Arc::clone(&action_bridge)),
+            Some(resource_leases.clone()),
+        );
+        if session.loaded_paths() != selected.extensions.as_slice() {
+            return Err(BuildError::HarnessCreate(
+                "selected native extension failed to load/register".into(),
+            ));
+        }
+        if session.owns_stdio() {
+            return Err(BuildError::HarnessCreate(
+                "stdio-owning extensions are unsupported with --resource-config".into(),
+            ));
+        }
+        session
+    } else if args.no_extensions {
         ExtensionSession::none()
     } else {
-        load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
+        load_extensions(
+            home,
+            args,
+            cwd,
+            project_trusted,
+            Some(Arc::clone(&action_bridge)),
+        )
     };
     if args.verbose {
         if let Some(s) = extension_session.summary() {
@@ -401,7 +768,18 @@ pub fn prepare_extensions(
         }
         report_deferred_renderers(&extension_session);
     }
+    validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
+    extension_register.finish();
+    // Publish the extension registry so `ListCommands` can enumerate slash
+    // commands. Done here rather than at host construction because the registry
+    // only exists after extensions load; `/reload` republishes the new snapshot
+    // via `RuntimeActionHost::publish_registry`.
+    action_host.publish_registry_impl(extension_session.snapshot_arc());
     Ok(PreparedExtensions {
+        resource_leases,
+        resource_selection,
+        session_selection,
+        transition_session,
         session_dir,
         runtime,
         tool_context,
@@ -413,6 +791,7 @@ pub fn prepare_extensions(
         editor_text_mailbox,
         action_bridge,
         extension_session,
+        prepared_restore,
     })
 }
 
@@ -433,7 +812,17 @@ pub fn prepare_extensions(
 /// [`ReloadContext`] the interactive TUI holds to drive `/reload` (and a
 /// plugin's `runtime_action(Reload)` via the mailbox). Non-interactive modes
 /// drop the context (no `/reload` surface in print/json mode).
+///
+/// `home` is the one agent-home value for this session: settings/auth/models/
+/// trust, skills/prompts/extensions/SYSTEM.md discovery, resource leases and
+/// the native-package artifacts used by extension loading all read from it.
+/// CLI callers pass [`AgentHome::process`](crate::config::AgentHome::process),
+/// which preserves the historical `RPI_CODING_AGENT_DIR`/`~/.rpi/agent`
+/// behavior; embedding hosts pass an explicit home and can run several
+/// sessions with different homes in one process without mutating the process
+/// environment.
 pub async fn build(
+    home: &crate::config::AgentHome,
     resolved: &ResolvedModel,
     args: &Args,
     cwd: &Path,
@@ -446,11 +835,67 @@ pub async fn build(
     ),
     BuildError,
 > {
-    let prepared = prepare_extensions(args, cwd, project_trusted)?;
-    build_prepared(resolved, args, cwd, project_trusted, prepared).await
+    let prepared = prepare_extensions(home, args, cwd, project_trusted)?;
+    build_prepared(home, resolved, args, cwd, project_trusted, prepared).await
+}
+
+/// The three resource families that share the same project/global/trust
+/// selection ladder. Keeping one implementation prevents a new family (themes,
+/// packages) from silently missing the explicit home on one of the three call
+/// sites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceRootKind {
+    Extensions,
+    Skills,
+    PromptTemplates,
+}
+
+fn resource_root_dirs(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    kind: ResourceRootKind,
+) -> Vec<PathBuf> {
+    if (kind == ResourceRootKind::Extensions && args.no_extensions)
+        || (kind == ResourceRootKind::Skills && args.no_skills)
+        || (kind == ResourceRootKind::PromptTemplates && args.no_prompt_templates)
+    {
+        return Vec::new();
+    }
+    let mut dirs = if kind == ResourceRootKind::Extensions && args.dev_local_only {
+        // `dev-local` never imports unrelated global/project extension dirs;
+        // explicit `--extensions-dir` paths are appended below.
+        Vec::new()
+    } else if args.project_only {
+        match kind {
+            ResourceRootKind::Extensions => project_extension_dirs(cwd),
+            ResourceRootKind::Skills => project_skill_dirs(cwd),
+            ResourceRootKind::PromptTemplates => project_prompt_template_dirs(cwd),
+        }
+    } else if project_trusted {
+        match kind {
+            ResourceRootKind::Extensions => home.extension_dirs(cwd),
+            ResourceRootKind::Skills => home.skill_dirs(cwd),
+            ResourceRootKind::PromptTemplates => home.prompt_template_dirs(cwd),
+        }
+    } else {
+        match kind {
+            ResourceRootKind::Extensions => home.global_extension_dirs(),
+            ResourceRootKind::Skills => home.global_skill_dirs(),
+            ResourceRootKind::PromptTemplates => home.global_prompt_template_dirs(),
+        }
+    };
+    match kind {
+        ResourceRootKind::Extensions => dirs.extend(args.extensions_dir.iter().cloned()),
+        ResourceRootKind::Skills => dirs.extend(args.skill.iter().cloned()),
+        ResourceRootKind::PromptTemplates => dirs.extend(args.prompt_template.iter().cloned()),
+    }
+    dirs
 }
 
 pub async fn build_prepared(
+    home: &crate::config::AgentHome,
     resolved: &ResolvedModel,
     args: &Args,
     cwd: &Path,
@@ -464,12 +909,19 @@ pub async fn build_prepared(
     ),
     BuildError,
 > {
+    let experimental_policy = crate::native_durable::experimental_epoch::policy(args)
+        .map_err(BuildError::HarnessCreate)?;
+    let fresh_session_only = false;
     let cwd_str = cwd.to_string_lossy().to_string();
     // Plugin tools get the session's identity injected into every call's
     // arguments (see `rpi_extensions::ToolCallContext`). It is created here,
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        resource_leases,
+        resource_selection,
+        session_selection: selection,
+        transition_session,
         session_dir,
         runtime,
         tool_context,
@@ -481,7 +933,9 @@ pub async fn build_prepared(
         editor_text_mailbox,
         action_bridge,
         extension_session,
+        prepared_restore,
     } = prepared;
+    let build_tools = StartupSpan::start(Phase::BuildTools);
     let catalog = crate::provider::authenticated_catalog(resolved);
     action_host.set_catalog(catalog.clone());
 
@@ -492,9 +946,13 @@ pub async fn build_prepared(
     let _registry = Arc::new(MutationQueueRegistry::new());
     // `env_dyn` is shared between the tool context (moved in) and the resource
     // loaders below (borrowed); clone one branch so both hold a reference.
-    let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let file_io = Arc::new(rpi_tools::file_io::FileIORouter::new());
+    let ctx =
+        ExecutionToolContext::new(env_dyn.clone(), Some(mut_env)).with_file_io(file_io.clone());
 
-    let mut tools = build_tools(&ctx, args);
+    validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
+    let durable_binding = Arc::new(std::sync::OnceLock::new());
+    let mut tools = build_tools_bound(home, &ctx, args, Some(&durable_binding));
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -504,11 +962,45 @@ pub async fn build_prepared(
     // the harness lifetime via the returned session guard. `--no-extensions`
     // skips discovery entirely (no dirs scanned, no plugins loaded).
     merge_extension_tools(&mut tools, &extension_session, args, &tool_context);
-    let active = filter_active_tool_names(active_tool_names(&tools, args), args);
+    let active = if let Some(selected) = &resource_selection {
+        selected
+            .active_tools(
+                &tools
+                    .iter()
+                    .map(|t| t.tool.schema().name.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(BuildError::HarnessCreate)?
+    } else {
+        filter_active_tool_names(active_tool_names(&tools, args), args)
+    };
 
     // ---- Session storage ----
-    let selection = select_session_in_dir(args, session_dir.clone());
-    let session = build_session(&selection, &cwd_str).await?;
+    // The root is the one `prepare_extensions` froze at startup, never a fresh
+    // `configured_session_dir(args, cwd)`: settings and `RPI_CODING_AGENT_SESSION_DIR`
+    // can change while extensions load, and an adopted session cwd would point
+    // at another project's tree. Both the cwd peek and this build must read the
+    // same root, so the caller pins it into `args` before either runs.
+    build_tools.finish();
+    let writer_restore = StartupSpan::start(Phase::WriterRestore);
+    let session = match transition_session {
+        Some(session) => session,
+        None => {
+            build_session(
+                &selection,
+                &cwd_str,
+                resource_selection.as_ref(),
+                prepared_restore,
+            )
+            .await?
+        }
+    };
+    writer_restore.finish();
+    let session_bind = StartupSpan::start(Phase::SessionBind);
+    crate::resource_selection::bind_session(&session, resource_selection.as_ref())
+        .await
+        .map_err(BuildError::SessionOpen)?;
+    session_bind.finish();
     // Plugin tools now know which session they serve: `todo` and friends key
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
@@ -524,6 +1016,11 @@ pub async fn build_prepared(
         let name = requested.trim();
         let name = if name.is_empty() { None } else { Some(name) };
         if let Err(error) = session.set_name(name).await {
+            if fresh_session_only {
+                return Err(BuildError::SessionOpen(format!(
+                    "native session name persistence failed: {error}"
+                )));
+            }
             if args.verbose {
                 eprintln!("warning: could not set session name: {error}");
             }
@@ -538,20 +1035,30 @@ pub async fn build_prepared(
     // direction as skills/prompts precedence.
     // Whether this model sees its own prior reasoning again decides how the
     // working-state rule is worded (see `default_system_prompt`).
+    let prompt_resources = StartupSpan::start(Phase::PromptResources);
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+        None if project_trusted && resource_selection.is_none() => {
+            match home.discover_system_prompt_file(cwd, true) {
+                Some(path) => {
+                    read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
+                }
+                None => default_prompt(),
             }
-        },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        }
+        None => default_prompt(),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -565,9 +1072,17 @@ pub async fn build_prepared(
         let text = read_append_target(extra, &mut context_paths).unwrap_or_else(|| extra.clone());
         append_texts.push(text);
     }
-    if args.append_system_prompt.is_empty() {
+    if let Some(selected) = &resource_selection {
+        append_texts.extend(
+            selected
+                .instructions
+                .iter()
+                .map(|(_, _, text)| text.clone()),
+        );
+    }
+    if args.append_system_prompt.is_empty() && resource_selection.is_none() {
         if let Some(path) = project_trusted
-            .then(|| discover_append_system_prompt_file(cwd))
+            .then(|| home.discover_append_system_prompt_file(cwd))
             .flatten()
         {
             if let Some(text) = read_prompt_source(&path, &mut context_paths) {
@@ -592,7 +1107,7 @@ pub async fn build_prepared(
     // `isProjectTrusted()` (global resources are unconditional). rpi v1 has no
     // trust prompt — project resources are discovered unconditionally (a copied
     // `.rpi/` dir drops in and works). Full trust gating is deferred.
-    let agent_dir = crate::config::agent_dir().ok();
+    let agent_dir = home.root().ok();
 
     // ---- B5b: extension resources_discover ----
     // If any plugin registered a `resources_discover` handler, fan the event out
@@ -611,21 +1126,24 @@ pub async fn build_prepared(
     // A `--no-*` flag suppresses its channel for BOTH static and discovered paths.
     let discovered = extension_session
         .snapshot_arc()
+        .filter(|_| resource_selection.is_none())
         .map(|snap| emit_resources_discover(&cwd_str, "startup", &snap))
         .unwrap_or_default();
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
-    if !args.no_skills {
-        let mut dirs = if args.dev_local_only || args.project_only {
-            project_skill_dirs(cwd)
-        } else if project_trusted {
-            skill_dirs(cwd)
-        } else {
-            global_skill_dirs()
-        };
-        dirs.extend(args.skill.iter().cloned());
+    if let Some(selected) = &resource_selection {
+        // Consume the preflight's parsed resources, never rediscover or reread
+        // selected Skills after executable registration / writer opening.
+        skills = selected
+            .validated_skills()
+            .map_err(BuildError::HarnessCreate)?
+            .skills
+            .clone();
+    } else if !args.no_skills {
+        let mut dirs =
+            resource_root_dirs(&home, args, cwd, project_trusted, ResourceRootKind::Skills);
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
@@ -635,15 +1153,14 @@ pub async fn build_prepared(
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
-    if !args.no_prompt_templates {
-        let mut dirs = if args.dev_local_only || args.project_only {
-            project_prompt_template_dirs(cwd)
-        } else if project_trusted {
-            prompt_template_dirs(cwd)
-        } else {
-            global_prompt_template_dirs()
-        };
-        dirs.extend(args.prompt_template.iter().cloned());
+    if !args.no_prompt_templates && resource_selection.is_none() {
+        let mut dirs = resource_root_dirs(
+            &home,
+            args,
+            cwd,
+            project_trusted,
+            ResourceRootKind::PromptTemplates,
+        );
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
@@ -651,7 +1168,8 @@ pub async fn build_prepared(
         resource_diags.extend(result.resource_diagnostics);
     }
 
-    let context_block = if args.no_context_files || !project_trusted {
+    let context_block = if args.no_context_files || !project_trusted || resource_selection.is_some()
+    {
         String::new()
     } else {
         // `load_project_context_files` walks the global agentDir first then
@@ -731,7 +1249,7 @@ pub async fn build_prepared(
         eprintln!("=== --debug-system-prompt ===");
         let base_src = if args.system_prompt.is_some() {
             "--system-prompt"
-        } else if discover_system_prompt_file(cwd).is_some() {
+        } else if home.discover_system_prompt_file(cwd, true).is_some() {
             "SYSTEM.md"
         } else {
             "default"
@@ -791,6 +1309,7 @@ pub async fn build_prepared(
         eprintln!("=== end --debug-system-prompt ===");
     }
 
+    prompt_resources.finish();
     // ---- Options ----
     // Install a BroadcastEmitter so the caller (the interactive TUI) can drain
     // AgentEvents live as a run unfolds. The corresponding broadcast::Receiver
@@ -821,7 +1340,7 @@ pub async fn build_prepared(
     // Saved user defaults. Best-effort: a missing or malformed file must not stop
     // a session from starting, and every accessor falls back to the harness
     // default when its key is absent.
-    let saved_settings = crate::settings::load_settings().unwrap_or_default();
+    let saved_settings = home.settings().unwrap_or_default();
 
     // `httpProxy` applies to rpi's own HTTP clients. Setting the environment is how
     // they are configured (`pi-ai/src/http.rs`), and upstream does the same thing
@@ -858,10 +1377,67 @@ pub async fn build_prepared(
             )
         });
 
+    // Host-integrated approval gate: composes AFTER the extension hook (an
+    // extension veto wins; the host gate only sees calls that would run).
+    //
+    // Field contract (harness `prepare_tool_call`): a returned
+    // `BeforeToolCallResult` may carry `block`/`terminate`/`args`, and a
+    // non-blocking result's `args` REPLACES the validated args for the call.
+    // So the composite must (a) keep an extension's non-blocking rewrite and
+    // `terminate` bit, and (b) run the approval gate against the *rewritten*
+    // args — not the originals (review follow-up).
+    let approval_binding = Arc::clone(&durable_binding);
+    let before_tool_call: Option<rpi_agent::hooks::BeforeToolCall> = match before_tool_call {
+        Some(extension_hook) => Some(Arc::new(
+            move |context: rpi_agent::types::BeforeToolCallContext<'_>,
+                  signal: tokio_util::sync::CancellationToken| {
+                let extension_hook = Arc::clone(&extension_hook);
+                let binding = Arc::clone(&approval_binding);
+                let tool = context.tool_call.name.clone();
+                let original_args = context.args.clone();
+                // Call synchronously: the extension hook copies what it needs
+                // and returns a 'static future, so the borrowed context never
+                // enters our boxed future.
+                let first = extension_hook(context, signal.clone());
+                Box::pin(async move {
+                    let extension_result = first.await;
+                    if let Some(result) = extension_result.as_ref() {
+                        if result.block {
+                            return Some(result.clone());
+                        }
+                    }
+                    let rewritten = extension_result
+                        .as_ref()
+                        .and_then(|result| result.args.clone())
+                        .unwrap_or(original_args);
+                    match crate::approval_gate::evaluate(&binding, &tool, &rewritten, &signal).await
+                    {
+                        Some(blocked) => {
+                            // Keep the extension's own terminate intent when the
+                            // host gate denies (both are "stop here" signals).
+                            let terminate = extension_result
+                                .as_ref()
+                                .map(|result| result.terminate)
+                                .unwrap_or(false);
+                            Some(rpi_agent::types::BeforeToolCallResult {
+                                terminate,
+                                ..blocked
+                            })
+                        }
+                        // Allowed: hand the extension's own result back so the
+                        // harness applies its args rewrite / terminate bit.
+                        None => extension_result,
+                    }
+                })
+            },
+        )),
+        None => Some(crate::approval_gate::hook(approval_binding)),
+    };
+
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
         thinking_level: resolved.thinking_level,
-        active_tool_names: active,
+        active_tool_names: active.clone(),
         tools,
         system_prompt: Some(system_prompt),
         resources: AgentHarnessResources {
@@ -886,6 +1462,7 @@ pub async fn build_prepared(
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
         ),
+        require_native_durable: args.native_durable,
         stream_options: AgentHarnessStreamOptions {
             timeout: args.timeout,
             stream_idle_timeout: args.stream_idle_timeout.or_else(|| {
@@ -893,6 +1470,7 @@ pub async fn build_prepared(
                     .stream_idle_timeout
                     .map(std::time::Duration::from_secs)
             }),
+            thinking_budgets: saved_settings.thinking_budgets,
             ..Default::default()
         },
         // Settings-backed harness options: upstream lets users tune retry,
@@ -919,11 +1497,20 @@ pub async fn build_prepared(
         agent_emitter: Some(emitter),
         // B3b loop hooks. `before_tool_call` dispatches the pi `on("tool_call")`
         // extension event and honors a veto (a permission gate can block a tool
-        // before it runs). `after_tool_call`/`transform_context` remain `None`
-        // (their host-side adapters are not wired yet).
+        // before it runs). `after_tool_call` runs the plugin `tool_result`
+        // transforms (pi's `on("tool_result")`) over every finished result,
+        // error results included; it reads the session per call, so a plugin
+        // that a `/reload` adds is covered. Extension context adapters remain
+        // unwired. Native durable observes the committed service per model
+        // request, using the same weak binding as its tool, even when model
+        // tools are filtered.
         before_tool_call,
-        after_tool_call: None,
-        transform_context: None,
+        after_tool_call: Some(extension_tool_result_hook(Arc::clone(
+            &extension_session_cell,
+        ))),
+        transform_context: args
+            .native_durable
+            .then(|| crate::native_durable::context_hook(Arc::clone(&durable_binding))),
         entry_transforms: Vec::new(),
         // Extension provider hooks (B4): plugins subscribing to the
         // BeforeProviderRequest / BeforeProviderHeaders / AfterProviderResponse
@@ -934,18 +1521,118 @@ pub async fn build_prepared(
             .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
-    let harness = match AgentHarness::create(options).await {
-        Ok(h) => {
-            // Fill the extension action host now that the harness exists
-            // (plugin runtime_action calls can then reach it).
-            crate::extensions_actions::HarnessActionHost::set_harness(
-                &harness_cell,
-                Arc::new(h.clone()),
-            );
-            h
+    let harness_create = StartupSpan::start(Phase::HarnessCreate);
+    let harness = match experimental_policy {
+        Some(policy) => AgentHarness::create_experimental(options, policy).await,
+        None => AgentHarness::create(options).await,
+    }
+    .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+    harness_create.finish();
+
+    if args.native_durable {
+        let durable_validate = StartupSpan::start(Phase::DurableValidate);
+        // Validate legacy/corrupt branch state before sealing resources or ready.
+        rpi_harness::durable::DurableService::bind(
+            &harness,
+            rpi_harness::durable::DurableActor::owner("native-cli")
+                .map_err(|e| BuildError::HarnessCreate(e.to_string()))?,
+        )
+        .snapshot()
+        .await
+        .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+        durable_validate.finish();
+    }
+    // Populate the weak tool binding before resource selection is published.
+    // Unconditional: host-integrated tools (approval gate session id,
+    // message_agent caller resolution) need the owning harness even when the
+    // native DurableService path is off — host embeddings never set
+    // `native_durable`, so an `if args.native_durable`-scoped set left the
+    // binding permanently empty for them.
+    let _ = durable_binding.set(harness.downgrade());
+
+    // Retain read leases even for resource-only/--no-extensions hosts.
+    let harness_leases = resource_leases.clone();
+    harness
+        .events()
+        .on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |_| {
+            let _ = &harness_leases;
+        });
+    install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
+    let resource_seal = StartupSpan::start(Phase::ResourceSeal);
+    if let Some(selected) = &resource_selection {
+        harness
+            .seal_resources(active)
+            .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+        crate::resource_selection::attach(
+            &harness,
+            serde_json::json!({
+                "version": 1,
+                "hostId": uuid::Uuid::new_v4().to_string(),
+                "host": {"name": crate::APP_NAME, "version": crate::VERSION, "pid": std::process::id()},
+                "selection": selected.selection,
+                "package": selected.package,
+                "selectedSkills": selected.skills,
+                "skillDiagnostics": [],
+                "loadedExtensions": extension_session.loaded_paths().iter().map(|p| serde_json::json!({"identity": p.file_stem().and_then(|s| s.to_str()), "path": p})).collect::<Vec<_>>(),
+                "instructions": selected.provenance(),
+                "baseSystemPrompt": "native-default",
+                "projectContext": "disabled",
+                "resourceDiscovery": "disabled",
+                "changes": "restart-required"
+            }),
+        );
+        crate::resource_selection::get_resource_state(&harness)
+            .await
+            .map_err(BuildError::HarnessCreate)?;
+        if selected.transition.is_some() {
+            // Re-read persisted facts at commit, not merely the startup mirror.
+            // The canonical OS writer claim acquired before registration is
+            // retained by the host for the entire session lifetime.
+            let meta = resolve_restore_target(&selection, &cwd_str)
+                .await?
+                .ok_or_else(|| {
+                    BuildError::SessionOpen("transition session disappeared before commit".into())
+                })?;
+            if !harness.session().storage().writer_lease_held() {
+                return Err(BuildError::SessionOpen(
+                    "resource transition lost storage-level writer ownership".into(),
+                ));
+            }
+            let path = std::fs::canonicalize(&meta.path)
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+            let facts =
+                rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
+                    Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())),
+                    &path.to_string_lossy(),
+                    Arc::new(SystemClock),
+                    Arc::new(DefaultIdGenerator::new()),
+                )
+                .await
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+            crate::resource_selection::validate_session_binding(&facts.values, Some(selected))
+                .map_err(BuildError::SessionOpen)?;
+            let mirror = rpi_harness::session::SessionValues::load(harness.session())
+                .await
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+            if crate::resource_selection::binding_state(&mirror)
+                != crate::resource_selection::binding_state(&facts.values)
+            {
+                return Err(BuildError::SessionOpen(
+                    "resource binding changed before commit".into(),
+                ));
+            }
         }
-        Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
-    };
+        crate::resource_selection::bind_inventory(&harness, selected)
+            .await
+            .map_err(BuildError::SessionOpen)?;
+    }
+    resource_seal.finish();
+    // Publish only after exact resources have been sealed and validated.
+    crate::extensions_actions::HarnessActionHost::set_harness(
+        &harness_cell,
+        Arc::new(harness.clone()),
+    );
+    register_file_io_router(&harness, &file_io);
 
     // ---- Durable operation recovery (runtime layer) ----
     // A previous process can die between `operation_started` and
@@ -955,6 +1642,7 @@ pub async fn build_prepared(
     // read-only: nothing is mutated here, so a failed sweep cannot corrupt the
     // log. A clean session (the common case) reports no findings.
     {
+        let recovery_sweep = StartupSpan::start(Phase::RecoverySweep);
         let runtime = rpi_harness::runtime::SessionRuntime::new(harness.session().clone());
         match rpi_harness::runtime::recover_all_lanes(&runtime).await {
             Ok(reports) => {
@@ -988,6 +1676,7 @@ pub async fn build_prepared(
                 }
             }
         }
+        recovery_sweep.finish();
     }
 
     // ---- B5d: assemble the ReloadContext the TUI holds ----
@@ -1001,15 +1690,21 @@ pub async fn build_prepared(
     let mut reload_args = args.clone();
     reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
+        resource_leases,
+        fresh_session_only,
         extension_session: extension_session_cell,
+        durable_binding,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
+        file_io,
         catalog: Arc::new(std::sync::RwLock::new(catalog)),
         providers: Arc::new(std::sync::RwLock::new(resolved.providers.clone())),
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
+        discovered_theme_paths: Arc::new(std::sync::Mutex::new(discovered.theme_paths.clone())),
         args: reload_args,
+        home: home.clone(),
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
@@ -1017,9 +1712,28 @@ pub async fn build_prepared(
         ext_status: ext_status_mailbox,
         editor_text: editor_text_mailbox,
         dev_extension: None,
+        startup_notices: Vec::new(),
     };
 
     Ok((harness, event_rx, reload_context))
+}
+
+/// Project authoritative harness termination, not per-attempt AgentEnd, to
+/// plugins. The bus owns this listener; its session cell follows reloads and
+/// retains callback libraries, while the action host binds the harness weakly.
+fn install_extension_settlement_bridge(
+    events: &rpi_harness::events::HarnessEventBus,
+    sessions: ExtensionSessionCell,
+) {
+    events.on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |event| {
+        if event.lane != "main" {
+            return;
+        }
+        let session = sessions.lock().unwrap().clone();
+        if let Some(snapshot) = session.snapshot_arc() {
+            rpi_extensions::dispatch_empty_event(&snapshot, rpi_plugin_sdk::EventTag::AgentSettled);
+        }
+    });
 }
 
 /// Resolve the current plugin session for each call rather than keeping a
@@ -1040,7 +1754,7 @@ fn extension_tool_call_hook(
         Box::pin(async move {
             let reason = match session {
                 Ok(session) => {
-                    rpi_extensions::dispatch_tool_call_event(
+                    let vetoed = rpi_extensions::dispatch_tool_call_event(
                         &session,
                         &tool_call_id,
                         &tool_name,
@@ -1048,7 +1762,20 @@ fn extension_tool_call_hook(
                         &signal,
                         &ui_dialog,
                     )
-                    .await
+                    .await;
+                    match vetoed {
+                        Some(reason) => Some(
+                            veto_reason_via_transforms(
+                                &session,
+                                &tool_call_id,
+                                &tool_name,
+                                &params,
+                                reason,
+                            )
+                            .await,
+                        ),
+                        None => None,
+                    }
                 }
                 Err(_) => Some("extension approval session is unavailable".to_string()),
             };
@@ -1060,6 +1787,140 @@ fn extension_tool_call_hook(
             })
         })
     })
+}
+
+/// The text that replaces a tool result when the `tool_result` transforms
+/// could not run. A plugin may use the transforms to remove values the model
+/// must not see, so the host fails closed instead of passing the result on.
+const TOOL_RESULT_WITHHELD: &str =
+    "[tool result withheld: the extension tool_result transforms could not run]";
+
+/// Run the plugin `tool_result` transforms over one result on a blocking
+/// thread. `None` means no transform is registered. When a transform ran, an
+/// unchanged result is still returned so the caller can distinguish it from a
+/// skipped dispatch.
+async fn run_tool_result_transforms(
+    session: &ExtensionSession,
+    tool_call_id: String,
+    tool_name: String,
+    input: serde_json::Value,
+    result: rpi_agent::AgentToolResult,
+    is_error: bool,
+) -> Option<rpi_agent::AgentToolResult> {
+    let snapshot = session.snapshot_arc()?;
+    if snapshot.tool_result().is_empty() {
+        return None;
+    }
+    let keepalive = session.keepalive();
+    let withheld = rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD);
+    let transformed = tokio::task::spawn_blocking(move || {
+        // A started blocking callback outlives a dropped awaiter: keep the
+        // plugin libraries loaded until every handler has returned.
+        let _keepalive = keepalive;
+        if !snapshot.is_active() {
+            return rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD);
+        }
+        match rpi_extensions::emit_tool_result_with_status(
+            &tool_call_id,
+            &tool_name,
+            &input,
+            &result,
+            is_error,
+            &snapshot,
+        ) {
+            Ok(Some(changed)) => changed,
+            Ok(None) => result,
+            // A concurrent /reload invalidated the snapshot before the
+            // blocking callback could dispatch. Never pass the unchecked
+            // output to the model: it may still contain secrets that a
+            // plugin's transform was supposed to remove.
+            Err(()) => rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD),
+        }
+    })
+    .await;
+    match transformed {
+        Ok(changed) => Some(changed),
+        Err(_) => Some(withheld),
+    }
+}
+
+/// `after_tool_call` hook: pass every finished tool result, success or error
+/// (a bash exit != 0 returns its output as an error result), and every fresh
+/// immediate failure through the plugin `tool_result` transforms. Resolves the
+/// session per call, like the tool-call hook, so it follows `/reload`; child
+/// harnesses inherit it. A stale or unavailable session fails closed.
+fn extension_tool_result_hook(sessions: ExtensionSessionCell) -> rpi_agent::AfterToolCall {
+    Arc::new(move |ctx: rpi_agent::AfterToolCallContext<'_>, _signal| {
+        let session = sessions.lock().map(|session| session.clone()).ok();
+        let tool_call_id = ctx.tool_call.id.clone();
+        let tool_name = ctx.tool_call.name.clone();
+        let input = ctx.args.clone();
+        let result = ctx.result.clone();
+        let is_error = ctx.is_error;
+        Box::pin(async move {
+            let changed = match session {
+                Some(session) => {
+                    match run_tool_result_transforms(
+                        &session,
+                        tool_call_id,
+                        tool_name,
+                        input,
+                        result,
+                        is_error,
+                    )
+                    .await
+                    {
+                        Some(changed) => changed,
+                        // No transform is registered: leave the tool's result
+                        // untouched, including its usage and terminate fields.
+                        None => return None,
+                    }
+                }
+                // A poisoned session lock: withhold rather than pass unchecked.
+                None => rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD),
+            };
+            Some(rpi_agent::AfterToolCallResult {
+                content: Some(changed.content),
+                details: Some(changed.details),
+                ..Default::default()
+            })
+        })
+    })
+}
+
+/// A vetoed call's reason, offered to the `tool_result` transforms as the text
+/// of the blocked result (`isError: true`, `details: {"blocked": true}`). The
+/// first non-empty text block of the changed result becomes the reason the
+/// model reads, so the vetoing plugin can explain the block. With no change
+/// the host's reason stays.
+async fn veto_reason_via_transforms(
+    session: &ExtensionSession,
+    tool_call_id: &str,
+    tool_name: &str,
+    params: &serde_json::Value,
+    reason: String,
+) -> String {
+    let mut blocked = rpi_agent::AgentToolResult::error_text(reason.clone());
+    blocked.details = serde_json::json!({ "blocked": true });
+    let changed = run_tool_result_transforms(
+        session,
+        tool_call_id.to_string(),
+        tool_name.to_string(),
+        params.clone(),
+        blocked,
+        true,
+    )
+    .await;
+    changed
+        .and_then(|result| {
+            result.content.into_iter().find_map(|part| match part {
+                rpi_agent::TextContentOrImage::Text(text) => {
+                    (!text.text.trim().is_empty()).then_some(text.text)
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or(reason)
 }
 
 // ===========================================================================
@@ -1123,8 +1984,16 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    resource_leases: Arc<Vec<crate::resource_management::Lease>>,
+    /// Startup routing capability, retained independently of mutable args/settings.
+    fresh_session_only: bool,
+    /// One neutral router for all built-ins, including those reconstructed on reload.
+    pub file_io: Arc<rpi_tools::file_io::FileIORouter>,
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
+    /// The process-lifetime durable-tool binding. Reloaded tool instances must
+    /// keep the same weak harness binding as the context hook installed at startup.
+    durable_binding: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
     /// The session's plugin-tool context (`cwd` + session id), reused — not
     /// rebuilt — on reload so the rebuilt adapters keep serving the SAME
     /// session. A reload that made a fresh context would leave every plugin
@@ -1158,6 +2027,11 @@ pub struct ReloadContext {
     /// Startup consumers reuse this value so extension code cannot change the
     /// effective policy by mutating the process cwd while it is loading.
     pub project_trusted: bool,
+    /// Theme file paths contributed by extensions via `resources_discover`,
+    /// shared so the TUI theme registry can merge them. Filled at startup,
+    /// replaced on every `/reload` (paths are unattributed — the v1 divergence
+    /// documented in `rpi-extensions::resources`).
+    pub discovered_theme_paths: Arc<std::sync::Mutex<Vec<String>>>,
     /// The parsed args (cloned) — `--no-*`/`--tools`/`--exclude-tools`/
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
@@ -1165,6 +2039,9 @@ pub struct ReloadContext {
     /// `/reload` re-runs discovery with the same config). `session_dir` holds
     /// the resolved startup root, including saved settings/environment defaults.
     pub args: Args,
+    /// The session's agent home. `/reload` must re-read resources and settings
+    /// from this value, never from a startup snapshot or the process home.
+    pub home: crate::config::AgentHome,
     /// The resolved model + thinking level (the harness's active model stays
     /// unless `set_model` changed it; reload does not touch the model).
     pub resolved_model: rpi_ai::Model,
@@ -1191,6 +2068,12 @@ pub struct ReloadContext {
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
+    /// One-line notices the host should show at startup (a session directory
+    /// that fell back, an untrusted adopted directory). Filled by the CLI after
+    /// the build and rendered as transcript notes in the TUI; headless modes
+    /// print them to stderr. Kept as data — never `eprintln!`d from here, which
+    /// would corrupt the alternate screen (issue #115).
+    pub startup_notices: Vec<String>,
 }
 
 impl ReloadContext {
@@ -1199,41 +2082,55 @@ impl ReloadContext {
         self.args
             .session_dir
             .clone()
-            .unwrap_or_else(|| configured_session_dir(&self.args, &self.cwd))
+            .unwrap_or_else(|| configured_session_dir_for(&self.home, &self.args, &self.cwd))
     }
 }
 
-/// Dispatch a no-payload lifecycle event (e.g. `SessionStart`, `SessionShutdown`,
-/// the rpi-specific `BeforeTuiStart`) to every extension handler subscribed to
-/// that tag, with **veto** + **timeout** semantics (P1).
+/// Dispatch a no-payload lifecycle event using the live extension-session cell.
 ///
-/// Resolves the **current** extension session from the reload cell so a
-/// `/reload`-swapped session is honored. Each handler runs on a blocking thread
-/// with a per-event timeout ([`rpi_extensions::lifecycle_timeout_for`]); a
-/// handler returning [`rpi_plugin_sdk::EVENT_HANDLER_ABORT`] vetoes the phase
-/// and this returns `Some(reason)`. No-op (`None`) when no plugins loaded, no
-/// handler subscribes, or the registry is stale.
+/// This is the cell-based counterpart to [`dispatch_session_event_async`]. It
+/// lets headless RPC tasks retain the live session without borrowing the larger
+/// [`ReloadContext`]. The snapshot and keepalive are cloned before awaiting, so
+/// a concurrent `/reload` neither invalidates the plugin function pointers
+/// mid-dispatch nor keeps a swapped-out registry alive.
 ///
-/// The caller decides what a veto means: a `BeforeTuiStart` veto aborts startup
-/// (never enter the TUI); `SessionStart`/`SessionShutdown` vetoes are advisory
-/// (the session is already up or already closing).
-pub async fn dispatch_session_event_async(
-    reload_context: &ReloadContext,
+/// Each handler runs on a blocking thread with a per-event timeout
+/// ([`rpi_extensions::lifecycle_timeout_for`]); a handler returning
+/// [`rpi_plugin_sdk::EVENT_HANDLER_ABORT`] is reported as `Some(reason)`.
+/// Returns `None` when no plugins are loaded, no handler subscribes, or the
+/// registry is stale (a `/reload` swapped the session out).
+pub async fn dispatch_session_event_from_cell(
+    extension_session: &ExtensionSessionCell,
     tag: rpi_plugin_sdk::EventTag,
 ) -> Option<String> {
-    // Take the snapshot Arc + keepalive, drop the session lock, then dispatch —
-    // we must not hold the session cell's mutex across the await (a handler
-    // could re-enter a reload path that locks it). Holding the keepalive across
-    // the await keeps the cdylibs (owning the handler fn pointers) mapped even
-    // if a concurrent `/reload` swaps the session cell out.
     let (snapshot, keepalive) = {
-        let session = reload_context.extension_session.lock().unwrap();
+        // A poisoned cell must not panic the caller (the TUI loop dispatches
+        // these events between UI actions): the session contents are only ever
+        // replaced wholesale, so recovering the guard is safe.
+        let session = extension_session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         (session.snapshot_arc(), session.keepalive())
     };
     match snapshot {
         Some(snapshot) => rpi_extensions::dispatch_lifecycle_event(&snapshot, tag, keepalive).await,
         None => None,
     }
+}
+
+/// Dispatch a no-payload lifecycle event through the current reload context.
+///
+/// Resolves the **current** extension session from the reload cell so a
+/// `/reload`-swapped session is honored. The caller decides what a veto means:
+/// a `BeforeTuiStart` veto aborts startup (never enter the TUI);
+/// `SessionStart`/`SessionShutdown` and the session-tree events dispatched by
+/// the interactive TUI and RPC paths are advisory — the host logs the reason
+/// and continues.
+pub async fn dispatch_session_event_async(
+    reload_context: &ReloadContext,
+    tag: rpi_plugin_sdk::EventTag,
+) -> Option<String> {
+    dispatch_session_event_from_cell(&reload_context.extension_session, tag).await
 }
 
 /// Join plugin teardown before unloading modules. A detached timed-out handler
@@ -1273,6 +2170,11 @@ pub struct ReloadOutcome {
     /// settings reload errored) and the previous resources were kept. Soft
     /// diagnostics (skill shadowing, name validation) do not set this.
     pub had_errors: bool,
+    /// The project-trust policy this reload actually resolved and applied.
+    /// `None` when the reload failed hard and kept the previous resources, so
+    /// consumers (e.g. theme discovery) should stay on the snapshot they
+    /// already match instead of re-reading a stale startup bool.
+    pub project_trusted: Option<bool>,
 }
 
 struct PreparedReloadInputs {
@@ -1325,6 +2227,20 @@ async fn reload_extension_resources_inner<F>(
 where
     F: FnOnce() + Send,
 {
+    if harness.has_exact_resources()
+        || ctx.args.resource_config.is_some()
+        || ctx.args.resource_transition.is_some()
+    {
+        return ReloadOutcome {
+            summary:
+                "Exact resource selection is restart-required; reload/dev hot apply unsupported"
+                    .into(),
+            had_warnings: true,
+            details: Vec::new(),
+            had_errors: true,
+            project_trusted: None,
+        };
+    }
     // Resolve the arguments once for this reload. `rpi dev` may append its
     // freshly staged extension directory; every subsequent loader and policy
     // decision must observe that same effective set rather than falling back
@@ -1343,24 +2259,27 @@ where
                 had_warnings: true,
                 details: Vec::new(),
                 had_errors: true,
+                project_trusted: None,
             };
         }
     }
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
-    let project_trusted = resolve_project_trust(&effective_args, &ctx.cwd);
-    let prepared = match prepare_reload_inputs(&effective_args, &ctx.cwd, project_trusted) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return ReloadOutcome {
-                summary: format!(
-                    "Settings reload failed: {error}. Keeping the currently loaded resources."
-                ),
-                had_warnings: true,
-                details: Vec::new(),
-                had_errors: true,
-            };
-        }
-    };
+    let project_trusted = resolve_project_trust_for(&ctx.home, &effective_args, &ctx.cwd);
+    let prepared =
+        match prepare_reload_inputs_for(&ctx.home, &effective_args, &ctx.cwd, project_trusted) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return ReloadOutcome {
+                    summary: format!(
+                        "Settings reload failed: {error}. Keeping the currently loaded resources."
+                    ),
+                    had_warnings: true,
+                    details: Vec::new(),
+                    had_errors: true,
+                    project_trusted: None,
+                };
+            }
+        };
     after_prepare();
     let PreparedReloadInputs {
         extension_dirs,
@@ -1368,23 +2287,6 @@ where
         prompt_base_dirs,
     } = prepared;
     let mut warnings = false;
-
-    // Shutdown callbacks must finish before a replacement can unload old DLLs.
-    // Ordinary lifecycle dispatch can time out or stop on a veto; unload cleanup
-    // instead joins every handler while keeping its module mapped.
-    let (shutdown_snapshot, shutdown_keepalive) = {
-        let session = ctx.extension_session.lock().unwrap();
-        (session.snapshot_arc(), session.keepalive())
-    };
-    if let Err(reason) = shutdown_extensions_for_reload(shutdown_snapshot, shutdown_keepalive).await
-    {
-        return ReloadOutcome {
-            summary: "Reload failed during extension shutdown".into(),
-            had_warnings: true,
-            details: vec![reason],
-            had_errors: true,
-        };
-    }
 
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
     // The fresh bridge carries the SAME `HarnessActionHost` (the host's harness
@@ -1412,11 +2314,17 @@ where
                 &_cell,
                 Arc::new(harness.clone()),
             );
-            Arc::new(action_host.with_session_dir(ctx.session_dir()))
+            Arc::new(
+                action_host
+                    .with_session_dir(ctx.session_dir())
+                    .with_fresh_session_only(ctx.fresh_session_only)
+                    .with_native_durable(ctx.args.native_durable),
+            )
         }
     };
 
     let reload_cb = rpi_extensions::reload_callback_from_mailbox(ctx.mailbox.clone());
+    let publish_host = Arc::clone(&host);
     let fresh_bridge = rpi_extensions::ActionBridge::with_reload_and_ui(
         ctx.runtime.clone(),
         host,
@@ -1430,11 +2338,25 @@ where
         rpi_extensions::ExtensionSession::none()
     } else {
         load_extensions_from_dirs(
+            &ctx.home,
             &effective_args,
             &extension_dirs,
             Some(Arc::clone(&fresh_bridge)),
+            Some(ctx.resource_leases.clone()),
         )
     };
+    if effective_args.native_durable {
+        if let Err(error) = validate_durable_extensions(&extension_session) {
+            return ReloadOutcome {
+                summary: "Reload rejected because an extension conflicts with native durable"
+                    .into(),
+                had_warnings: true,
+                details: vec![error],
+                had_errors: true,
+                project_trusted: None,
+            };
+        }
+    }
     if extension_session.is_empty() && !effective_args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
         // warning per se, but note it.
@@ -1480,6 +2402,7 @@ where
                         current.provider
                     )],
                     had_errors: true,
+                    project_trusted: None,
                 };
             }
             args.provider = Some(current.provider.clone());
@@ -1490,6 +2413,7 @@ where
             }
         }
         match crate::provider::resolve_with_extensions(
+            &ctx.home,
             &args,
             &ctx.cwd,
             ctx.project_trusted,
@@ -1502,12 +2426,35 @@ where
                     had_warnings: true,
                     details: vec![error.to_string()],
                     had_errors: true,
+                    project_trusted: None,
                 }
             }
         }
     } else {
         None
     };
+
+    // Candidate loading and provider resolution above are not yet published to
+    // the live session. Do not tell existing extensions that their session is
+    // shutting down until every rejectable preparation step has
+    // succeeded; otherwise a rejected candidate would leave the old registry
+    // live after it had already received SessionShutdown. Candidate DLLs remain
+    // held by `extension_session`, so the old module is not unloaded before its
+    // shutdown handlers have joined.
+    let (shutdown_snapshot, shutdown_keepalive) = {
+        let session = ctx.extension_session.lock().unwrap();
+        (session.snapshot_arc(), session.keepalive())
+    };
+    if let Err(reason) = shutdown_extensions_for_reload(shutdown_snapshot, shutdown_keepalive).await
+    {
+        return ReloadOutcome {
+            summary: "Reload failed during extension shutdown".into(),
+            had_warnings: true,
+            details: vec![reason],
+            had_errors: true,
+            project_trusted: None,
+        };
+    }
 
     // ---- 2. Invalidate the old session + bridge BEFORE the swap ----
     // The old registry's `active` flag flips false so any in-flight
@@ -1539,12 +2486,25 @@ where
 
     // The session was swapped atomically above; expose its matching bridge.
     *ctx.action_bridge.lock().unwrap() = Some(Arc::clone(&fresh_bridge));
+    // Republish the registry so `ListCommands` reflects the commands the reload
+    // just discovered — without this a remote UI keeps serving the startup set
+    // until the host process restarts. Via the trait method because all we hold
+    // here is `Arc<dyn RuntimeActionHost>`.
+    // Publish even when the reload found nothing: a nonempty -> empty reload
+    // returns `ExtensionSession::none()`, and skipping it would leave the old
+    // snapshot advertised.
+    publish_host.publish_registry_opt(extension_session.snapshot_arc());
 
     // ---- 3. resources_discover ("reload") over the fresh snapshot ----
     let discovered = extension_session
         .snapshot_arc()
         .map(|snap| rpi_extensions::emit_resources_discover(&cwd_str, "reload", &snap))
         .unwrap_or_default();
+    // Publish the fresh theme paths so the TUI registry rebuild sees the same
+    // set the skill/prompt loaders just consumed.
+    if let Ok(mut guard) = ctx.discovered_theme_paths.lock() {
+        *guard = discovered.theme_paths.clone();
+    }
 
     // ---- 4. Re-run the Part-A loaders (same precedence + --no-* gates) ----
     let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
@@ -1593,7 +2553,7 @@ where
     let context_files = if effective_args.no_context_files || !project_trusted {
         Vec::new()
     } else {
-        let agent_dir = crate::config::agent_dir().ok();
+        let agent_dir = ctx.home.root().ok();
         let agent_dir_path = agent_dir.unwrap_or_else(|| ctx.cwd.clone());
         load_project_context_files(&env_dyn, &ctx.cwd, &agent_dir_path).await
     };
@@ -1654,8 +2614,17 @@ where
     // on top, mirroring `build`. Built before the
     // prompt so the prompt lists exactly the active tools.
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
-    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
-    let mut tools = build_tools(&tool_ctx, &effective_args);
+    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env))
+        .with_file_io(ctx.file_io.clone());
+    // Reuse the binding installed in the durable context hook at startup;
+    // constructing a fresh OnceLock here would register a durable tool that
+    // can never resolve its owning harness.
+    let mut tools = build_tools_bound(
+        &ctx.home,
+        &tool_ctx,
+        &effective_args,
+        Some(&ctx.durable_binding),
+    );
     merge_extension_tools(
         &mut tools,
         &extension_session,
@@ -1665,19 +2634,26 @@ where
     let mut active = active_tool_names(&tools, &effective_args);
     active = filter_active_tool_names(active, &effective_args);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+        None if project_trusted => match ctx.home.discover_system_prompt_file(&ctx.cwd, true) {
+            Some(path) => {
+                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
+            None => default_prompt(),
         },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_prompt(),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
@@ -1686,7 +2662,7 @@ where
     }
     if effective_args.append_system_prompt.is_empty() {
         if let Some(path) = project_trusted
-            .then(|| discover_append_system_prompt_file(&ctx.cwd))
+            .then(|| ctx.home.discover_append_system_prompt_file(&ctx.cwd))
             .flatten()
         {
             if let Some(text) = read_prompt_source(&path, &mut context_paths) {
@@ -1794,6 +2770,7 @@ where
         // Reload completed; any diagnostics here are soft (shadowing / name
         // validation / skipped optional resources), not hard failures.
         had_errors: false,
+        project_trusted: Some(project_trusted),
     }
 }
 
@@ -1828,6 +2805,7 @@ fn reload_reads_settings(args: &Args) -> bool {
 /// snapshot intentionally excludes UI/model fields that `/reload` does not
 /// use, so an unrelated settings save does not invalidate the operation.
 fn load_reload_settings_snapshot(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
@@ -1835,7 +2813,8 @@ fn load_reload_settings_snapshot(
     if !reload_reads_settings(args) {
         return Ok(None);
     }
-    let global = crate::settings::load_settings()
+    let global = home
+        .settings()
         .map_err(|error| format!("could not load global settings: {error}"))?
         .into();
     let project = if project_trusted {
@@ -1856,17 +2835,25 @@ fn validate_settings_for_reload(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<(), String> {
-    load_reload_settings_snapshot(args, cwd, project_trusted).map(|_| ())
+    load_reload_settings_snapshot(
+        &crate::config::AgentHome::process(),
+        args,
+        cwd,
+        project_trusted,
+    )
+    .map(|_| ())
 }
 
-fn prepare_reload_inputs(
+fn prepare_reload_inputs_for(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedReloadInputs, String> {
-    prepare_reload_inputs_inner(args, cwd, project_trusted, || {})
+    prepare_reload_inputs_inner_for(home, args, cwd, project_trusted, || {})
 }
 
+#[cfg(test)]
 fn prepare_reload_inputs_inner<F>(
     args: &Args,
     cwd: &Path,
@@ -1876,43 +2863,46 @@ fn prepare_reload_inputs_inner<F>(
 where
     F: FnOnce(),
 {
-    let settings_before = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+    prepare_reload_inputs_inner_for(
+        &crate::config::AgentHome::process(),
+        args,
+        cwd,
+        project_trusted,
+        before_verify,
+    )
+}
 
-    let mut extension_dirs = if args.no_extensions || args.dev_local_only {
-        Vec::new()
-    } else if args.project_only {
-        project_extension_dirs(cwd)
-    } else if project_trusted {
-        extension_dirs(cwd)
-    } else {
-        global_extension_dirs()
-    };
-    if !args.no_extensions {
-        extension_dirs.extend(args.extensions_dir.iter().cloned());
-    }
+fn prepare_reload_inputs_inner_for<F>(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    before_verify: F,
+) -> Result<PreparedReloadInputs, String>
+where
+    F: FnOnce(),
+{
+    let settings_before = load_reload_settings_snapshot(home, args, cwd, project_trusted)?;
 
-    let skill_base_dirs = if args.no_skills {
-        Vec::new()
-    } else if args.dev_local_only || args.project_only {
-        project_skill_dirs(cwd)
-    } else if project_trusted {
-        skill_dirs(cwd)
-    } else {
-        global_skill_dirs()
-    };
-
-    let prompt_base_dirs = if args.no_prompt_templates {
-        Vec::new()
-    } else if args.dev_local_only || args.project_only {
-        project_prompt_template_dirs(cwd)
-    } else if project_trusted {
-        prompt_template_dirs(cwd)
-    } else {
-        global_prompt_template_dirs()
-    };
+    let extension_dirs = resource_root_dirs(
+        home,
+        args,
+        cwd,
+        project_trusted,
+        ResourceRootKind::Extensions,
+    );
+    let skill_base_dirs =
+        resource_root_dirs(home, args, cwd, project_trusted, ResourceRootKind::Skills);
+    let prompt_base_dirs = resource_root_dirs(
+        home,
+        args,
+        cwd,
+        project_trusted,
+        ResourceRootKind::PromptTemplates,
+    );
 
     before_verify();
-    let settings_after = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+    let settings_after = load_reload_settings_snapshot(home, args, cwd, project_trusted)?;
     if settings_before != settings_after {
         return Err(
             "settings changed while reload inputs were being prepared; retry /reload".to_string(),
@@ -2009,10 +2999,18 @@ fn build_models_with_extensions(
 /// Resolve project resource loading without prompting. Explicit CLI overrides
 /// win, then a stored decision; projects with no decision load by default.
 pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
+    resolve_project_trust_for(&crate::config::AgentHome::process(), args, cwd)
+}
+
+pub(crate) fn resolve_project_trust_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+) -> bool {
     if let Some(override_value) = args.trust_override {
         return override_value;
     }
-    crate::config::project_trust_decision(cwd)
+    home.project_trust_decision(cwd)
         .ok()
         .flatten()
         .unwrap_or(true)
@@ -2025,7 +3023,23 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
 /// `--extensions-dir` flags (scanned after the defaults — `args.rs`).
 /// Diagnostics are a no-op sink for now; load skips/ABI mismatches surface via
 /// the `--verbose` summary.
+fn startup_extension_dirs(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Vec<PathBuf> {
+    resource_root_dirs(
+        home,
+        args,
+        cwd,
+        project_trusted,
+        ResourceRootKind::Extensions,
+    )
+}
+
 pub(crate) fn load_extensions(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
@@ -2034,39 +3048,141 @@ pub(crate) fn load_extensions(
     if args.no_extensions {
         return ExtensionSession::none();
     }
-    let mut dirs = if args.dev_local_only {
-        Vec::new()
-    } else if args.project_only {
-        project_extension_dirs(cwd)
-    } else if project_trusted {
-        extension_dirs(cwd)
-    } else {
-        global_extension_dirs()
+    let dirs = startup_extension_dirs(home, args, cwd, project_trusted);
+    let leases = match crate::resource_management::host_leases_for(home, cwd) {
+        Ok(leases) => leases,
+        Err(error) => {
+            eprintln!("warning: refusing extension loading: {error}");
+            return ExtensionSession::none();
+        }
     };
-    dirs.extend(args.extensions_dir.iter().cloned());
-    load_extensions_from_dirs(args, &dirs, action_bridge)
+    load_extensions_from_dirs(home, args, &dirs, action_bridge, Some(leases))
+}
+
+/// Replace the default global extension directory with the registry-selected
+/// file list. The loader otherwise scans every cdylib in that directory,
+/// which re-loads retired versioned artifacts after an rpi-web update and
+/// makes two `ownsStdio` extensions race for stdio ownership.
+///
+/// Only the conventional `<agent_dir>/extensions` directory is rewritten.
+/// Project dirs and user-configured extension dirs stay directory-scanned;
+/// unmanaged legacy cdylibs in the global dir are preserved explicitly.
+fn registry_aware_extension_inputs(
+    dirs: &[PathBuf],
+    explicit_files: &[PathBuf],
+    agent_dir_home: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    // `agent_dir` owns the registry file; `global_dir` is the directory the
+    // loader would otherwise scan. Keep both: the helpers take the agent dir.
+    // `agent_dir_home` is already resolved from the session's `AgentHome`;
+    // never re-resolve it from the process environment here.
+    let agent_dir = agent_dir_home.map(Path::to_path_buf);
+    let global_dir = agent_dir.as_ref().map(|dir| dir.join("extensions"));
+    let mut filtered_dirs = Vec::with_capacity(dirs.len());
+    let mut files = explicit_files.to_vec();
+    let mut global_dir_handled = false;
+    for dir in dirs {
+        let is_global = global_dir
+            .as_ref()
+            .is_some_and(|global| same_extension_dir(global, dir));
+        if is_global {
+            if !global_dir_handled {
+                global_dir_handled = true;
+                // An unreadable registry cannot tell us which artifacts are
+                // retired, so fall back to the historical directory scan rather
+                // than silently loading no global extension at all.
+                let selection = agent_dir.as_ref().map(|agent| {
+                    (
+                        crate::install::active_global_native_package_artifacts_at(agent),
+                        crate::install::unregistered_global_native_package_artifacts_at(agent),
+                    )
+                });
+                match selection {
+                    Some((Ok(active), Ok(legacy))) => {
+                        files.extend(active);
+                        files.extend(legacy);
+                    }
+                    _ => filtered_dirs.push(dir.clone()),
+                }
+            }
+            continue;
+        }
+        filtered_dirs.push(dir.clone());
+    }
+    (filtered_dirs, files)
+}
+
+fn same_extension_dir(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn load_extensions_from_dirs(
+    home: &crate::config::AgentHome,
     args: &Args,
     dirs: &[PathBuf],
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
+    let agent_dir = home.root().ok();
+    let (dirs, files) =
+        registry_aware_extension_inputs(dirs, &args.extension, agent_dir.as_deref());
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
     // host from any thread. The call site already gates `load_extensions` behind
     // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
     // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
     // and tests. Explicit `--extension`/`-e` files load after the dirs.
-    rpi_extensions::load_session_mixed(dirs, &args.extension, diagnostics, action_bridge)
+    rpi_extensions::load_session_mixed_guarded(
+        &dirs,
+        &files,
+        diagnostics,
+        action_bridge,
+        host_guard,
+    )
 }
 
-/// Merge the loaded extension tools into the built-in set. An extension tool
-/// overrides a same-named built-in; first-extension-wins across plugins is
-/// already guaranteed by the registry (`register_tool` keeps the prior). The
-/// explicit `--tools` allowlist / `--exclude-tools` denylist apply to the
-/// merged set (the built-ins were already filtered in [`build_tools`]).
+/// The host permanently owns both durable public names.
+/// Refuse rather than override, fall back to, or dual-write a legacy extension
+/// implementation. Stdio ownership is independent: adapters such as ACP and
+/// Web use it only to keep their protocol/server lifecycle alive while the
+/// native host still owns session durability.
+fn validate_durable_extensions(session: &ExtensionSession) -> Result<(), String> {
+    if let Some(snapshot) = session.snapshot() {
+        if reserved_durable_name(
+            snapshot.tools().iter().map(|tool| tool.tool.name.as_str()),
+            snapshot
+                .commands()
+                .iter()
+                .map(|command| command.name.as_str()),
+        ) {
+            return Err("extension durable tool or /durable command uses a host-reserved name; remove the legacy extension durable implementation (no automatic import or fallback)".into());
+        }
+    }
+    Ok(())
+}
+
+fn reserved_durable_name<'a>(
+    mut tools: impl Iterator<Item = &'a str>,
+    mut commands: impl Iterator<Item = &'a str>,
+) -> bool {
+    tools.any(|name| name == "durable")
+        || commands.any(|name| name.trim_start_matches('/') == "durable")
+}
+
+#[cfg(test)]
+#[path = "native_durable/session_tests.rs"]
+mod native_durable_session_tests;
+
+/// Merge extension tools into the built-ins. Ordinarily extensions override
+/// same-named built-ins (first extension wins); host-reserved durable names
+/// were already checked above. Both tool filters still apply to the merged set.
 fn merge_extension_tools(
     tools: &mut Vec<HarnessTool>,
     session: &ExtensionSession,
@@ -2098,17 +3214,24 @@ fn merge_extension_tools(
 /// forgotten `timeout` from hanging the run forever — the "卡住" report).
 /// `RPI_BASH_TIMEOUT` overrides; a model-supplied timeout always wins.
 pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
+    bash_options_for(&crate::config::AgentHome::process())
+}
+
+/// [`bash_options`] for one agent home.
+pub fn bash_options_for(
+    home: &crate::config::AgentHome,
+) -> rpi_tools::tools::bash::BashToolOptions {
     use rpi_tools::tools::bash::BashToolOptions;
     let default = std::env::var("RPI_BASH_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(120.0);
+        .unwrap_or(rpi_tools::tools::bash::DEFAULT_BASH_TIMEOUT_SECONDS);
     // Saved user defaults, matching how `defaultTools` is read in `build_tools`.
     // `shellCommandPrefix` is prepended to every command (upstream's key for
     // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
     // `BashToolOptions` nor `ShellCaptureOptions` carries a shell binary today, so
     // honouring it means plumbing one through pi-tools first.
-    let settings = crate::settings::load_settings().unwrap_or_default();
+    let settings = home.settings().unwrap_or_default();
     BashToolOptions {
         command_prefix: settings.shell_command_prefix.clone(),
         default_timeout: Some(default),
@@ -2116,7 +3239,22 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     }
 }
 
+#[cfg(test)]
 fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
+    build_tools_bound(
+        &crate::config::AgentHome::process(),
+        ctx,
+        args,
+        Some(&Arc::new(std::sync::OnceLock::new())),
+    )
+}
+
+pub(crate) fn build_tools_bound(
+    home: &crate::config::AgentHome,
+    ctx: &ExecutionToolContext,
+    args: &Args,
+    binding: Option<&Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>>,
+) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
@@ -2144,7 +3282,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ),
         (
             "bash",
-            HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
+            HarnessTool::new(create_bash_tool(ctx, Some(bash_options_for(home)))),
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
@@ -2154,17 +3292,43 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ),
     ];
 
+    if let Some(binding) = binding.filter(|_| args.native_durable) {
+        // Mixed read/write tool is NEVER safe for automatic replay.
+        all.push((
+            "durable",
+            HarnessTool::new(Arc::new(crate::native_durable::NativeDurableTool::new(
+                binding.clone(),
+            ))),
+        ));
+    }
+
     // Add PowerShell tool on Windows
     #[cfg(target_os = "windows")]
     all.push(("powershell", HarnessTool::new(create_powershell_tool(ctx))));
 
     // Apply default_tools from settings (if no CLI override)
-    if args.tools.is_none() {
-        if let Ok(settings) = crate::settings::load_settings() {
+    if args.tools.is_none() && args.resource_config.is_none() && args.resource_transition.is_none()
+    {
+        if let Ok(settings) = home.settings() {
             if let Some(default_tools) = &settings.default_tools {
                 all.retain(|(name, _)| default_tools.iter().any(|t| t == name));
             }
         }
+    }
+
+    // Host-integrated agent-to-agent messaging: only when the embedding host
+    // installed a delivery door. A bare CLI session never advertises a tool it
+    // cannot service.
+    if let Some(binding) = binding.filter(|_| {
+        crate::message_agent::handler_installed()
+            && tool_name_allowed(crate::message_agent::MESSAGE_AGENT_TOOL_NAME, args)
+    }) {
+        all.push((
+            crate::message_agent::MESSAGE_AGENT_TOOL_NAME,
+            HarnessTool::new(crate::message_agent::create_message_agent_tool(
+                binding.clone(),
+            )),
+        ));
     }
 
     // `--no-builtin-tools` disables the built-in set but would keep
@@ -2230,7 +3394,12 @@ where
 }
 
 /// Build the `Session` facade for the chosen selection.
-async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
+async fn build_session(
+    selection: &SessionSelection,
+    cwd: &str,
+    selected: Option<&crate::resource_selection::ResolvedSelection>,
+    prepared_restore: Option<rpi_harness::session::jsonl::PreparedJsonlRestore>,
+) -> Result<Session, BuildError> {
     match selection {
         SessionSelection::Ephemeral => Ok(ephemeral_session()),
         SessionSelection::New { dir, .. } => {
@@ -2245,8 +3414,17 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
         }
         SessionSelection::Latest { .. }
         | SessionSelection::ById { .. }
-        | SessionSelection::ByExactId { .. } => restore_session(selection, cwd).await,
-        SessionSelection::Fork { source, dir } => fork_session_at_launch(source, dir, cwd).await,
+        | SessionSelection::ByExactId { .. } => {
+            restore_session(selection, cwd, prepared_restore).await
+        }
+        SessionSelection::Fork {
+            source,
+            dir,
+            entry_id,
+            position,
+        } => {
+            fork_session_at_launch(source, dir, cwd, selected, entry_id.as_deref(), *position).await
+        }
     }
 }
 
@@ -2255,45 +3433,165 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
 /// match the request, then open the matched file and wrap it in a `Session`
 /// facade. The restored transcript renders into the TUI at startup and the
 /// harness continues appending to the same file.
-async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
-    // `list_typed` is newest-first; `Latest` takes the head, `ById` matches
-    // the id exactly or by file-name containment (so `--session 01a02…` or a
-    // partial id works, mirroring the TS id/path matching).
+async fn restore_session(
+    selection: &SessionSelection,
+    cwd: &str,
+    prepared_restore: Option<rpi_harness::session::jsonl::PreparedJsonlRestore>,
+) -> Result<Session, BuildError> {
+    // `resolve_restore_target` is newest-first; `Latest` takes the head, `ById`
+    // matches the id exactly or by file-name containment (so `--session 01a02…`
+    // or a partial id works, mirroring the TS id/path matching).
+    let Some(meta) = resolve_restore_target(selection, cwd).await? else {
+        return match selection {
+            // Exact id match only (pi `--session-id`): a missing session is
+            // created fresh under the selected dir instead of an error.
+            SessionSelection::ByExactId { id, dir } => {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
+                create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
+                    .await
+                    .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
+            }
+            SessionSelection::Latest { dir } => Err(BuildError::SessionNotFound {
+                requested: "the most recent session".to_string(),
+                dir: dir.display().to_string(),
+            }),
+            SessionSelection::ById { id, dir } => Err(BuildError::SessionNotFound {
+                requested: format!("session {id}"),
+                dir: dir.display().to_string(),
+            }),
+            _ => unreachable!("resolve_restore_target only returns None for restore selections"),
+        };
+    };
+    if let Some(prepared) = prepared_restore {
+        let prepared_meta = prepared.metadata();
+        if prepared_meta.id != meta.id {
+            return Err(BuildError::SessionOpen(
+                "session changed during restore preparation".into(),
+            ));
+        }
+        let storage = prepared
+            .commit()
+            .await
+            .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
+        let progress_upgrade = StartupSpan::start(Phase::ProgressUpgrade);
+        let storage = storage
+            .enable_progress_under_exclusive_lock()
+            .await
+            .map_err(|e| BuildError::SessionOpen(format!("upgrade {}: {e}", meta.path)))?;
+        progress_upgrade.finish();
+        return Ok(Session::new(Arc::new(storage), None));
+    }
+    let sessions_root = selection_dir(selection);
+    open_session(&meta, cwd, &sessions_root)
+        .await
+        .map(|restored| restored.session)
+}
+
+/// The sessions root a selection was resolved against.
+fn selection_dir(selection: &SessionSelection) -> PathBuf {
+    match selection {
+        SessionSelection::Ephemeral => PathBuf::new(),
+        SessionSelection::New { dir, .. }
+        | SessionSelection::Latest { dir }
+        | SessionSelection::ById { dir, .. }
+        | SessionSelection::ByExactId { dir, .. }
+        | SessionSelection::Fork { dir, .. } => dir.clone(),
+    }
+}
+
+/// Resolve the metadata a restore selection names, without opening the file.
+///
+/// Shared by the startup build ([`restore_session`]) and the cwd peek
+/// ([`peek_restored_session_cwd`]) so the two can never disagree about which
+/// session a launch restores. Pure listing + matching: no session lock is
+/// claimed and nothing is created.
+async fn resolve_restore_target(
+    selection: &SessionSelection,
+    cwd: &str,
+) -> Result<Option<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     match selection {
         SessionSelection::Latest { dir } => {
             let metas = list_session_metadata_in_dir(cwd, dir).await?;
-            let Some(meta) = first_resumable_session(&metas) else {
-                return Err(BuildError::SessionNotFound {
-                    requested: "the most recent session".to_string(),
-                    dir: dir.display().to_string(),
-                });
-            };
-            open_session(meta, cwd).await
+            Ok(first_resumable_session(&metas).cloned())
         }
-        SessionSelection::ById { id, dir } => open_session_by_id_in_dir(id, cwd, dir)
-            .await
-            .map_err(|e| match e {
-                OpenError::NotFound { requested } => BuildError::SessionNotFound {
-                    requested,
-                    dir: dir.display().to_string(),
-                },
-                OpenError::Other(msg) => BuildError::SessionOpen(msg),
-            }),
+        SessionSelection::ById { id, dir } => find_session_metadata(id, cwd, dir).await,
         SessionSelection::ByExactId { id, dir } => {
-            // Exact id match only (pi `--session-id`): restore when the
-            // session exists, else create a fresh one under the selected dir.
             let metas = list_session_metadata_in_dir(cwd, dir).await?;
-            if let Some(meta) = metas.iter().find(|m| m.id == *id) {
-                return open_session(meta, cwd).await;
-            }
-            std::fs::create_dir_all(dir)
-                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
-            create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
-                .await
-                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
+            Ok(metas.into_iter().find(|m| m.id == *id))
         }
-        _ => unreachable!("restore_session only called for Latest/ById/ByExactId"),
+        SessionSelection::Fork { .. }
+        | SessionSelection::New { .. }
+        | SessionSelection::Ephemeral => Ok(None),
     }
+}
+
+/// The metadata of the session whose id matches exactly or by file-name
+/// containment (so `--session 01a02…` / a partial id / a full file name all
+/// work), or `None` when nothing matches.
+async fn find_session_metadata(
+    id: &str,
+    cwd: &str,
+    dir: &Path,
+) -> Result<Option<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    let metas = list_session_metadata_in_dir(cwd, dir).await?;
+    Ok(metas
+        .into_iter()
+        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id)))
+}
+
+/// What a launch that would restore a session says about the working directory.
+pub(crate) struct RestoredSessionCwd {
+    /// The id of the session this launch will restore. The host pins it into
+    /// `args` so the later build opens exactly this session — a directory
+    /// listing taken twice can disagree (another `rpi` may write a newer
+    /// session in between), and adopting one session's directory while opening
+    /// another is the very bug this restores.
+    pub id: String,
+    /// The directory recorded in the session header.
+    pub recorded: PathBuf,
+    /// `Some` when the recorded directory still exists and the run adopts it;
+    /// `None` when the caller must fall back to the launch cwd and say so.
+    pub adopted: Option<PathBuf>,
+}
+
+/// The working directory the launch's restored session was created in, resolved
+/// WITHOUT opening, locking, or creating anything.
+///
+/// Read-only by design: this runs before trust resolution and extension
+/// preparation, where a failure must not take the run down — the real open
+/// happens later and surfaces its own errors. Returns `None` when the selection
+/// is not a restore (fresh/ephemeral/fork) or cannot be resolved.
+pub(crate) async fn peek_restored_session_cwd(
+    selection: &SessionSelection,
+    launch_cwd: &Path,
+) -> Option<RestoredSessionCwd> {
+    let cwd_str = launch_cwd.to_string_lossy().into_owned();
+    let meta = resolve_restore_target(selection, &cwd_str).await.ok()??;
+    let recorded = PathBuf::from(&meta.cwd);
+    if recorded.as_os_str().is_empty() {
+        return None;
+    }
+    Some(RestoredSessionCwd {
+        id: meta.id,
+        adopted: crate::session_cwd::resolve_session_cwd(&recorded),
+        recorded,
+    })
+}
+
+/// Pin a peeked restore target into `args` so the later build opens exactly the
+/// session the peek inspected.
+///
+/// `Latest` (`-c`) re-lists the session directory when the build runs, and
+/// another `rpi` may have written a newer session in between. Adopting one
+/// session's working directory while opening a different conversation would put
+/// the tools in a directory that conversation never used — the exact failure
+/// this adoption exists to prevent. Pinning the resolved id turns the second
+/// listing into an exact match instead of a fresh "newest" choice.
+pub(crate) fn pin_restored_selection(args: &mut Args, restored: &RestoredSessionCwd) {
+    args.continue_session = false;
+    args.resume = false;
+    args.session = Some(restored.id.clone());
 }
 
 /// `--fork <path|id>`: open the source session, fork it into a new JSONL
@@ -2302,6 +3600,9 @@ async fn fork_session_at_launch(
     source: &str,
     dir: &Path,
     cwd: &str,
+    selected: Option<&crate::resource_selection::ResolvedSelection>,
+    entry_id: Option<&str>,
+    position: Option<rpi_harness::session::types::ForkPosition>,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -2340,7 +3641,7 @@ async fn fork_session_at_launch(
         }
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             &source_meta,
             &JsonlSessionCreateOptions {
                 id: None,
@@ -2348,11 +3649,18 @@ async fn fork_session_at_launch(
                 cwd: cwd.to_string(),
                 metadata: None,
             },
-            &ForkOptions::default(),
+            &ForkOptions::Branch {
+                entry_id: entry_id.map(str::to_owned),
+                position,
+            },
+            |values| crate::resource_selection::fork_initial_values_for_selection(values, selected),
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
-    claim_session_lock(&fork_storage.jsonl_metadata().path).map_err(BuildError::SessionOpen)?;
+    fork_storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(fork_storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -2407,8 +3715,39 @@ impl std::fmt::Display for OpenError {
     }
 }
 
+/// Which sessions a picker lists. The default is [`Self::Project`]: with a
+/// shared `sessionDir`, a flat list over every cwd directory buries the current
+/// project's history (fork issue DavidHinton-xcpc/pi-rust#13). `All` is an
+/// explicit opt-in and rows carry their project so the list stays traceable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionScope {
+    #[default]
+    Project,
+    All,
+}
+
+impl SessionScope {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Project => Self::All,
+            Self::All => Self::Project,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "this project",
+            Self::All => "all projects",
+        }
+    }
+}
+
 /// List the JSONL session metadata under the default session dir, newest
 /// first. Shared by startup restore and the TUI `/session` hot-switch.
+///
+/// `list_session_metadata` intentionally stays unscoped: it resolves sessions
+/// to *open* (including `--continue`/`-c`), where filtering by cwd would make
+/// a session that the caller named by id unopenable. Only pickers apply a scope.
 pub async fn list_session_metadata(
     cwd: &str,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
@@ -2419,6 +3758,17 @@ pub async fn list_session_metadata(
 pub(crate) async fn list_session_metadata_in_dir(
     cwd: &str,
     dir: &Path,
+) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    list_session_metadata_in_scope_in_dir(cwd, dir, SessionScope::All).await
+}
+
+/// Scope-aware metadata listing for pickers. `Project` passes the cwd to the
+/// repo's typed list API, so the enumeration and the open path agree on which
+/// directory belongs to this project.
+pub(crate) async fn list_session_metadata_in_scope_in_dir(
+    cwd: &str,
+    dir: &Path,
+    scope: SessionScope,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -2433,9 +3783,21 @@ pub(crate) async fn list_session_metadata_in_dir(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    repo.list_typed(&JsonlSessionListOptions::default())
+    let options = JsonlSessionListOptions {
+        cwd: match scope {
+            SessionScope::Project => Some(cwd.to_string()),
+            SessionScope::All => None,
+        },
+    };
+    let metadata_lookup = StartupSpan::start(Phase::MetadataLookup);
+    let result = repo
+        .list_typed(&options)
         .await
-        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))
+        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")));
+    if result.is_ok() {
+        metadata_lookup.finish();
+    }
+    result
 }
 
 /// A cheap, display-oriented summary of one JSONL session file.
@@ -2639,8 +4001,19 @@ pub fn short_session_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+/// One listed session file. `project` is the cwd-encoded directory name when
+/// the row comes from a project subdirectory; `None` for legacy files that sit
+/// directly under the sessions root. The All view renders it so a flat list is
+/// still attributable to a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFileEntry {
+    pub path: PathBuf,
+    pub project: Option<String>,
+}
+
 /// Synchronously list every JSONL session file under `dir`, newest-first by
-/// modification time.
+/// modification time. Kept for callers that explicitly want the full set (e.g.
+/// resolving a session by id); pickers use [`list_session_files_in_scope_sync`].
 ///
 /// The repo's [`list_session_metadata`] is async and scans one cwd-encoded
 /// subdirectory level; the in-TUI `/session` selector runs on the blocking key
@@ -2648,32 +4021,102 @@ pub fn short_session_id(id: &str) -> &str {
 /// `.jsonl` files directly under `dir` and one level of subdirectories are
 /// accepted.
 pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    let mut visit = |path: PathBuf| {
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+    list_entries_sync(dir, None)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect()
+}
+
+/// Scope-aware synchronous listing for the `/session` selector.
+///
+/// `Project` resolves the current project's directory with the *same* encoding
+/// the repo uses for create/open (`jsonl_session_directory_name`), rather than
+/// re-deriving it: the old flat walk and the open path disagreed about which
+/// files belong to this project (fork issue #13). `All` keeps the old layout but
+/// tags each row with its project directory.
+pub fn list_session_files_in_scope_sync(
+    cwd: &Path,
+    dir: &Path,
+    scope: SessionScope,
+) -> Vec<SessionFileEntry> {
+    let project_dir = match scope {
+        SessionScope::Project => {
+            let resolved = normalize_cwd(cwd);
+            Some(rpi_harness::session::jsonl::jsonl_session_directory_name(
+                &resolved.to_string_lossy(),
+            ))
+        }
+        SessionScope::All => None,
+    };
+    match project_dir {
+        Some(name) => list_entries_sync(&dir.join(&name), None),
+        None => list_entries_sync(dir, Some(true)),
+    }
+}
+
+/// Mirror the repo's `absolute_path` normalization for a cwd path: the picker
+/// runs on the blocking key thread and cannot await the `FileSystem` trait, so
+/// this is the synchronous equivalent of `OsExecutionEnv::absolute_path`.
+fn normalize_cwd(cwd: &Path) -> PathBuf {
+    let absolute = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(cwd)
+    };
+    // Lexical normalization only (`.` / `..` components), no symlink or FS
+    // access — the repo's normalize_absolute is likewise purely lexical.
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn list_entries_sync(dir: &Path, tag_projects: Option<bool>) -> Vec<SessionFileEntry> {
+    let tag_projects = tag_projects.unwrap_or(false);
+    let mut files: Vec<(SessionFileEntry, std::time::SystemTime)> = Vec::new();
+    let mut visit = |path: PathBuf, project: Option<String>| {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+            || path.to_string_lossy().ends_with(".progress.jsonl")
+        {
             return;
         }
         let modified = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        files.push((path, modified));
+        files.push((SessionFileEntry { path, project }, modified));
     };
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                let project = if tag_projects {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
                 if let Ok(inner) = std::fs::read_dir(&path) {
                     for child in inner.flatten() {
-                        visit(child.path());
+                        visit(child.path(), project.clone());
                     }
                 }
             } else {
-                visit(path);
+                visit(path, None);
             }
         }
     }
     files.sort_by(|a, b| b.1.cmp(&a.1));
-    files.into_iter().map(|(path, _)| path).collect()
+    files.into_iter().map(|(entry, _)| entry).collect()
 }
 
 /// Pick the session `--continue`/`-c` should open: the newest session that has
@@ -2694,26 +4137,25 @@ fn first_resumable_session(
 /// TUI `/session` hot-switch calls this with the selector's item value.
 pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenError> {
     let dir = default_session_dir(Path::new(cwd));
-    open_session_by_id_in_dir(id, cwd, &dir).await
+    open_session_by_id_in_dir(id, cwd, &dir)
+        .await
+        .map(|restored| restored.session)
 }
 
 pub(crate) async fn open_session_by_id_in_dir(
     id: &str,
     cwd: &str,
     dir: &Path,
-) -> Result<Session, OpenError> {
-    let metas = list_session_metadata_in_dir(cwd, dir)
+) -> Result<RestoredSession, OpenError> {
+    let meta = find_session_metadata(id, cwd, dir)
         .await
         .map_err(|e| OpenError::Other(e.to_string()))?;
-    let Some(meta) = metas
-        .iter()
-        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id))
-    else {
+    let Some(meta) = meta else {
         return Err(OpenError::NotFound {
             requested: format!("session {id}"),
         });
     };
-    open_session(meta, cwd).await.map_err(|e| {
+    open_session(&meta, cwd, dir).await.map_err(|e| {
         OpenError::Other(match e {
             // `open_session` renders as "Could not open the saved session:
             // <reason>" via `BuildError`. Carry the bare reason so it is not
@@ -2814,7 +4256,7 @@ pub(crate) async fn fork_session_storage(
         return Err(format!("current session {id} not found on disk"));
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             source,
             &rpi_harness::session::jsonl::JsonlSessionCreateOptions {
                 id: None,
@@ -2823,10 +4265,14 @@ pub(crate) async fn fork_session_storage(
                 metadata: None,
             },
             &rpi_harness::session::types::ForkOptions::default(),
+            crate::resource_selection::fork_initial_values,
         )
         .await
         .map_err(|e| e.to_string())?;
-    claim_session_lock(&fork_storage.jsonl_metadata().path)?;
+    fork_storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(Session::new(Arc::new(fork_storage), None))
 }
 
@@ -2841,6 +4287,7 @@ pub(crate) async fn import_session_file(
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions, JsonlSessionStorage,
     };
+    use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
     let dir = if dir.is_absolute() {
@@ -2849,10 +4296,49 @@ pub(crate) async fn import_session_file(
         Path::new(cwd).join(dir)
     };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let staged = tempfile::NamedTempFile::new_in(&dir)
-        .map_err(|e| e.to_string())?
-        .into_temp_path();
-    std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+    // External writers must be closed. This process deliberately retains locks
+    // for previously opened sessions, so its own copies additionally verify a
+    // stable history around the sidecar snapshot (bind/entry before retirement).
+    let source_progress = PathBuf::from(format!("{}.progress.jsonl", source.display()));
+    let _source_lock = if source_progress.try_exists().map_err(|e| e.to_string())? {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(format!("{}.lock", source.display()))
+            .map_err(|e| format!("lock import source: {e}"))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
+            "close the source session before importing its recovery pair".to_owned()
+        })?;
+        Some(lock)
+    } else {
+        None
+    };
+    let staging = tempfile::tempdir_in(&dir).map_err(|e| e.to_string())?;
+    let staged = staging.path().join("history.stage");
+    let staged_progress = PathBuf::from(format!("{}.progress.jsonl", staged.display()));
+    let mut attempts = 0;
+    let has_progress = loop {
+        std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+        let copied_history = std::fs::read(&staged).map_err(|e| e.to_string())?;
+        let has_progress = match std::fs::copy(&source_progress, &staged_progress) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&staged_progress);
+                false
+            }
+            Err(error) => return Err(format!("copy progress import: {error}")),
+        };
+        if copied_history == std::fs::read(source).map_err(|e| e.to_string())? {
+            break has_progress;
+        }
+        attempts += 1;
+        if attempts >= 4 {
+            return Err(
+                "source history changed during import; retry when the session is idle".into(),
+            );
+        }
+        tokio::task::yield_now().await;
+    };
     let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let validated = JsonlSessionStorage::load(
         fs.clone(),
@@ -2862,8 +4348,33 @@ pub(crate) async fn import_session_file(
     )
     .await
     .map_err(|e| format!("invalid session import: {e}"))?;
+    validated
+        .read_progress("")
+        .await
+        .map_err(|e| format!("invalid recovery import: {e}"))?;
     let mut metadata = validated.jsonl_metadata().clone();
     drop(validated);
+    let text = std::fs::read_to_string(&staged).map_err(|e| e.to_string())?;
+    let (first, rest) = text
+        .split_once('\n')
+        .ok_or_else(|| "import has no complete header".to_owned())?;
+    let mut header =
+        rpi_harness::session::jsonl::codec::parse_header(first).map_err(|e| e.to_string())?;
+    if has_progress && header.progress_format.is_none() {
+        return Err("history-only artifact has an undeclared recovery companion".into());
+    }
+    // An imported history-only artifact receives the destination's empty store.
+    // Imports of live-format sessions retain their validated companion instead.
+    header.progress_format = Some("assistant-progress-v1".into());
+    std::fs::write(
+        &staged,
+        format!(
+            "{}{}",
+            rpi_harness::session::jsonl::codec::encode_header(&header),
+            rest
+        ),
+    )
+    .map_err(|e| e.to_string())?;
     if list_session_metadata_in_dir(cwd, &dir)
         .await
         .map_err(|e| e.to_string())?
@@ -2894,12 +4405,20 @@ pub(crate) async fn import_session_file(
         .map_err(|e| e.to_string())?;
     let path = destination.jsonl_metadata().path.clone();
     drop(destination);
-    if let Err(error) = claim_session_lock(&path) {
-        // Another process owns this destination; leave its file intact.
-        return Err(error);
-    }
-    if let Err(error) = staged.persist(&path) {
+    // Do not claim the session-level `.lock` here. The destination storage
+    // opened below owns the same OS lease; claiming it first would make this
+    // process conflict with itself. The JSONL storage lease is the
+    // authoritative writer fence for the imported session.
+    let destination_progress = format!("{path}.progress.jsonl");
+    let publish = (|| -> std::io::Result<()> {
+        if has_progress {
+            std::fs::rename(&staged_progress, &destination_progress)?;
+        }
+        std::fs::rename(&staged, &path)
+    })();
+    if let Err(error) = publish {
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&destination_progress);
         return Err(format!("publish import: {error}"));
     }
     metadata.path = path;
@@ -2910,64 +4429,37 @@ pub(crate) async fn import_session_file(
     Ok(Session::new(Arc::new(storage), None))
 }
 
-/// Session logs this process has claimed, so re-claiming is a no-op.
-static SESSION_LOCK_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-/// The held lock handles. Kept alive for the process lifetime — dropping the
-/// `File` would release the OS lock, so the guard is parked here.
-static SESSION_LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
-
-/// Claim the exclusive lock for a session log.
+/// A restored session together with the working directory it was created in.
 ///
-/// Two rpi processes appending to one JSONL diverge their `sequence` counters
-/// (duplicate / gapped seqs) and corrupt it. The lock is an OS advisory lock on
-/// `<path>.lock`: the second process gets a clear "already open" error instead
-/// of corrupting the log, and the OS releases it automatically when the holder
-/// exits (no stale-lock cleanup). Re-claiming a path this process already holds
-/// is a no-op, so the TUI's session hot-switch can re-open freely.
-fn claim_session_lock(session_path: &str) -> Result<(), String> {
-    let lock_path = PathBuf::from(format!("{session_path}.lock"));
-    if SESSION_LOCK_PATHS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap()
-        .contains(&lock_path)
-    {
-        return Ok(());
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| format!("open session lock {}: {e}", lock_path.display()))?;
-    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
-        return Err(format!(
-            "session {session_path} is already open in another rpi process"
-        ));
-    }
-    SESSION_LOCKS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(file);
-    SESSION_LOCK_PATHS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap()
-        .insert(lock_path);
-    Ok(())
+/// The recorded cwd is data for the host's notices, never a silent adoption:
+/// the launch path adopts the directory in [`app`](crate::app) before any
+/// resource loads (tools, extensions, system prompt, and trust all key off it),
+/// and the `/session` hot-switch does not move the running tools at all. Either
+/// way the user hears about the directory instead of the process quietly
+/// working somewhere unexpected.
+pub(crate) struct RestoredSession {
+    pub session: Session,
+    /// The directory recorded in the session header, when it still exists.
+    /// `None` when the record is empty or the path is gone (or is a file).
+    pub recorded_cwd: Option<PathBuf>,
 }
 
 /// Wrap an opened [`JsonlSessionStorage`] in the `Session` facade (shared by
 /// startup restore + TUI hot-switch).
+///
+/// `sessions_root` is passed in rather than re-derived from `cwd`: after a
+/// restore adopts the session's directory, `default_session_dir(cwd)` would
+/// name the ADOPTED project's tree, which is not where this session was found.
 async fn open_session(
     meta: &rpi_harness::session::jsonl::JsonlSessionMetadata,
     cwd: &str,
-) -> Result<Session, BuildError> {
+    sessions_root: &Path,
+) -> Result<RestoredSession, BuildError> {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
     use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
-    let dir = default_session_dir(Path::new(cwd));
+    let dir = sessions_root;
     let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let fs: Arc<dyn FileSystem> = env.clone();
     let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
@@ -2976,26 +4468,25 @@ async fn open_session(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    claim_session_lock(&meta.path).map_err(BuildError::SessionOpen)?;
     let storage = repo
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
-    // A session records the cwd it was created in. When that directory has
-    // since been removed, continuing silently in it is confusing; warn the
-    // user that we fell back to the process cwd (pi `getMissingSessionCwdIssue`).
-    if let Some(issue) = crate::session_cwd::get_missing_session_cwd_issue(
-        Some(Path::new(&meta.path)),
-        Path::new(&meta.cwd),
-        Path::new(cwd),
-    ) {
-        eprintln!(
-            "warning: {}",
-            crate::session_cwd::format_missing_session_cwd_error(&issue)
-        );
-    }
+    storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| BuildError::SessionOpen(format!("lock {}: {e}", meta.path)))?;
+    // Native saved sessions predating progressFormat remain read-only to plain
+    // storage loaders. Only this locked, not-yet-shared restore opts into writes.
+    let storage = storage
+        .enable_progress_under_exclusive_lock()
+        .await
+        .map_err(|e| BuildError::SessionOpen(format!("upgrade {}: {e}", meta.path)))?;
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
-    Ok(Session::new(storage_arc, None))
+    Ok(RestoredSession {
+        session: Session::new(storage_arc, None),
+        recorded_cwd: crate::session_cwd::resolve_session_cwd(Path::new(&meta.cwd)),
+    })
 }
 
 /// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`
@@ -3063,9 +4554,8 @@ pub(crate) async fn create_jsonl_session_with_id(
         .create_typed(&opts)
         .await
         .map_err(|e| format!("create session: {e}"))?;
-    claim_session_lock(&storage.jsonl_metadata().path)
-        .map_err(|e| format!("create session: {e}"))?;
-    // `JsonlSessionStorage` implements `SessionStorage`; wrap in the facade.
+    // `JsonlSessionStorage` acquires the storage-level lease during create;
+    // wrap it in the facade without a second CLI-owned lock table.
     let storage_arc: Arc<dyn rpi_harness::session::types::SessionStorage> = Arc::new(storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -3100,11 +4590,71 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
 }
 
 #[cfg(test)]
+mod goal_outbox_smoke_tests;
+#[cfg(test)]
 mod runtime_session_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_bridge_follows_reload_and_releases_its_session_with_the_bus() {
+        use rpi_harness::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OLD: AtomicUsize = AtomicUsize::new(0);
+        static NEW: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn old(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+            OLD.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        extern "C" fn new(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+            NEW.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let make = |handler: rpi_plugin_sdk::EventHandlerFn| {
+            let mut registry = rpi_extensions::ExtensionRegistry::new();
+            registry.register_event_handler(
+                "settlement".into(),
+                rpi_plugin_sdk::EventTag::AgentSettled,
+                handler,
+                std::ptr::null_mut(),
+            );
+            ExtensionSession::from_parts(
+                Arc::new(registry.snapshot()),
+                rpi_extensions::PluginKeepalive::empty(),
+                vec![],
+                None,
+            )
+        };
+        let sessions = Arc::new(Mutex::new(make(old)));
+        let weak = Arc::downgrade(&sessions);
+        let bus = HarnessEventBus::new();
+        install_extension_settlement_bridge(&bus, sessions.clone());
+        let ended = |outcome| {
+            HarnessEvent::RunEnd(RunEndEvent {
+                lane: "main".into(),
+                run_id: "run".into(),
+                outcome,
+                leaf_id: "leaf".into(),
+            })
+        };
+        bus.emit(&ended(RunEndOutcome::Completed));
+        assert_eq!(OLD.load(Ordering::SeqCst), 1);
+        *sessions.lock().unwrap() = make(new);
+        for outcome in [RunEndOutcome::Aborted, RunEndOutcome::Failed] {
+            bus.emit(&ended(outcome));
+        }
+        assert_eq!(OLD.load(Ordering::SeqCst), 1);
+        assert_eq!(NEW.load(Ordering::SeqCst), 2);
+        drop(sessions);
+        assert!(weak.upgrade().is_some());
+        drop(bus);
+        assert!(
+            weak.upgrade().is_none(),
+            "settlement observer must not create an ownership cycle"
+        );
+    }
 
     #[tokio::test]
     async fn unauthenticated_packages_are_not_reintroduced_as_legacy_adapters() {
@@ -3196,6 +4746,7 @@ mod tests {
                     std::fs::write(path, content).unwrap();
                 }
                 let resolved = crate::provider::resolve(
+                    &crate::config::AgentHome::process(),
                     Some("anthropic"),
                     Some(crate::provider::DEFAULT_MODEL_ID),
                     None,
@@ -3211,8 +4762,15 @@ mod tests {
                     trust_override: Some(true),
                     ..Default::default()
                 };
-                let (harness, _events, mut context) =
-                    build(&resolved, &args, &cwd, true).await.unwrap();
+                let (harness, _events, mut context) = build(
+                    &crate::config::AgentHome::process(),
+                    &resolved,
+                    &args,
+                    &cwd,
+                    true,
+                )
+                .await
+                .unwrap();
                 let resources = harness.get_resources().await.unwrap();
                 let path = |p: PathBuf| p.to_string_lossy().into_owned();
                 assert_eq!(
@@ -3389,6 +4947,402 @@ mod tests {
         assert!(invoke_test_tool_hook(&hook).await.is_none());
     }
 
+    /// Replaces every result with one text block that names what it saw:
+    /// `isError`, `details.blocked` and the first text of the result.
+    extern "C" fn label_test_tool_result(
+        event: rpi_plugin_sdk::StbStringRef,
+        out: *mut rpi_plugin_sdk::StbString,
+        _: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: the host keeps the envelope and the output slot live for the call.
+        let event: serde_json::Value = serde_json::from_str(unsafe { event.as_str() }).unwrap();
+        let text = format!(
+            "isError={} blocked={} text={}",
+            event["isError"],
+            event["details"]["blocked"],
+            event["content"][0]["text"].as_str().unwrap_or_default()
+        );
+        let patch = serde_json::json!({"content": [{"type": "text", "text": text}]});
+        unsafe { *out = rpi_plugin_sdk::StbString::from_string(patch.to_string()) };
+        0
+    }
+
+    extern "C" fn whitespace_then_reason_transform(
+        event: rpi_plugin_sdk::StbStringRef,
+        out: *mut rpi_plugin_sdk::StbString,
+        _: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: the host keeps the envelope and output slot live for the call.
+        let event: serde_json::Value = serde_json::from_str(unsafe { event.as_str() }).unwrap();
+        let reason = format!("REASON: {}", event["content"][0]["text"].as_str().unwrap());
+        let patch = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "   "},
+                {"type": "text", "text": reason}
+            ]
+        });
+        unsafe { *out = rpi_plugin_sdk::StbString::from_string(patch.to_string()) };
+        0
+    }
+
+    extern "C" fn redacting_test_tool_result(
+        _event: rpi_plugin_sdk::StbStringRef,
+        out: *mut rpi_plugin_sdk::StbString,
+        _: *mut std::ffi::c_void,
+    ) -> i32 {
+        let patch = serde_json::json!({
+            "content": [{"type": "text", "text": "REVIEW-REDACTED"}]
+        });
+        // SAFETY: the host keeps the output slot live for the callback.
+        unsafe { *out = rpi_plugin_sdk::StbString::from_string(patch.to_string()) };
+        0
+    }
+
+    /// A session with a `ToolCall` gate that vetoes every call and/or the
+    /// labelling `tool_result` transform.
+    fn test_session(gate: bool, transform: bool) -> ExtensionSession {
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        if gate {
+            registry.register_event_handler(
+                "gate".into(),
+                rpi_plugin_sdk::EventTag::ToolCall,
+                deny_test_tool_call,
+                std::ptr::null_mut(),
+            );
+        }
+        if transform {
+            registry.register_tool_result(
+                label_test_tool_result,
+                rpi_plugin_sdk::callbacks::free_string,
+                std::ptr::null_mut(),
+            );
+        }
+        ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            rpi_extensions::PluginKeepalive::empty(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn invoke_test_result_hook_future(
+        hook: &rpi_agent::AfterToolCall,
+        result: &rpi_agent::AgentToolResult,
+        is_error: bool,
+    ) -> futures::future::BoxFuture<'static, Option<rpi_agent::AfterToolCallResult>> {
+        let message = rpi_ai::providers::faux::faux_assistant_message(
+            "result",
+            rpi_ai::types::StopReason::ToolUse,
+        );
+        let rpi_ai::types::Content::ToolCall(call) =
+            rpi_ai::types::Content::tool_call("call", "bash", serde_json::json!({"command":"x"}))
+        else {
+            unreachable!()
+        };
+        hook(
+            rpi_agent::AfterToolCallContext {
+                assistant_message: &message,
+                tool_call: &call,
+                args: &call.arguments,
+                result,
+                is_error,
+                context: &rpi_agent::AgentContext::default(),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    async fn invoke_test_result_hook(
+        hook: &rpi_agent::AfterToolCall,
+        result: &rpi_agent::AgentToolResult,
+        is_error: bool,
+    ) -> Option<rpi_agent::AfterToolCallResult> {
+        invoke_test_result_hook_future(hook, result, is_error).await
+    }
+
+    fn first_text(content: &[rpi_agent::TextContentOrImage]) -> &str {
+        match content.first() {
+            Some(rpi_agent::TextContentOrImage::Text(text)) => &text.text,
+            _ => panic!("expected a text block"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_hook_transforms_success_and_error_results() {
+        let sessions = Arc::new(Mutex::new(ExtensionSession::none()));
+        let hook = extension_tool_result_hook(sessions.clone());
+        let output = rpi_agent::AgentToolResult::text("exit 3: secret output");
+        // No plugin, and a plugin without a transform: the result is untouched.
+        assert!(invoke_test_result_hook(&hook, &output, true)
+            .await
+            .is_none());
+        *sessions.lock().unwrap() = test_session(true, false);
+        assert!(invoke_test_result_hook(&hook, &output, true)
+            .await
+            .is_none());
+
+        // A transform added later (as by /reload) sees success and error results.
+        *sessions.lock().unwrap() = test_session(false, true);
+        for is_error in [false, true] {
+            let changed = invoke_test_result_hook(&hook, &output, is_error)
+                .await
+                .expect("the transform changed the result");
+            assert_eq!(
+                first_text(changed.content.as_deref().unwrap()),
+                format!("isError={is_error} blocked=null text=exit 3: secret output")
+            );
+            assert!(
+                changed.is_error.is_none(),
+                "the transform does not change whether the call failed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_hook_withholds_the_result_when_the_session_lock_is_poisoned() {
+        let sessions = Arc::new(Mutex::new(test_session(false, true)));
+        let poison = sessions.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison the session lock");
+        })
+        .join();
+        let hook = extension_tool_result_hook(sessions);
+        let output = rpi_agent::AgentToolResult::text("secret output");
+        let changed = invoke_test_result_hook(&hook, &output, false)
+            .await
+            .expect("withheld");
+        assert_eq!(
+            first_text(changed.content.as_deref().unwrap()),
+            TOOL_RESULT_WITHHELD
+        );
+    }
+
+    #[tokio::test]
+    async fn vetoed_call_reason_passes_through_the_tool_result_transforms() {
+        // Without a transform the model reads the host's reason.
+        let sessions = Arc::new(Mutex::new(test_session(true, false)));
+        let hook =
+            extension_tool_call_hook(sessions.clone(), rpi_extensions::UiDialogMailbox::new());
+        let host_reason = invoke_test_tool_hook(&hook).await.unwrap().reason.unwrap();
+        assert!(host_reason.contains("gate"));
+
+        // With one, the transform's text replaces it, and the transform can
+        // tell a vetoed call from a failed one.
+        *sessions.lock().unwrap() = test_session(true, true);
+        let result = invoke_test_tool_hook(&hook).await.unwrap();
+        assert!(result.block);
+        assert_eq!(
+            result.reason.unwrap(),
+            format!("isError=true blocked=true text={host_reason}")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_reload_between_snapshot_capture_and_dispatch_withholds_result() {
+        let old_session = test_session(false, true);
+        let old_snapshot = old_session.snapshot_arc().expect("test transform");
+        let sessions = Arc::new(Mutex::new(old_session));
+        let hook = extension_tool_result_hook(sessions.clone());
+        let output = rpi_agent::AgentToolResult::text("secret output");
+        // Capture the hook's future without polling it: the session snapshot
+        // is already fixed, exactly as it is before dispatch to the blocking
+        // callback.
+        let pending = invoke_test_result_hook_future(&hook, &output, false);
+
+        // Invalidate/swap as /reload does before the captured future runs.
+        old_snapshot.active_flag().store(false, Ordering::SeqCst);
+        *sessions.lock().unwrap() = test_session(false, true);
+
+        let changed = pending.await.expect("stale dispatch fails closed");
+        assert_eq!(
+            first_text(changed.content.as_deref().unwrap()),
+            TOOL_RESULT_WITHHELD
+        );
+    }
+
+    #[tokio::test]
+    async fn review_veto_uses_first_nonempty_text() {
+        let sessions = Arc::new(Mutex::new(test_session(true, false)));
+        let hook =
+            extension_tool_call_hook(sessions.clone(), rpi_extensions::UiDialogMailbox::new());
+        let host_reason = invoke_test_tool_hook(&hook).await.unwrap().reason.unwrap();
+
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "gate".into(),
+            rpi_plugin_sdk::EventTag::ToolCall,
+            deny_test_tool_call,
+            std::ptr::null_mut(),
+        );
+        registry.register_tool_result(
+            whitespace_then_reason_transform,
+            rpi_plugin_sdk::callbacks::free_string,
+            std::ptr::null_mut(),
+        );
+        *sessions.lock().unwrap() = ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            rpi_extensions::PluginKeepalive::empty(),
+            Vec::new(),
+            None,
+        );
+
+        let result = invoke_test_tool_hook(&hook).await.unwrap();
+        assert!(result.block);
+        assert_eq!(result.reason.unwrap(), format!("REASON: {host_reason}"));
+    }
+
+    #[tokio::test]
+    async fn review_validation_error_passes_through_cli_result_transform() {
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        registry.register_tool_result(
+            redacting_test_tool_result,
+            rpi_plugin_sdk::callbacks::free_string,
+            std::ptr::null_mut(),
+        );
+        let sessions = Arc::new(Mutex::new(ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            rpi_extensions::PluginKeepalive::empty(),
+            Vec::new(),
+            None,
+        )));
+        let after = extension_tool_result_hook(sessions);
+        let mut context = rpi_agent::AgentContext::default();
+        context.tools = vec![Arc::new(SchemaTool {
+            schema: rpi_ai::types::Tool {
+                name: "integer".into(),
+                description: "accepts an integer".into(),
+                parameters: rpi_ai::types::Schema::new(serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"]
+                })),
+                constrained_sampling: None,
+            },
+        })];
+        let tool_call = match rpi_ai::types::Content::tool_call(
+            "call",
+            "integer",
+            serde_json::json!({"value": "invalid-secret"}),
+        ) {
+            rpi_ai::types::Content::ToolCall(call) => call,
+            _ => unreachable!(),
+        };
+        let assistant = rpi_ai::providers::faux::faux_assistant_message(
+            rpi_ai::providers::faux::FauxBlock::ToolCall {
+                name: "integer".into(),
+                id: "call".into(),
+                arguments: tool_call.arguments.clone(),
+            },
+            rpi_ai::types::StopReason::ToolUse,
+        );
+        context
+            .messages
+            .push(rpi_agent::message::AgentMessage::Assistant(Box::new(
+                assistant,
+            )));
+        let (collector, events) = rpi_agent::events::CollectorEmitter::new();
+        let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
+        let config = rpi_agent::hooks::AgentLoopConfig {
+            model: rpi_ai::model::Model::new(
+                "test",
+                "test",
+                rpi_ai::types::Api::Other("test".into()),
+                "test",
+                "",
+            ),
+            convert_to_llm: rpi_agent::hooks::default_convert_to_llm_fn(),
+            convert_to_llm_incremental: None,
+            transform_context: None,
+            get_api_key: None,
+            should_stop_after_turn: None,
+            prepare_next_turn: None,
+            after_tool_results: None,
+            get_steering_messages: None,
+            get_follow_up_messages: None,
+            pending_message_count: None,
+            before_tool_call: None,
+            after_tool_call: Some(after),
+            provider_hooks: None,
+            tool_execution: rpi_agent::types::ToolExecutionMode::Sequential,
+            thinking_level: rpi_ai::types::ThinkingLevel::default(),
+            api_key: None,
+            timeout: None,
+            stream_idle_timeout: None,
+            max_retries: None,
+            max_retry_delay: None,
+            cache_retention: rpi_ai::provider::CacheRetention::default(),
+            session_id: None,
+            signal: tokio_util::sync::CancellationToken::new(),
+        };
+        // Only the pending assistant's tool calls run; the empty stream fn is
+        // never called before the loop finishes this batch.
+        let stream_fn = rpi_agent::stream_fn::stream_fn(|_, _, opts| {
+            let (mut producer, stream) =
+                rpi_ai::event_stream::create_assistant_message_event_stream_with_cancellation(
+                    &opts.signal,
+                );
+            tokio::spawn(async move {
+                let message = rpi_ai::types::AssistantMessage::terminal(
+                    rpi_ai::types::Api::Other("test".into()),
+                    "test",
+                    "test",
+                    rpi_ai::types::StopReason::Stop,
+                    "done",
+                    0,
+                );
+                producer
+                    .push(rpi_ai::types::AssistantMessageEvent::Done {
+                        reason: rpi_ai::types::DoneReason::Stop,
+                        message,
+                    })
+                    .await;
+            });
+            stream
+        });
+        rpi_agent::run_agent_loop_from_assistant(context, config, emit, stream_fn)
+            .await
+            .expect("agent loop finishes");
+
+        let events = events.lock().unwrap();
+        let result = events.iter().find_map(|event| match event {
+            rpi_agent::AgentEvent::ToolExecutionEnd { result, .. } => Some(result),
+            _ => None,
+        });
+        let result = result.expect("validation failure reaches tool execution end");
+        let text = match &result.content[0] {
+            rpi_agent::TextContentOrImage::Text(text) => &text.text,
+            _ => panic!("expected a text result"),
+        };
+        assert_eq!(text, "REVIEW-REDACTED");
+        assert!(!text.contains("invalid-secret"));
+        assert!(!text.contains("Received arguments"));
+    }
+
+    /// Minimal schema-only tool for the immediate-validation regression.
+    struct SchemaTool {
+        schema: rpi_ai::types::Tool,
+    }
+
+    #[async_trait::async_trait]
+    impl rpi_agent::AgentTool for SchemaTool {
+        fn schema(&self) -> &rpi_ai::types::Tool {
+            &self.schema
+        }
+        fn label(&self) -> &str {
+            "schema tool"
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+            _on_update: Arc<dyn Fn(rpi_agent::types::ToolResultPartial) + Send + Sync>,
+        ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::AgentError> {
+            unreachable!("invalid arguments must not execute this tool")
+        }
+    }
+
     /// A unique scratch file for one summary test.
     fn scratch(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -3494,6 +5448,94 @@ mod tests {
         std::fs::remove_file(&content).ok();
     }
 
+    #[tokio::test]
+    async fn import_preserves_validates_and_locks_the_recovery_pair() {
+        use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
+        use rpi_harness::session::types::{
+            AssistantFrameOp, AssistantFrameRecord, RecordBase, SessionStorage,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.jsonl");
+        let progress = tmp.path().join("source.jsonl.progress.jsonl");
+        let fs: Arc<dyn rpi_tools::FileSystem> =
+            Arc::new(OsExecutionEnv::with_cwd(tmp.path().into()));
+        let storage = JsonlSessionStorage::create(
+            fs,
+            &source.to_string_lossy(),
+            JsonlV4Header::new("import-pair".into(), 1, "/".into(), None, None, None),
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        storage
+            .append_progress(vec![AssistantFrameRecord {
+                base: RecordBase {
+                    id: "accepted-prefix".into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"payload":"keep"})),
+            }])
+            .await
+            .unwrap();
+        drop(storage);
+        let original = std::fs::read(&progress).unwrap();
+        let destination = tmp.path().join("imported");
+        let imported = import_session_file(&source, &tmp.path().to_string_lossy(), &destination)
+            .await
+            .unwrap();
+        assert_eq!(
+            imported.read_progress("run").await.unwrap()[0].base.id,
+            "accepted-prefix"
+        );
+        assert_eq!(
+            std::fs::read(&progress).unwrap(),
+            original,
+            "import must not repair or mutate its source"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(tmp.path().join("source.jsonl.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("busy")
+        )
+        .await
+        .is_err());
+        drop(lock);
+        let mut corrupt = String::from_utf8(original.clone()).unwrap();
+        corrupt = corrupt.replace(
+            "\"session_id\":\"import-pair\"",
+            "\"session_id\":\"foreign\"",
+        );
+        assert_ne!(corrupt.as_bytes(), original.as_slice());
+        std::fs::write(&progress, corrupt).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("foreign")
+        )
+        .await
+        .is_err());
+        std::fs::remove_file(&progress).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("missing")
+        )
+        .await
+        .is_err());
+    }
+
     #[test]
     fn list_session_files_sync_walks_the_cwd_subdirectory() {
         let root = std::env::temp_dir().join(format!("rpi-summary-{}-dir", std::process::id()));
@@ -3501,9 +5543,129 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let file = nested.join("2026-01-01_a.jsonl");
         std::fs::write(&file, "{}\n").unwrap();
+        let sidecar = nested.join("2026-01-01_a.jsonl.progress.jsonl");
+        std::fs::write(&sidecar, "{}\n").unwrap();
         let found = list_session_files_sync(&root);
         assert!(found.iter().any(|p| p == &file));
+        assert!(!found.contains(&sidecar));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Regression for fork issue #13: with a shared session root, the default
+    /// picker scope must show only this project's sessions, and All must show
+    /// every project with its directory tag so a flat list stays traceable.
+    #[test]
+    fn review_issue13_default_scope_is_this_project_and_all_is_tagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        let own = root.join(rpi_harness::session::jsonl::jsonl_session_directory_name(
+            &cwd.to_string_lossy(),
+        ));
+        let foreign = root.join("--some-other-project--");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        let own_file = own.join("2026-01-01_own.jsonl");
+        let foreign_file = foreign.join("2026-01-02_foreign.jsonl");
+        std::fs::write(&own_file, "{}\n").unwrap();
+        std::fs::write(&foreign_file, "{}\n").unwrap();
+        // A legacy file directly under the root is not a project subdirectory.
+        let legacy = root.join("2026-01-03_legacy.jsonl");
+        std::fs::write(&legacy, "{}\n").unwrap();
+
+        let project = list_session_files_in_scope_sync(&cwd, &root, SessionScope::Project);
+        assert_eq!(project.len(), 1, "default scope must not flatten projects");
+        assert_eq!(project[0].path, own_file);
+        assert_eq!(project[0].project, None);
+
+        let all = list_session_files_in_scope_sync(&cwd, &root, SessionScope::All);
+        assert_eq!(all.len(), 3);
+        let own_project = own.file_name().unwrap().to_str().unwrap();
+        assert!(all
+            .iter()
+            .any(|e| e.path == own_file && e.project.as_deref() == Some(own_project)));
+        assert!(all
+            .iter()
+            .any(|e| e.path == foreign_file
+                && e.project.as_deref() == Some("--some-other-project--")));
+        assert!(all.iter().any(|e| e.path == legacy && e.project.is_none()));
+
+        assert_eq!(SessionScope::Project.toggled(), SessionScope::All);
+        assert_eq!(SessionScope::All.toggled(), SessionScope::Project);
+        assert_eq!(SessionScope::default(), SessionScope::Project);
+    }
+
+    /// The project directory name must be the repo's own encoding, not a
+    /// re-derivation that drifts from create/open. A relative cwd resolves
+    /// against the process cwd the same way `OsExecutionEnv::absolute_path` does.
+    #[test]
+    fn review_issue13_project_scope_uses_the_repo_directory_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        let name =
+            rpi_harness::session::jsonl::jsonl_session_directory_name(&cwd.to_string_lossy());
+        std::fs::create_dir_all(root.join(&name)).unwrap();
+        let file = root.join(&name).join("a.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        // A look-alike directory that a naive "last path component" derivation
+        // would pick instead. The repo encodes the *full* cwd, so this must not
+        // be listed by the Project scope.
+        let lookalike = root.join("--project--");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        let other_file = lookalike.join("b.jsonl");
+        std::fs::write(&other_file, "{}\n").unwrap();
+        let found = list_session_files_in_scope_sync(&cwd, &root, SessionScope::Project);
+        assert_eq!(
+            found,
+            vec![SessionFileEntry {
+                path: file,
+                project: None
+            }]
+        );
+    }
+
+    /// Fork issue #13, async path: the `-r` picker's default scope must use the
+    /// repo's typed list API with an explicit cwd, and the open path must stay
+    /// unscoped so a row chosen from All still resolves by id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_issue13_resume_scope_and_open_path_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let foreign_cwd = tmp.path().join("other");
+        std::fs::create_dir_all(&foreign_cwd).unwrap();
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        let own = create_jsonl_session(&root, &cwd_text).await.unwrap();
+        let own_id = own.storage().metadata().id.clone();
+        drop(own);
+        let foreign = create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+            .await
+            .unwrap();
+        let foreign_id = foreign.storage().metadata().id.clone();
+        drop(foreign);
+
+        let project =
+            list_session_metadata_in_scope_in_dir(&cwd_text, &root, SessionScope::Project)
+                .await
+                .unwrap();
+        assert_eq!(project.len(), 1, "-r default must not flatten projects");
+        assert_eq!(project[0].id, own_id);
+        let all = list_session_metadata_in_scope_in_dir(&cwd_text, &root, SessionScope::All)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|m| m.cwd == foreign_cwd.to_string_lossy()));
+        // `list_session_metadata_in_dir` (the open path) must remain unscoped.
+        let open = list_session_metadata_in_dir(&cwd_text, &root)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 2);
+        let found = find_session_metadata(&foreign_id, &cwd_text, &root)
+            .await
+            .unwrap();
+        assert_eq!(found.unwrap().id, foreign_id);
     }
 
     /// The default CLI tool set plus the `todo` tool its bundled plugins add.
@@ -3522,15 +5684,7 @@ mod tests {
         let p = default_system_prompt_with_tools("/tmp/proj", true, &tools);
         assert!(p.contains("- read  — Read file contents"));
         assert!(p.contains("- grep  — Search file contents"));
-        for absent in [
-            "- edit",
-            "- write",
-            "- bash",
-            "- docs",
-            "todo",
-            "PowerShell cmdlets",
-            "project documentation",
-        ] {
+        for absent in ["- edit", "- write", "- bash", "- docs", "todo", "Windows"] {
             assert!(
                 !p.contains(absent),
                 "{absent} must not appear for a read-only run: {p}"
@@ -3554,20 +5708,17 @@ mod tests {
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("- powershell"));
-        assert!(p.contains("Bash/POSIX syntax, including on Windows"));
-        assert!(p.contains("do not pass PowerShell cmdlets"));
+        assert!(p.contains("Bash/POSIX syntax, also on Windows"));
     }
 
     #[test]
     fn default_prompt_instructs_language_matching() {
-        // The model must detect the user's language and answer in it, so a
-        // Chinese (or any non-English) user gets a same-language reply without
-        // having to ask every turn.
+        // A Chinese (or any non-English) user gets a same-language reply
+        // without having to ask every turn.
         let p = default_system_prompt_with_tools("/tmp/proj", false, &default_prompt_tools());
-        let lower = p.to_lowercase();
         assert!(
-            lower.contains("same language") && lower.contains("detect"),
-            "the prompt must tell the model to detect and mirror the user's language: {p}"
+            p.contains("same language as the user's latest message"),
+            "the prompt must tell the model to mirror the user's language: {p}"
         );
     }
 
@@ -3587,10 +5738,10 @@ mod tests {
             lower.contains("reasoning is not") && lower.contains("carried into your next turn"),
             "the prompt must explain that reasoning does not survive the turn: {p}"
         );
-        // …and the remedy: keep state visible, use the todo tool.
+        // Working state stays visible; extension-specific rules require opt-in.
         assert!(
-            lower.contains("visible") && lower.contains("todo tool"),
-            "the prompt must point at visible text and the todo tool: {p}"
+            lower.contains("visible") && !lower.contains("todo tool"),
+            "the prompt must keep state visible without inventing extension rules: {p}"
         );
         // …plus the anti-repetition rule itself.
         assert!(
@@ -3627,13 +5778,30 @@ mod tests {
             "the replayed variant must forbid re-deriving the plan: {p}"
         );
         assert!(
-            lower.contains("do not re-derive") && lower.contains("re-listing the same plan"),
+            lower.contains("do not re-derive") && lower.contains("re-stating the same plan"),
             "the anti-repetition rule must survive the flip: {p}"
         );
         assert!(
             lower.contains("already shown earlier"),
             "the re-read rule must survive the flip: {p}"
         );
+    }
+
+    #[test]
+    fn default_prompt_states_each_rule_once() {
+        // The plan rule, the todo tool and the anti-repetition line used to be
+        // spread over two guidelines that repeated each other.
+        for replayed in [false, true] {
+            let p =
+                default_system_prompt_with_tools("/tmp/proj", replayed, &default_prompt_tools());
+            for phrase in ["the same plan", "Windows", "guessing"] {
+                assert_eq!(p.matches(phrase).count(), 1, "{phrase:?} repeated: {p}");
+            }
+            assert!(
+                !p.contains("todo tool"),
+                "extension rules require explicit metadata"
+            );
+        }
     }
 
     /// Only side-effect-free tools may be replayed after a crash.
@@ -3779,6 +5947,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -3795,7 +5964,15 @@ mod tests {
             system_prompt: Some("stable system prompt".into()),
             ..Args::default()
         };
-        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+        let (harness, _events, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            false,
+        )
+        .await
+        .unwrap();
         let before_resources = harness.get_resources().await.unwrap();
         assert_eq!(before_resources.skills.as_ref().unwrap().len(), 1);
         assert_eq!(before_resources.skills.as_ref().unwrap()[0].name, "keep-me");
@@ -3821,6 +5998,10 @@ mod tests {
         assert!(outcome.had_warnings);
         assert!(outcome.summary.contains("Settings reload failed"));
         assert!(outcome.summary.contains("could not load global settings"));
+        // Hard failure keeps the previous resources; the outcome must not
+        // advertise a fresh trust policy either (theme discovery keeps the
+        // registry it already matches).
+        assert_eq!(outcome.project_trusted, None);
         assert_eq!(harness.get_resources().await.unwrap(), before_resources);
         assert_eq!(harness.get_system_prompt().await.unwrap(), before_prompt);
         let after_tools: Vec<String> = harness
@@ -3839,6 +6020,310 @@ mod tests {
             .unwrap()
             .clone();
         assert!(Arc::ptr_eq(&after_bridge, &before_bridge));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_outcome_carries_the_current_project_trust() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        // Startup snapshot: trusted.
+        crate::config::set_project_trust(&cwd, Some(true)).unwrap();
+        let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("stable system prompt".into()),
+            ..Args::default()
+        };
+        let (harness, _events, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(context.project_trusted, "startup snapshot is trusted");
+
+        // /trust no, then /reload: the outcome must report the CURRENT
+        // decision, not the immutable startup snapshot.
+        crate::config::set_project_trust(&cwd, Some(false)).unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+        assert!(!outcome.had_errors, "{}", outcome.summary);
+        assert_eq!(outcome.project_trusted, Some(false));
+
+        // And the opposite transition back to trusted.
+        crate::config::set_project_trust(&cwd, Some(true)).unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+        assert!(!outcome.had_errors, "{}", outcome.summary);
+        assert_eq!(outcome.project_trusted, Some(true));
+    }
+
+    /// An explicit agent home owns its transcripts: the default session root
+    /// is `<home>/sessions`, while `--session-dir` still wins. The process
+    /// session-dir env override must not bleed into an explicit home.
+    #[test]
+    fn agent_home_defaults_the_session_root_under_the_home() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let env_dir = cwd.path().join("env-sessions");
+        let _env = crate::config::test_support::SessionDirEnv::new(Some(&env_dir));
+        let agent_home =
+            crate::config::AgentHome::from_option(Some(home.path().to_path_buf())).unwrap();
+        let args = Args::default();
+        assert_eq!(
+            configured_session_dir_for(&agent_home, &args, cwd.path()),
+            home.path().join("sessions")
+        );
+
+        let explicit = cwd.path().join("explicit-sessions");
+        let args = Args {
+            session_dir: Some(explicit.clone()),
+            ..Args::default()
+        };
+        assert_eq!(
+            configured_session_dir_for(&agent_home, &args, cwd.path()),
+            explicit
+        );
+    }
+
+    /// `/reload` must re-read resources from the session's explicit agent home,
+    /// not the process default and not a startup snapshot.
+    #[test]
+    fn reload_inputs_reread_the_selected_agent_home() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let process_home = tempfile::tempdir().unwrap();
+        let selected_home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, process_home.path());
+        let process_skills = process_home.path().join("process-only-skills");
+        std::fs::create_dir_all(&process_skills).unwrap();
+        let selected_skills = selected_home.path().join("skills");
+        std::fs::create_dir_all(selected_skills.join("base")).unwrap();
+        std::fs::write(
+            selected_skills.join("base").join("SKILL.md"),
+            "---\nname: base\ndescription: base skill\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(selected_home.path().join("settings.json"), "{}").unwrap();
+
+        let selected_agent_home =
+            crate::config::AgentHome::from_option(Some(selected_home.path().to_path_buf()))
+                .unwrap();
+        let args = Args {
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            ..Args::default()
+        };
+
+        let first =
+            prepare_reload_inputs_for(&selected_agent_home, &args, cwd.path(), false).unwrap();
+        assert!(
+            first
+                .skill_base_dirs
+                .iter()
+                .any(|dir| dir == &selected_skills),
+            "{:?}",
+            first.skill_base_dirs
+        );
+        assert!(
+            first
+                .skill_base_dirs
+                .iter()
+                .all(|dir| !dir.starts_with(process_home.path())),
+            "{:?}",
+            first.skill_base_dirs
+        );
+
+        // A settings change in the selected home is observed by the next
+        // reload pass (the file is re-read, not cached at startup).
+        let extra = selected_home.path().join("extra-skills");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(
+            selected_home.path().join("settings.json"),
+            serde_json::json!({"skillDirs": [extra]}).to_string(),
+        )
+        .unwrap();
+        let second =
+            prepare_reload_inputs_for(&selected_agent_home, &args, cwd.path(), false).unwrap();
+        assert!(
+            second.skill_base_dirs.iter().any(|dir| dir == &extra),
+            "{:?}",
+            second.skill_base_dirs
+        );
+    }
+
+    #[test]
+    fn registry_aware_global_selection_falls_back_when_the_registry_is_corrupt() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let extensions = agent.join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::write(agent.join("native-packages.json"), b"{ this is not json").unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        // An unreadable registry cannot tell us which artifacts are retired. Keep
+        // the historical directory scan instead of silently loading nothing.
+        let dirs = vec![extensions.clone()];
+        let (scan_dirs, files) = registry_aware_extension_inputs(&dirs, &[], None);
+        assert!(
+            scan_dirs.contains(&extensions),
+            "a corrupt registry must not disable every global extension"
+        );
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn startup_and_reload_use_registry_aware_global_extension_selection() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let extensions = agent.join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let active =
+            extensions.join("librpi_web_extension-v0.1.64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.so");
+        let stale_same_version =
+            extensions.join("librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so");
+        let stale_rpi_web =
+            extensions.join("librpi_web_extension-v0.1.63-cccccccccccccccccccccccccccccccc.so");
+        let legacy = extensions.join("legacy_custom.so");
+        for path in [&active, &stale_same_version, &stale_rpi_web, &legacy] {
+            std::fs::write(path, b"cdylib").unwrap();
+        }
+        let registry = serde_json::json!([
+            {
+                "name": "rpi-web",
+                "version": "0.1.64",
+                "source": null,
+                "artifacts": [active.file_name().unwrap().to_str().unwrap()]
+            }
+        ]);
+        std::fs::write(agent.join("native-packages.json"), registry.to_string()).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let args = Args {
+            trust_override: Some(false),
+            ..Args::default()
+        };
+        let home = crate::config::AgentHome::process();
+        let startup_dirs = startup_extension_dirs(&home, &args, &cwd, false);
+        let home_root = home.root().ok();
+        assert!(startup_dirs.contains(&extensions));
+        let (startup_scan_dirs, startup_files) =
+            registry_aware_extension_inputs(&startup_dirs, &args.extension, home_root.as_deref());
+        assert!(!startup_scan_dirs.contains(&extensions));
+        assert!(startup_files.contains(&active));
+        assert!(startup_files.contains(&legacy));
+        assert!(!startup_files.contains(&stale_same_version));
+        assert!(!startup_files.contains(&stale_rpi_web));
+
+        let prepared = prepare_reload_inputs_inner(&args, &cwd, false, || {}).unwrap();
+        let (reload_scan_dirs, reload_files) = registry_aware_extension_inputs(
+            &prepared.extension_dirs,
+            &args.extension,
+            home_root.as_deref(),
+        );
+        assert!(!reload_scan_dirs.contains(&extensions));
+        assert_eq!(reload_files, startup_files);
+    }
+
+    #[test]
+    fn registry_aware_global_selection_keeps_unmanaged_legacy_cdylib() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let extensions = agent.join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        let legacy = extensions.join("legacy_custom.so");
+        std::fs::write(&legacy, b"cdylib").unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let (dirs, files) =
+            registry_aware_extension_inputs(&[extensions.clone()], &[], Some(agent.as_path()));
+        assert!(dirs.is_empty());
+        assert_eq!(files, vec![legacy]);
     }
 
     #[test]
@@ -3925,6 +6410,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -3941,7 +6427,15 @@ mod tests {
             system_prompt: Some("stable system prompt".into()),
             ..Args::default()
         };
-        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+        let (harness, _events, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            false,
+        )
+        .await
+        .unwrap();
 
         let outcome = reload_extension_resources_inner(&harness, &context, || {
             std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
@@ -4087,6 +6581,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -4106,7 +6601,15 @@ mod tests {
             ..Args::default()
         };
 
-        let (_, _, context) = build(&resolved, &args, &cwd, true).await.unwrap();
+        let (_, _, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(context.cwd, cwd);
         assert!(context.project_trusted);
@@ -4135,6 +6638,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -4155,7 +6659,15 @@ mod tests {
             ..Args::default()
         };
 
-        let (harness, _, _) = build(&resolved, &args, &cwd, true).await.unwrap();
+        let (harness, _, _) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             harness.get_name().await.unwrap().as_deref(),
             Some("smoke name")
@@ -4197,6 +6709,58 @@ mod tests {
             select_session(&args, cwd),
             SessionSelection::ById { id, .. } if id == "01a02ece"
         ));
+    }
+
+    /// The cut flags have to survive selection: `select_session_in_dir` is the
+    /// only place that copies them off `Args`, so a dropped field here would
+    /// make `--fork-entry` silently fork at the lane leaf again.
+    #[test]
+    fn select_fork_carries_the_cut_flags() {
+        use rpi_harness::session::types::ForkPosition;
+
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
+        let cwd = Path::new("/tmp");
+
+        // No cut: both stay absent so the build uses the harness defaults.
+        let args = Args {
+            fork: Some("parent".into()),
+            ..Args::default()
+        };
+        match select_session(&args, cwd) {
+            SessionSelection::Fork {
+                source,
+                entry_id,
+                position,
+                ..
+            } => {
+                assert_eq!(source, "parent");
+                assert_eq!(entry_id, None);
+                assert_eq!(position, None);
+            }
+            other => panic!("expected Fork, got {other:?}"),
+        }
+
+        for (flag, expected) in [
+            (None, None),
+            (Some(ForkPosition::At), Some(ForkPosition::At)),
+            (Some(ForkPosition::Before), Some(ForkPosition::Before)),
+        ] {
+            let args = Args {
+                fork: Some("parent".into()),
+                fork_entry: Some("message-2".into()),
+                fork_position: flag,
+                ..Args::default()
+            };
+            match select_session(&args, cwd) {
+                SessionSelection::Fork {
+                    entry_id, position, ..
+                } => {
+                    assert_eq!(entry_id.as_deref(), Some("message-2"));
+                    assert_eq!(position, expected, "{flag:?}");
+                }
+                other => panic!("expected Fork, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -4352,4 +6916,285 @@ mod tests {
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+
+    // ---- restored-session working directory ----
+
+    /// A restore peek must name the directory the session was created in —
+    /// that is the whole point of recording it. Everything downstream (tool
+    /// env, system prompt, context files, extensions) keys off the run's cwd,
+    /// so a peek that falls back to the launch directory would leave the
+    /// resumed agent editing files in whatever directory `rpi` happened to be
+    /// started from.
+    #[tokio::test]
+    async fn a_restored_session_adopts_its_recorded_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project-a");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &project.to_string_lossy(),
+            Some("cwdadopt01".into()),
+        )
+        .await
+        .unwrap();
+
+        let selection = SessionSelection::ById {
+            id: "cwdadopt01".into(),
+            dir: sessions.clone(),
+        };
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("a resumable session with a recorded cwd");
+        assert_eq!(peeked.recorded, project);
+        assert_eq!(peeked.adopted, Some(project));
+    }
+
+    /// A recorded directory that no longer exists must NOT be adopted: the run
+    /// falls back to the launch cwd, and the peek hands back the record so the
+    /// host can say so (instead of the old behaviour of eprintln-ing mid-TUI).
+    #[tokio::test]
+    async fn a_missing_recorded_directory_is_reported_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("project-gone");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &gone.to_string_lossy(),
+            Some("cwdgone001".into()),
+        )
+        .await
+        .unwrap();
+
+        let selection = SessionSelection::ById {
+            id: "cwdgone001".into(),
+            dir: sessions.clone(),
+        };
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("the session itself is resumable");
+        assert_eq!(peeked.recorded, gone);
+        assert_eq!(peeked.adopted, None);
+        let note = crate::session_cwd::missing_session_cwd_note(&peeked.recorded, &launch);
+        assert!(note.contains("no longer exists"), "{note}");
+        assert!(note.contains("launch-dir"), "{note}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_progress_upgrade_normal_open_runs_and_reopens() {
+        use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+        use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
+        use rpi_harness::session::jsonl::{
+            encode_header, JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+            JsonlV4Header,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+            fs: Arc::new(OsExecutionEnv::with_cwd(tmp.path().into())),
+            sessions_root: sessions.to_string_lossy().into_owned(),
+            clock: Arc::new(SystemClock),
+            ids: Arc::new(DefaultIdGenerator::new()),
+        });
+        let fixture = repo
+            .create_typed(&JsonlSessionCreateOptions {
+                id: Some("legacycli001".into()),
+                parent_session_id: None,
+                cwd: cwd.clone(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let path = PathBuf::from(fixture.jsonl_metadata().path);
+        drop(fixture);
+        let sidecar = PathBuf::from(format!("{}.progress.jsonl", path.display()));
+        std::fs::remove_file(&sidecar).unwrap();
+        let header = JsonlV4Header::new("legacycli001".into(), 1, cwd.clone(), None, None, None);
+        std::fs::write(&path, encode_header(&header)).unwrap();
+        assert!(!sidecar.exists());
+        for attempt in 0..2 {
+            let restored = open_session_by_id_in_dir("legacycli001", &cwd, &sessions)
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap();
+            // Hold the binding so the OS writer lease can be retired explicitly
+            // below. Dropping the harness is NOT enough: any surviving `Arc` to
+            // the storage keeps the lease alive until the last handle goes away,
+            // so the next `open` of the SAME journal could still observe
+            // "writer lease is already held". That ordering is not
+            // deterministic, which is exactly how this test flaked under CI
+            // concurrency.
+            let storage = restored.session.storage();
+            assert_eq!(storage.metadata().id, "legacycli001");
+            assert!(
+                storage.writer_lease_held(),
+                "reopened binding must own the journal (attempt {attempt})"
+            );
+            let provider =
+                FauxProvider::new(FauxScript::new().with_text("continued legacy session"));
+            let harness = AgentHarness::create(AgentHarnessOptions {
+                model: provider.default_model().clone(),
+                models: vec![provider],
+                session: restored.session,
+                allow_existing_session: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let run = harness.prompt_text("continue", vec![]).await.unwrap();
+            assert!(matches!(run.outcome, HarnessRunOutcome::Completed { .. }));
+            // Retire this binding before the next iteration reopens the journal.
+            // `release_writer_lease` bumps the revocation flag and drops the OS
+            // lease box, so ownership is released now rather than whenever the
+            // last storage handle happens to be dropped.
+            drop(run);
+            drop(harness);
+            storage.release_writer_lease();
+            assert!(
+                !storage.writer_lease_held(),
+                "retired binding must not retain the writer lease"
+            );
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.lines().next().unwrap().contains("progressFormat"));
+        assert!(sidecar.exists());
+    }
+
+    /// `open_session` hands back the recorded directory as data (for the
+    /// `/session` hot-switch notes) while still opening the session normally.
+    #[tokio::test]
+    async fn open_session_reports_the_recorded_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project-open");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &project.to_string_lossy(),
+            Some("cwdopen001".into()),
+        )
+        .await
+        .unwrap();
+
+        let restored =
+            open_session_by_id_in_dir("cwdopen001", &launch.to_string_lossy(), &sessions)
+                .await
+                .map_err(|error| error.to_string())
+                .unwrap();
+        assert_eq!(restored.recorded_cwd, Some(project.clone()));
+        assert_eq!(restored.session.storage().metadata().id, "cwdopen001");
+    }
+
+    /// The session the peek inspected must be the session the build opens.
+    ///
+    /// `-c` means "the most recent session", and the build lists the directory
+    /// again. Another `rpi` (or a `/session` new-session) can write a newer one
+    /// between the peek and the build; adopting the peeked session's directory
+    /// while opening the newer conversation would run the tools in a directory
+    /// that conversation never used. Pinning the resolved id makes the second
+    /// listing an exact match instead of a fresh newest-first choice.
+    #[tokio::test]
+    async fn the_peeked_session_is_the_one_the_build_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_project = tmp.path().join("project-first");
+        let second_project = tmp.path().join("project-second");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        for dir in [&first_project, &second_project, &launch, &sessions] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        create_jsonl_session_with_id(
+            &sessions,
+            &first_project.to_string_lossy(),
+            Some("cwdrace001".into()),
+        )
+        .await
+        .unwrap();
+
+        let mut args = Args {
+            continue_session: true,
+            session_dir: Some(sessions.clone()),
+            ..Default::default()
+        };
+        let selection = select_session_in_dir(&args, sessions.clone());
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("a resumable session");
+        assert_eq!(peeked.adopted, Some(first_project.clone()));
+
+        // A newer session appears in another project before the build runs.
+        create_jsonl_session_with_id(
+            &sessions,
+            &second_project.to_string_lossy(),
+            Some("cwdrace002".into()),
+        )
+        .await
+        .unwrap();
+
+        pin_restored_selection(&mut args, &peeked);
+        let pinned = select_session_in_dir(&args, sessions.clone());
+        let reopened = resolve_restore_target(&pinned, &launch.to_string_lossy())
+            .await
+            .unwrap()
+            .expect("the pinned session still exists");
+        assert_eq!(
+            reopened.id, peeked.id,
+            "the build must open the session the peek adopted the directory of"
+        );
+        assert_eq!(reopened.cwd, first_project.to_string_lossy());
+    }
+
+    /// Trust must be resolved against the directory it is asked about. A
+    /// session recorded in another project must not inherit the launch
+    /// directory's decision — that would run an untrusted project's settings,
+    /// skills, and context files with trusted privileges.
+    #[test]
+    fn trust_is_resolved_per_directory() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let untrusted = tmp.path().join("project-untrusted");
+        let launch = tmp.path().join("project-launch");
+        std::fs::create_dir_all(&untrusted).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        crate::config::set_project_trust(&untrusted, Some(false)).unwrap();
+
+        let args = Args::default();
+        assert!(!resolve_project_trust(&args, &untrusted));
+        // A directory with no stored decision loads by default.
+        assert!(resolve_project_trust(&args, &launch));
+    }
 }
+
+#[cfg(test)]
+#[path = "session/experimental_dialog_continuity_tests.rs"]
+mod experimental_dialog_continuity_tests;
+#[cfg(test)]
+#[path = "session/experimental_reload_continuity_tests.rs"]
+mod experimental_reload_continuity_tests;

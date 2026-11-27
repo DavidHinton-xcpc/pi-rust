@@ -1,0 +1,25 @@
+[package]
+name = "rpi-durable"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Native rpi durable domain, runtime and journal storage"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+fs2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

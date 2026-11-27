@@ -26,8 +26,14 @@ fn enter_on_sole_slash_completion_accepts_and_submits() {
     );
 }
 
+/// The panel's first choice is a real choice: a fresh ambiguous popup (several
+/// candidates, highlight on row 0) is confirmed by Enter — the row the panel
+/// paints with `→`, and the same row Tab takes. Refusing to take it was the
+/// bug: the fuzzy provider answers every command prefix with several
+/// candidates, so `/c` ⏎ sent the raw `/c` to the model instead of running
+/// `/clear`, and the user had to spell the command out in full.
 #[test]
-fn enter_on_ambiguous_slash_prefix_takes_highlighted() {
+fn enter_on_ambiguous_slash_prefix_takes_the_panel_first_choice() {
     let state = test_tui_state();
     state.autocomplete.set_provider(Arc::new(
         SlashCommandAutocompleteProvider::with_default_commands(),
@@ -37,21 +43,27 @@ fn enter_on_ambiguous_slash_prefix_takes_highlighted() {
     editor.set_text("/c");
     editor.set_cursor(0, 2);
 
-    // With no explicit selection (fresh popup, index 0), Enter must NOT
-    // silently pick a winner: it resolves to the normal submit path so the
-    // user's typed text is what gets submitted, exactly as before.
-    let action = enter_completion_action(&state, &editor).expect("a decision");
-    assert!(
-        matches!(action, EnterCompletionAction::Submit),
-        "ambiguous popup must keep plain submit, got {action:?}"
+    // Fresh popup, highlight on row 0 → Enter takes row 0 and submits it.
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(
+        completion.action,
+        EnterCompletionAction::ApplyAndSubmit,
+        "the highlighted (first) row must be applied and submitted"
     );
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(editor.get_text(), "/clear");
 
-    // After the user moved the highlight (↓), Enter accepts that row.
+    // ↓ moves the choice: Enter takes whatever row the panel highlights now.
+    editor.set_text("/c");
+    editor.set_cursor(0, 2);
     assert!(navigate_autocomplete(&state, &editor, 1));
-    let action = enter_completion_action(&state, &editor).expect("a decision");
-    assert!(
-        matches!(action, EnterCompletionAction::ApplyAndSubmit),
-        "highlighted row + Enter must apply, got {action:?}"
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(
+        editor.get_text(),
+        "/context",
+        "the second row, not the first one"
     );
 }
 
@@ -256,11 +268,11 @@ fn stale_highlight_is_clamped_when_candidates_narrow() {
     let editor = state.editor.clone();
     editor.set_text("/c");
     editor.set_cursor(0, 2);
-    // Ambiguous: two candidates, Enter submits.
-    assert!(matches!(
+    // Ambiguous: several candidates, Enter takes the highlighted row.
+    assert_eq!(
         enter_completion_action(&state, &editor),
-        Some(EnterCompletionAction::Submit)
-    ));
+        Some(EnterCompletionAction::ApplyAndSubmit)
+    );
     // User narrows to the sole candidate; the stale selection (possibly 1)
     // is clamped to 0 by the len==1 branch regardless.
     editor.set_text("/clea");
@@ -305,4 +317,130 @@ fn multiline_draft_slash_line_matches_tab_completion_semantics() {
         enter_completion_action(&state, &editor),
         Some(EnterCompletionAction::ApplyAndSubmit)
     ));
+}
+
+// ==== Follow-up to PR #106: the panel's first choice is selectable ====
+
+/// End-to-end: the key loop's entry point resolves `/c` to the panel's first
+/// row, writes it into the editor, and the Enter falls through to the submit
+/// callback with the completed command — the command runs instead of the raw
+/// prefix being sent to the model.
+#[test]
+fn enter_on_a_slash_prefix_runs_the_panel_first_choice() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let state = test_tui_state();
+    state.autocomplete.set_provider(Arc::new(
+        SlashCommandAutocompleteProvider::with_default_commands(),
+    ));
+    let editor = state.editor.clone();
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+
+    editor.set_text("/c"); // /clear and /context both match
+    editor.set_cursor(0, 2);
+    assert!(
+        !route_enter_completion(&state, &editor),
+        "a slash completion applies and falls through — it never consumes the Enter"
+    );
+    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        *submitted.lock().unwrap(),
+        vec!["/clear".to_string()],
+        "the panel's first row must be what gets executed"
+    );
+}
+
+/// Regression matrix over the real registry: for EVERY proper prefix of every
+/// visible command, the row the panel shows as the first choice is what Enter
+/// executes. Refusing an ambiguous popup was the bug — the fuzzy provider
+/// answers almost every prefix with several candidates, so 18 of the 32
+/// visible commands were unreachable without spelling them out in full:
+/// /clear, /clone, /compact, /copy, /exit, /help, /hotkeys, /images, /login,
+/// /model, /new, /provider, /reload, /session, /thinking, /tree, /usage,
+/// /version.
+#[test]
+fn every_visible_command_is_reachable_from_a_prefix_with_enter() {
+    let registry = build_builtin_registry();
+    let entries = registry.visible_entries();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(SlashCommandAutocompleteProvider::new(
+            entries.clone(),
+        )));
+    let editor = state.editor.clone();
+
+    let mut unreachable: Vec<String> = Vec::new();
+    for entry in &entries {
+        let chars: Vec<char> = entry.name.chars().collect();
+        let mut reached_from_prefix = false;
+        for len in 2..chars.len() {
+            let prefix: String = chars[..len].iter().collect();
+            // What the panel shows for this prefix.
+            let Some(popup) = state.autocomplete.get_suggestions(&prefix, prefix.len()) else {
+                continue;
+            };
+            let first_choice = popup.items[0].text.clone();
+            editor.set_text(&prefix);
+            editor.set_cursor(0, prefix.len());
+            *state.autocomplete_selection.lock().unwrap() = 0;
+            *state.autocomplete_selection_stamped_for.lock().unwrap() = None;
+
+            let completion = resolve_enter_completion(&state, &editor)
+                .expect("the panel is showing a command → Enter must resolve it");
+            assert_eq!(
+                completion.action,
+                EnterCompletionAction::ApplyAndSubmit,
+                "{prefix:?}: the panel's first choice {first_choice:?} must be what Enter takes"
+            );
+            assert!(completion.apply(&state, &editor));
+            assert_eq!(
+                editor.get_text(),
+                first_choice,
+                "{prefix:?}: Enter must write the row the panel highlighted"
+            );
+            assert!(
+                registry.find(&editor.get_text()).is_some(),
+                "{prefix:?} submitted the unknown token {:?} — the raw prefix must \
+                 never reach the model while the panel shows a command",
+                editor.get_text()
+            );
+            if editor.get_text() == entry.name {
+                reached_from_prefix = true;
+            }
+        }
+        if !reached_from_prefix {
+            unreachable.push(entry.name.clone());
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "commands that still need the full spelling: {unreachable:?}"
+    );
+}
+
+/// The completion context is the COMMAND token, not the whole input: with the
+/// caret in the arguments the provider still answers for everything before
+/// the caret, and taking its row would swallow the arguments (`/model o` ⏎
+/// must submit `/model o`, not `/model`).
+#[test]
+fn enter_in_the_arguments_keeps_the_typed_text() {
+    let state = test_tui_state();
+    state.autocomplete.set_provider(Arc::new(
+        SlashCommandAutocompleteProvider::with_default_commands(),
+    ));
+    let editor = state.editor.clone();
+    for text in ["/model o", "/c m", "/exit x", "/clear now"] {
+        editor.set_text(text);
+        editor.set_cursor(0, text.len());
+        assert_eq!(
+            enter_completion_action(&state, &editor),
+            None,
+            "{text:?}: the caret is in the arguments, not in the command token"
+        );
+    }
 }

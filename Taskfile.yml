@@ -174,6 +174,88 @@ tasks:
     cmds:
       - cargo test --workspace --locked
 
+  test:session:
+    desc: 离线测试真实 CLI 的消息、重启恢复与会话隔离（诊断目录必须不存在）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.SESSION_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.SESSION_CARGO_TARGET_DIR | default "target/session-smoke-cargo"}}'
+      DEFAULT_BINARY: '{{.BUILD_TARGET}}/debug/rpi{{if eq OS "windows"}}.exe{{end}}'
+      BINARY: '{{.SESSION_BINARY | default .DEFAULT_BINARY}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/session-smoke-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.SESSION_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_session_smoke.py'
+      - '{{.PYTHON}} -B scripts/session-smoke.py --rpi "{{.BINARY}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" {{.CLI_ARGS}}'
+
+  test:recovery:
+    desc: 测试 harness 崩溃恢复、消息顺序与 CLI 会话 cwd 恢复
+    vars:
+      BUILD_TARGET: '{{.SESSION_CARGO_TARGET_DIR | default "target/session-smoke-cargo"}}'
+    cmds:
+      - cargo test -p rpi-harness --test harness_run_e2e --test context_message_order --test frame_progress_recovery --test m5c_jsonl_torn_tail --test jsonl_failure_regressions --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo test -p rpi-cli --test session_cwd_restore --locked --target-dir "{{.BUILD_TARGET}}"
+
+  test:resources:
+    desc: 离线测试 release 编辑器与多轮 RPC 的内存、CPU 和最终结论（不使用真实模型）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.RESOURCE_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      PROBE: '{{.RESOURCE_EDITOR_PROBE | default (printf "%s/release/examples/editor_resource_probe%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/resource-smoke-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.RESOURCE_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    env:
+      RPI_RESOURCE_SMOKE_BINARY: '{{.BINARY}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_resource_smoke.py'
+      - '{{.PYTHON}} -B scripts/test_compare_resources.py'
+      - '{{.PYTHON}} -B scripts/test_resource_tui.py'
+      - cargo test -p rpi-tui --lib --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/resource-smoke.py --rpi "{{.BINARY}}" --editor-probe "{{.PROBE}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" --profile release {{.CLI_ARGS}}'
+
+  test:cold-start:
+    desc: 回归 701000 append frames + 21733 entries 的历史冷启动、消息查询与旧格式升级（合成数据，无模型调用）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.COLD_START_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -B -c "import pathlib, tempfile, uuid; print(pathlib.Path(tempfile.gettempdir()) / (''rpi-cold-start-'' + uuid.uuid4().hex))"'
+      DIAGNOSTICS_DIR: '{{.COLD_START_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    env:
+      RPI_COLD_START_BINARY: '{{.BINARY}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release -j 1 --locked --offline --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_resource_cold_start.py'
+      - '{{.PYTHON}} -B scripts/resource-cold-start.py --candidate "{{.BINARY}}" --output "{{.DIAGNOSTICS_DIR}}-modern" --shapes modern --frames 701000 --entries 21733 --repeats 5 --max-ready-ms 2000 --max-single-ready-ms 3000 {{.CLI_ARGS}}'
+      # Legacy first-open also pays for the checked progress-format upgrade.
+      # Keep its explicit budget separate; do not silently relax the modern SLA.
+      - '{{.PYTHON}} -B scripts/resource-cold-start.py --candidate "{{.BINARY}}" --output "{{.DIAGNOSTICS_DIR}}-legacy" --shapes legacy --frames 701000 --entries 21733 --repeats 5 --max-ready-ms 3500 --max-single-ready-ms 5000 {{.CLI_ARGS}}'
+
+  test:resources:live:
+    desc: 显式启用真实模型的有界多轮资源回归（需 endpoint/model/凭据环境变量，可能收费）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.RESOURCE_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      PROBE: '{{.RESOURCE_EDITOR_PROBE | default (printf "%s/release/examples/editor_resource_probe%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/resource-smoke-live-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.RESOURCE_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/resource-smoke.py --live --rpi "{{.BINARY}}" --editor-probe "{{.PROBE}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" --profile release {{.CLI_ARGS}}'
+
   check:
     desc: Check all locked workspace targets
     cmds:

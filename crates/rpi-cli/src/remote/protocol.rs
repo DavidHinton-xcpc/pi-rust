@@ -60,16 +60,26 @@ pub enum RemoteEvent {
         tool_result_count: usize,
         #[serde(rename = "toolResults")]
         tool_results: Value,
+        /// Queue depth when this turn settled, so a client can render
+        /// "N queued". Defaulted for wire compatibility with older peers.
+        #[serde(default, rename = "pendingMessages")]
+        pending_messages: usize,
     },
     MessageStart {
+        #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(default)]
         message: Value,
     },
     MessageEnd {
+        #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(default)]
         message: Value,
     },
     MessageUpdate {
+        #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(default)]
         message: Value,
         #[serde(rename = "assistantMessageEvent", default)]
@@ -167,18 +177,30 @@ impl RemoteEvent {
             AgentEvent::TurnEnd {
                 message,
                 tool_results,
+                pending_messages,
+                ..
             } => RemoteEvent::TurnEnd {
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
                 tool_result_count: tool_results.len(),
                 tool_results: serde_json::to_value(tool_results).unwrap_or(Value::Null),
+                pending_messages: *pending_messages,
             },
-            AgentEvent::MessageStart { message } => RemoteEvent::MessageStart {
+            AgentEvent::MessageStart {
+                message,
+                message_id,
+            } => RemoteEvent::MessageStart {
+                message_id: message_id.clone(),
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
             },
-            AgentEvent::MessageEnd { message } => RemoteEvent::MessageEnd {
+            AgentEvent::MessageEnd {
+                message,
+                message_id,
+            } => RemoteEvent::MessageEnd {
+                message_id: message_id.clone(),
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
             },
             AgentEvent::MessageUpdate {
+                message_id,
                 message,
                 assistant_message_event,
             } => {
@@ -201,6 +223,7 @@ impl RemoteEvent {
                     _ => (None, None),
                 };
                 RemoteEvent::MessageUpdate {
+                    message_id: message_id.clone(),
                     // `assistant_json` keeps this identical to the
                     // `AgentMessage` encoding without copying the message.
                     message: rpi_agent::message::assistant_json(message),
@@ -249,26 +272,8 @@ impl RemoteEvent {
 /// Serialize a tool result into the stable wire shape (content blocks, details,
 /// usage, and the batch hints).
 pub fn tool_result_json(result: &AgentToolResult) -> Value {
-    let content: Vec<Value> = result
-        .content
-        .iter()
-        .map(|item| match item {
-            rpi_agent::types::TextContentOrImage::Text(text) => serde_json::json!({
-                "type": "text",
-                "text": text.text,
-            }),
-            rpi_agent::types::TextContentOrImage::Image(image) => {
-                serde_json::to_value(image).unwrap_or(Value::Null)
-            }
-        })
-        .collect();
-    serde_json::json!({
-        "content": content,
-        "details": result.details,
-        "usage": result.usage.as_ref().and_then(|usage| serde_json::to_value(usage).ok()),
-        "addedToolNames": result.added_tool_names,
-        "terminate": result.terminate,
-    })
+    serde_json::to_value(result)
+        .expect("AgentToolResult contains only JSON-serializable native content, details and usage")
 }
 
 /// A command sent from the client to the server (`{"id":…,"type":…,…}`).
@@ -400,6 +405,124 @@ mod tests {
     use super::*;
     use rpi_agent::types::AgentToolResult;
 
+    fn signed_native_result() -> AgentToolResult {
+        use rpi_agent::types::TextContentOrImage;
+        AgentToolResult {
+            content: vec![
+                TextContentOrImage::Text(
+                    serde_json::from_value(serde_json::json!({
+                        "type":"text", "text":"signed 界😀", "textSignature":
+                            "{ \"version\": 1, \"id\": \"sig-😀\" }",
+                    }))
+                    .unwrap(),
+                ),
+                TextContentOrImage::Image(
+                    serde_json::from_value(serde_json::json!({
+                        "type":"image", "data":"AAEC+/==", "mimeType":"image/png",
+                    }))
+                    .unwrap(),
+                ),
+            ],
+            details: serde_json::json!({"runtimeKey":"business", "runtimeHandle":{"id":7},
+                "__rpi":{"owner":"customer"}, "__rpiRuntimeKey":"unchanged"}),
+            usage: Some(rpi_ai::types::Usage::zero()),
+            added_tool_names: vec!["read".into(), "read".into()],
+            terminate: true,
+        }
+    }
+
+    #[test]
+    fn tool_update_preserves_canonical_native_result_and_text_signature() {
+        let result = signed_native_result();
+        let expected = serde_json::to_value(&result).unwrap();
+        let event = AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "call".into(),
+            tool_name: "read".into(),
+            args: serde_json::json!({"path":"file"}),
+            partial_result: result.into(),
+        };
+        let wire = serde_json::to_value(RemoteEvent::from_agent_event(&event)).unwrap();
+        assert_eq!(wire["type"], "tool_execution_update");
+        assert_eq!(wire["partialResult"], expected);
+        assert_eq!(
+            wire["partialResult"]["content"][0]["textSignature"],
+            "{ \"version\": 1, \"id\": \"sig-😀\" }"
+        );
+        assert!(wire["partialResult"].get("isError").is_none());
+    }
+
+    #[test]
+    fn tool_end_preserves_canonical_native_result_and_separate_error_authority() {
+        let result = signed_native_result();
+        let expected = serde_json::to_value(&result).unwrap();
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call".into(),
+            tool_name: "read".into(),
+            result,
+            is_error: true,
+        };
+        let wire = serde_json::to_value(RemoteEvent::from_agent_event(&event)).unwrap();
+        assert_eq!(wire["type"], "tool_execution_end");
+        assert_eq!(wire["result"], expected);
+        assert!(wire["result"]["content"][0]["textSignature"].is_string());
+        assert_eq!(wire["isError"], true);
+        assert!(wire["result"].get("isError").is_none());
+        let plain = tool_result_json(&AgentToolResult::text("unsigned"));
+        assert!(plain["content"][0].get("textSignature").is_none());
+        assert!(plain["usage"].is_null());
+    }
+
+    /// The queue depth must survive the native remote projection: a client that
+    /// never sees it cannot render the "N queued" indicator.
+    #[test]
+    fn turn_end_projects_pending_messages() {
+        let event = AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::types::Api::AnthropicMessages,
+                    "p",
+                    "m",
+                    0,
+                ),
+            )),
+            tool_results: vec![],
+            pending_messages: 3,
+        };
+        let projected = RemoteEvent::from_agent_event(&event);
+        assert_eq!(projected.type_tag(), "turn_end");
+        let wire = serde_json::to_value(&projected).unwrap();
+        assert_eq!(wire["pendingMessages"], 3, "{wire}");
+
+        // Zero is a real value, not an absent field.
+        let zero = AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::types::Api::AnthropicMessages,
+                    "p",
+                    "m",
+                    0,
+                ),
+            )),
+            tool_results: vec![],
+            pending_messages: 0,
+        };
+        let wire = serde_json::to_value(RemoteEvent::from_agent_event(&zero)).unwrap();
+        assert_eq!(wire["pendingMessages"], 0, "{wire}");
+
+        // A peer that predates the field still deserializes.
+        let legacy: RemoteEvent = serde_json::from_value(serde_json::json!({
+            "type":"turn_end", "message":null, "toolResultCount":0, "toolResults":[],
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            RemoteEvent::TurnEnd {
+                pending_messages: 0,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn dialog_wire_shapes_round_trip_with_request_ids() {
         let event: RemoteEvent = serde_json::from_value(serde_json::json!({
@@ -471,10 +594,29 @@ mod tests {
     }
 
     #[test]
+    fn native_message_ids_round_trip_and_legacy_messages_remain_optional() {
+        for kind in ["message_start", "message_update", "message_end"] {
+            let legacy = serde_json::json!({"type": kind, "message": {"role":"assistant"}});
+            let parsed: RemoteEvent = serde_json::from_value(legacy).unwrap();
+            assert!(serde_json::to_value(parsed)
+                .unwrap()
+                .get("messageId")
+                .is_none());
+            let value = serde_json::json!({"type": kind, "messageId": "native-\"🐈", "message": {"role":"assistant"}});
+            let parsed: RemoteEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap()["messageId"],
+                "native-\"🐈"
+            );
+        }
+    }
+
+    #[test]
     fn events_round_trip_over_the_wire() {
         for event in [
             RemoteEvent::AgentStart,
             RemoteEvent::MessageUpdate {
+                message_id: Some("entry-1".into()),
                 message: serde_json::json!({"role": "assistant"}),
                 assistant_message_event: serde_json::json!({"type": "text_delta"}),
                 event_type: "text_delta".into(),

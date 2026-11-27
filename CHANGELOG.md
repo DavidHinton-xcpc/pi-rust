@@ -11,6 +11,728 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.29.0](https://github.com/bigfish1913/pi-rust/compare/v0.28.0...v0.29.0) - 2026-11-26
+
+### Added
+
+- *(cli)* add a low-memory mini mode ([#424](https://github.com/bigfish1913/pi-rust/pull/424))
+- *(fork)* allow branching at a selected message ([#411](https://github.com/bigfish1913/pi-rust/pull/411))
+
+### Fixed
+
+- *(cli)* [**breaking**] validate AgentHome eagerly and drop stale --agent-dir wording ([#414](https://github.com/bigfish1913/pi-rust/pull/414))
+- *(cli)* defer Homebrew updates to brew ([#423](https://github.com/bigfish1913/pi-rust/pull/423))
+
+## [0.28.0](https://github.com/bigfish1913/pi-rust/compare/v0.27.1...v0.28.0) - 2026-11-25
+
+### Added
+
+- *(cli)* inject AgentHome into session services ([#409](https://github.com/bigfish1913/pi-rust/pull/409))
+
+## [0.27.1](https://github.com/bigfish1913/pi-rust/compare/v0.27.0...v0.27.1) - 2026-11-21
+
+### Added
+
+- *(extensions)* follow the catalog move to pi-rust/rpi-extension ([#398](https://github.com/bigfish1913/pi-rust/pull/398))
+
+### Fixed
+
+- *(rpc)* correlate and settle every native execution lease ([#396](https://github.com/bigfish1913/pi-rust/pull/396))
+
+### Other
+
+- reduce history restore allocations and interrupted recovery hydration ([#394](https://github.com/bigfish1913/pi-rust/pull/394))
+
+### Fixed
+
+- *(rpc)* correlate RPC and autonomous execution leases without mistaking
+  per-attempt `agent_end` for completion. Correlated lifecycle framing requires
+  the parent to set `RPI_RPC_EXECUTION_LIFECYCLE=correlated-v1` on its child;
+  upgrade extcore to a launcher supporting this opt-in. Older clients retain
+  legacy framing and its limitations. Tool-partial congestion may drop partials
+  (the final tool result remains reliable), not the whole connection
+  ([#396](https://github.com/bigfish1913/pi-rust/pull/396)).
+
+## [0.27.0](https://github.com/bigfish1913/pi-rust/compare/v0.26.1...v0.27.0) - 2026-11-20
+
+### Added
+
+- *(tui)* show user message preview in /tree selector ([#390](https://github.com/bigfish1913/pi-rust/pull/390))
+- *(tui)* compact 24x12 gear+rpi startup lockup ([#386](https://github.com/bigfish1913/pi-rust/pull/386))
+
+### Fixed
+
+- *(cli)* make global extension discovery registry-aware, so a retired
+  versioned `rpi-web` cdylib is no longer rediscovered at startup and two
+  `ownsStdio` extensions can no longer race for stdio
+  ([#391](https://github.com/bigfish1913/pi-rust/pull/391))
+- *(harness)* tie the prepared-restore stat fast path to the generation the
+  replay actually consumed, and never trust an unknown (`0`) mtime
+  ([#383](https://github.com/bigfish1913/pi-rust/pull/383))
+
+### Other
+
+- accelerate historical session restore and recovery ([#389](https://github.com/bigfish1913/pi-rust/pull/389))
+- *(harness)* hash prepared restore only after taking ownership ([#379](https://github.com/bigfish1913/pi-rust/pull/379))
+- *(tui)* place screenshots instead of resending them every frame ([#384](https://github.com/bigfish1913/pi-rust/pull/384))
+
+### Changed
+
+- *(tui)* 启动标志换成 24×12 的半块线稿（齿轮环 + 内圆 + `r p i`），并用主题默认
+  前景色（dark 下白、light 下黑）。之前那枚 44×22 的 3D 徽章画的是「实心圆盘 +
+  镂空 rpi」，和 `docs/images/rpi-logo.jpg` 的线稿不是同一张图，缩到终端分辨率
+  远看就是一团斑块；`brand/shape.rs`、`brand/spin.rs`（3D 步进求交、7 秒自转）
+  随之删除，渲染 tick 不再为装饰性动画请求重绘。
+- *(tui)* 欢迎页 header 压到 17 行，80×24 的终端首屏可以完整显示。80×24 下转录
+  视口只有 17 行，旧 header 是 28 行，会滚掉整个标志。除了标志从 22 行降到 12 行，
+  还去掉了 logo 后的空行与和 footer 重复的 `Type your message and press Enter to
+  send.` 一行。
+
+## [0.26.1](https://github.com/bigfish1913/pi-rust/compare/v0.26.0...v0.26.1) - 2026-11-19
+
+### Added
+
+- *(sdk)* take_step! without a caller-side unsafe block ([#378](https://github.com/bigfish1913/pi-rust/pull/378))
+- *(sdk)* keep ABI strings out of plugin unsafe blocks ([#375](https://github.com/bigfish1913/pi-rust/pull/375))
+
+### Other
+
+- *(harness)* state that an expired lease fails closed ([#376](https://github.com/bigfish1913/pi-rust/pull/376))
+
+## [0.26.0](https://github.com/bigfish1913/pi-rust/compare/v0.25.0...v0.26.0) - 2026-11-19
+
+### Added
+
+- *(tui)* extension argument suggestions in the autocomplete pipeline ([#338](https://github.com/bigfish1913/pi-rust/pull/338))
+- *(extensions)* pi editor-draft and completion parity ([#366](https://github.com/bigfish1913/pi-rust/pull/366))
+- *(extensions)* dispatch session-tree lifecycle events
+- *(host)* task leases, runtime approval gate, and message_agent tool ([#348](https://github.com/bigfish1913/pi-rust/pull/348))
+- *(host)* child-agent roster and host-initiated stop ([#355](https://github.com/bigfish1913/pi-rust/pull/355))
+- *(tui)* 启动标志改为可旋转的 3D 齿轮徽章 ([#346](https://github.com/bigfish1913/pi-rust/pull/346))
+- *(tui)* render LaTeX math in the transcript ([#362](https://github.com/bigfish1913/pi-rust/pull/362))
+
+### Fixed
+
+- *(agent)* dispatch `ProviderHooks::after_response` before `MessageEnd` ([#367](https://github.com/bigfish1913/pi-rust/pull/367))
+- *(test)* release the writer lease between legacy session reopens ([#359](https://github.com/bigfish1913/pi-rust/pull/359))
+- *(tui)* pin an explicit user-message foreground in the light theme ([#361](https://github.com/bigfish1913/pi-rust/pull/361))
+- *(tui)* keep word navigation byte-safe on multibyte lines ([#357](https://github.com/bigfish1913/pi-rust/pull/357))
+
+### Performance
+
+- *(host)* reuse one transcript replay during session restore ([#368](https://github.com/bigfish1913/pi-rust/pull/368))
+
+### Documentation
+
+- *(extensions)* state where renderers run and how replies are chosen ([#360](https://github.com/bigfish1913/pi-rust/pull/360))
+
+## [0.25.0](https://github.com/bigfish1913/pi-rust/compare/v0.24.2...v0.25.0) - 2026-11-17
+
+### Added
+
+- *(tools)* bash description param + real write diffs ([#333](https://github.com/bigfish1913/pi-rust/pull/333))
+
+### Fixed
+
+- *(cli)* honor project CDN settings ([#341](https://github.com/bigfish1913/pi-rust/pull/341))
+- *(cli)* run plugin tool_result transforms on every tool result ([#323](https://github.com/bigfish1913/pi-rust/pull/323))
+
+## [0.24.2](https://github.com/bigfish1913/pi-rust/compare/v0.24.1...v0.24.2) - 2026-11-15
+
+### Added
+
+- *(extensions)* reclaim abandoned UI dialog mailbox entries ([#332](https://github.com/bigfish1913/pi-rust/pull/332))
+
+### Fixed
+
+- *(tui)* keep input dock out of native scrollback ([#334](https://github.com/bigfish1913/pi-rust/pull/334))
+
+### Added
+
+- *(extensions)* add `UiDialogMailbox::forget` and the `forget` op for runtime action 17 / `RelayUiDialog`. A plugin that abandons a dialog (timeout, tool cancellation, abort) can now explicitly release the terminal entry that would otherwise remain in `active` for the host's lifetime, because no further `poll` is coming. Pending requests are never removed.
+
+## [0.24.1](https://github.com/bigfish1913/pi-rust/compare/v0.24.0...v0.24.1) - 2026-11-14
+
+### Added
+
+- *(tui)* render README logo with RASCII at 64x32 ([#327](https://github.com/bigfish1913/pi-rust/pull/327))
+
+## [0.24.0](https://github.com/bigfish1913/pi-rust/compare/v0.23.0...v0.24.0) - 2026-11-13
+
+### Added
+
+- *(tui)* render README logo as ASCII
+
+### Fixed
+
+- *(install)* locate cdylib artifacts from Cargo JSON messages
+- *(cli)* remove obsolete no-emoji help entry
+
+### Other
+
+- Merge branch 'main' into fix/cargo-1.100-build-dir
+- Merge branch 'main' into feat/tui-logo-ascii
+
+## [0.23.0](https://github.com/bigfish1913/pi-rust/compare/v0.22.1...v0.23.0) - 2026-11-13
+
+### Added
+
+- *(session)* allow native durable extension reload
+- *(tui)* click thinking label to expand per message
+
+### Fixed
+
+- *(tui)* preserve native history across replies, panels and update notices ([#314](https://github.com/bigfish1913/pi-rust/pull/314))
+- *(rpc)* accept the nextRun queue kind returned by get_queue
+- *(cli)* only announce session cwd adoption when the directory actually changes
+- *(ci)* make infrastructure and validation gates reliable ([#306](https://github.com/bigfish1913/pi-rust/pull/306))
+- *(tui)* restore the startup and update notice slots ([#307](https://github.com/bigfish1913/pi-rust/pull/307))
+- *(tui)* keep per-message thinking ids unique across per-event views
+- *(tools)* fail fast on interactive credential prompts in shell children
+- *(tools)* prefer PATH pwsh and silence progress in powershell tool
+
+### Other
+
+- Merge branch 'main' into fix/session-cwd-note-only
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into fix/powershell-path-pwsh
+- Merge branch 'main' into fix/powershell-path-pwsh
+- Merge branch 'main' into fix/noninteractive-shell-prompts
+- *(tools)* add real encoded-command regressions for PowerShell scripts
+- *(session)* stop retaining frame locations during facts-only preflight ([#311](https://github.com/bigfish1913/pi-rust/pull/311))
+- *(tui)* drop leftover frame dump from thinking region probe
+
+### Fixed
+
+- *(tui)* keep startup output and update cards in the retained header/update slot so live output can no longer render around them
+
+## [0.22.1](https://github.com/bigfish1913/pi-rust/compare/v0.22.0...v0.22.1) - 2026-11-11
+
+### Fixed
+
+- *(tui)* align @ file completion and preserve streamed replies ([#303](https://github.com/bigfish1913/pi-rust/pull/303))
+
+## [0.22.0](https://github.com/bigfish1913/pi-rust/compare/v0.21.2...v0.22.0) - 2026-11-10
+
+### Added
+
+- *(cli)* add an operations docs topic for skills, diagnostics, providers and sessions ([#273](https://github.com/bigfish1913/pi-rust/pull/273))
+- *(tui)* align at file completion with pi ([#295](https://github.com/bigfish1913/pi-rust/pull/295))
+- add opt-in native durable session slice
+
+### Fixed
+
+- *(rpc)* validate provider configuration commands ([#298](https://github.com/bigfish1913/pi-rust/pull/298))
+- *(tui)* keep read-tool images in transcript order ([#294](https://github.com/bigfish1913/pi-rust/pull/294))
+- allow test-only autocomplete helpers
+- pass native durable flag to autocomplete reservation
+- *(cli)* scope session pickers to the current project ([#269](https://github.com/bigfish1913/pi-rust/pull/269))
+- *(msrv)* keep preview tests on rust 1.88
+- *(ci)* keep durable checks compatible with rust 1.88
+- *(ci)* allow intentionally dormant preview helpers
+- *(harness)* advance cold replay sequence
+
+### Other
+
+- enable native durable by default
+- Merge remote-tracking branch 'origin/main' into codex/preview-main-sync-291
+- Merge main into durable preview
+- Enforce native durable hard cut
+- Merge remote-tracking branch 'origin/main' into feat/durable-core
+- *(harness)* remove legacy sqlite session backend
+- synchronize durable core with latest main
+- Forward history identity in queue probe
+- Forward history identity in recovery probes
+- Update hard-cut harness fixtures
+- Opt source ledger fixture into experimental mode
+- Opt synthetic ledger fixture into experimental mode
+- Fix paused storage admission fixture
+- *(harness)* fast-path cold assistant frame replay
+
+## [0.21.2](https://github.com/bigfish1913/pi-rust/compare/v0.21.1...v0.21.2) - 2026-11-08
+
+### Fixed
+
+- *(tui)* preserve todo transcript order
+- *(resource)* re-sign staged native artifacts on macOS ([#284](https://github.com/bigfish1913/pi-rust/pull/284))
+
+### Other
+
+- Merge branch 'main' into perf/offline-retired-frame-gc
+- Merge branch 'main' into perf/offline-retired-frame-gc
+- *(harness)* compact stream frames a clear_run already retired
+- *(harness)* pin GC generation contract for existing append handles
+
+## [0.21.1](https://github.com/bigfish1913/pi-rust/compare/v0.21.0...v0.21.1) - 2026-11-07
+
+### Added
+
+- *(cli)* allow service extensions to start without an agent ([#278](https://github.com/bigfish1913/pi-rust/pull/278))
+
+### Fixed
+
+- *(cli)* support CDN for extension updates
+- *(cli)* emit model_select on startup and model switch
+
+### Other
+
+- Merge branch 'main' into fix/model-select-event-v0.21
+- Revert "feat(cli): allow service extensions to start without an agent ([#278](https://github.com/bigfish1913/pi-rust/pull/278))" ([#279](https://github.com/bigfish1913/pi-rust/pull/279))
+
+## [0.21.0](https://github.com/bigfish1913/pi-rust/compare/v0.20.0...v0.21.0) - 2026-11-06
+
+### Added
+
+- *(plugin-sdk)* tool_result transforms can rewrite a finished tool result ([#240](https://github.com/bigfish1913/pi-rust/pull/240))
+- allow configuring release CDN in settings
+- add optional release CDN mirror
+- version native extension artifacts for hot reload
+- *(release)* support x86_64 musl binaries
+
+### Fixed
+
+- *(tui)* keep runtime notices in transcript order ([#275](https://github.com/bigfish1913/pi-rust/pull/275))
+- *(cli)* tokenize docs queries and fall back across topics ([#272](https://github.com/bigfish1913/pi-rust/pull/272))
+- *(tools)* classify bash command failures in tool details ([#271](https://github.com/bigfish1913/pi-rust/pull/271))
+- *(tui)* gate file autocomplete on path appearance ([#264](https://github.com/bigfish1913/pi-rust/pull/264))
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/cdn-rustfs
+- *(read)* resize images with fast_image_resize ([#241](https://github.com/bigfish1913/pi-rust/pull/241))
+
+## [0.20.0](https://github.com/bigfish1913/pi-rust/compare/v0.19.0...v0.20.0) - 2026-11-05
+
+### Added
+
+- *(plugin-sdk)* add ReloadModels for a catalog-only refresh
+- *(config)* add provider update and delete RPCs
+- *(config)* persist image input support
+- *(config)* persist maximum output tokens
+- *(config)* persist provider context window
+- *(rpc)* probe provider models and connectivity
+- *(rpc)* persist provider configuration
+
+### Fixed
+
+- *(rpc)* raise ACP inline image prompt limit to 1 MiB
+- *(tui)* keep completed plan in transcript order ([#257](https://github.com/bigfish1913/pi-rust/pull/257))
+
+### Other
+
+- Merge branch 'main' into feat/web-provider-config
+- Merge branch 'main' into feat/web-provider-config
+
+## [0.19.0](https://github.com/bigfish1913/pi-rust/compare/v0.18.0...v0.19.0) - 2026-11-05
+
+### Added
+
+- *(harness)* expose bounded ToolProgram child queries and commit events
+- *(runtime)* add scoped native tool programs for Code Mode
+- *(agent)* observe genuine finalized ToolProgram children
+- *(tool-program)* resolve ordered native content attachments
+- *(codemode)* retain native results for bounded attachment
+- *(codemode)* preserve business values and guard invocation outputs
+- *(runtime)* preserve native results accounting and parent progress
+- *(harness)* persist genuine ToolProgram child observations
+- *(harness)* archive bounded native bodies in primary sessions
+
+### Fixed
+
+- *(rpc)* expose stable ToolProgram branch identity
+- *(rpc)* preserve canonical native tool result signatures
+- *(runtime)* drain panicking tool descendants and retain termination
+
+### Other
+
+- *(rpc)* simplify the owned child commit pump
+- add official extension compatibility gate ([#255](https://github.com/bigfish1913/pi-rust/pull/255))
+- *(harness)* initialize rebinding storage fixtures
+
+## [0.18.0](https://github.com/bigfish1913/pi-rust/compare/v0.17.2...v0.18.0) - 2026-11-04
+
+### Fixed
+
+- *(cli)* make context dismissible and align skill commands with pi ([#251](https://github.com/bigfish1913/pi-rust/pull/251))
+
+## [0.17.2](https://github.com/bigfish1913/pi-rust/compare/v0.17.1...v0.17.2) - 2026-11-04
+
+### Fixed
+
+- *(tui)* preserve startup output above the live transcript
+- parse JSON floats exactly so committed costs compare equal
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.17.1](https://github.com/bigfish1913/pi-rust/compare/v0.17.0...v0.17.1) - 2026-11-04
+
+### Fixed
+
+- *(resource)* resolve external scope prefixes before leasing
+
+## [0.17.0](https://github.com/bigfish1913/pi-rust/compare/v0.16.0...v0.17.0) - 2026-11-04
+
+### Added
+
+- *(plugin-sdk)* add StopRound for finishing the current turn only
+- *(plugin-sdk)* relay host UI dialogs to an external UI
+- *(plugin-sdk)* expose prompt templates in command listing
+- *(session)* share storage indexes and lazily page JSONL history
+- *(agent)* report queued message count on turn_end
+- *(cli)* add nonexecuting saved session resource reader
+- *(cli)* add explicit same-session resource transitions
+- *(cli)* opt in fresh print sessions to experimental native store
+- *(cli)* manage local packages skills and extensions
+- *(cli)* add exact native session resource selection
+- *(cli)* add exact native session resource selection
+- *(cli)* add extension update with legacy package compatibility
+- *(cli)* cancel provider OAuth calls when the TUI flow ends
+- *(extensions)* deliver OAuth cancellation to cancellable plugins
+- *(cli)* install runtime assets declared by prebuilt packages
+- *(plugin-sdk)* append a cancellable OAuth registration slot
+- *(durable)* share native progress checkpoints and restore pending queues
+- *(durable)* index experimental v3 queries and UI pages
+- *(durable)* add opt-in experimental native session backend
+
+### Fixed
+
+- preserve cold history validation and streamline session restore
+- preserve cold fork leaves and initialize verified resource authority before publication
+- enforce saved-read budgets and classify changed-branch cursors before anchors
+- *(cli)* canonicalize smoke fixtures and reject experimental extension dispatch
+- *(cli)* read steering text from the per-message view
+- *(cli)* drop unused queued_message_view_payloads
+- *(cli)* hand aborted queue back and keep per-queue views
+- *(harness)* reclaim queued messages atomically on abort
+- complete the relay lifecycle and unblock action 28
+- *(cli)* drop the unused merge_command_list wrapper
+- *(cli)* keep built-ins in the listing when reserving names
+- *(cli)* publish empty reloads and reserve built-in names
+- *(cli)* protect managed packages and preserve resource compatibility
+- *(cli)* validate selected Skills before startup side effects
+- *(cli)* validate selected Skills before startup side effects
+- *(cli)* initialize resource identity during native fork
+- make the TurnEnd payload ABI-safe and propagate it
+- *(cli)* honor deliverAs in SendUserMessage
+- *(tui)* derive spinner frames from wall clock at upstream cadence
+- *(cli)* keep history browsing alive after a single-line recall
+- *(cli)* move the caret through a multi-line draft before history
+- *(session)* lazily materialize legacy streaming frames
+- *(ai)* share image data between message copies
+- *(cli)* keep Linux clipboard data alive after selection copies
+- *(cli)* anchor autocomplete candidates to the editor
+- *(session)* upgrade locked legacy native sessions for progress
+- *(cli)* publish the OAuth flow id and its cancel token together
+- *(harness)* make host recovery and message settlement standalone
+- *(cli)* claim the OAuth flow before writing or deleting a credential
+- *(cli)* remove directories a failed sidecar install created
+- *(cli)* never treat an unowned sidecar as owned because of its case
+- *(cli)* prune a sidecar whose name changed only in case
+- *(cli)* reject Windows device names and trailing-dot sidecar paths
+- *(harness)* preserve run ownership and queued handoffs across caller drop
+- *(tools)* keep Windows shells suspended until they are in their job
+- *(test)* move the trampoline ceiling test into `mod tests`
+- *(extensions)* restore the relay test attribute and doc comment
+- *(test)* move the trampoline ceiling test into `mod tests`
+- *(extensions)* keep delivering the turn_end lifecycle event
+- *(extensions)* yield parallel tool scheduling during observer callbacks
+- *(tools)* kill Windows shell trees through a job object
+- *(harness)* reclaim native handles and classify create conflicts
+- *(harness)* recover recognized native hot journals before identity reads
+- *(session)* keep retired frame IDs reserved
+- *(session)* drop retired assistant frames from memory
+- *(harness)* hold AgentEnd until final assistant fallback is durable
+- *(harness)* retry final assistant entry ACK with its native ID
+- *(tui)* preserve native scrollback during live updates
+- *(tui)* share folded paste bodies across undo snapshots
+
+### Other
+
+- integrate latest main StopRound into preview
+- Merge main recovery store changes into StopRound preserving stream preconditions
+- retain latest preview runtime actions in resource transitions
+- preserve bounded history and strict transition reads on current resource base
+- Merge main into preview preserving native policy and runtime actions
+- Merge main into UI dialog relay and preserve all runtime actions
+- reconcile b with current preview storage and guards
+- Merge main into command listing and preserve atomic abort actions
+- Integrate bounded history and experimental backend policy with resource management
+- retain atomic abort and Notice fixes in optimized preview
+- Merge Notice and atomic abort fixes while preserving complete implicit forks
+- Merge reviewed preview Notice/abort fixes into resource d
+- Merge reviewed preview Notice/abort fixes into resource c
+- integrate bounded session history optimizations into preview
+- Merge reviewed preview Notice/abort fixes into resource b
+- Merge atomic abort recovery and restore pending Notice retry scheduling
+- *(session)* bound cold history reads and RPC state hydration
+- Merge updated resource reader and validate fork source identity
+- Merge updated transitions into nonexecuting saved-session reader
+- Merge updated resource foundation into same-session transitions
+- Merge preview into local resource management and preserve startup ownership
+- Merge main into preview and reconcile recovery/resource contracts
+- rustfmt the merge_command_list_reserved test call sites
+- Merge branch 'main' into pr/4-pending-messages
+- Merge branch 'main' into codex/session-resource-foundation
+- Merge branch 'main' into docs/skill-frontmatter-fields
+- *(skills)* describe the frontmatter fields the loader consumes
+- Merge reviewed resource fixes into native fork configuration
+- Merge reviewed resource fixes into saved session reads
+- Merge reviewed resource fixes into controlled rebind
+- synchronize main into preview with session history optimizations
+- integrate shared storage and lazy session history into preview
+- *(preview)* checkpoint extension updates and resource regression tooling
+- Merge branch 'main' into fix/spinner-cadence
+- Merge branch 'main' into fix/slash-panel-anchor
+- Merge branch 'main' into upstream/runtime-assets
+- Merge branch 'main' into fix/linux-clipboard-persistence
+- Merge branch 'main' into fix/slash-panel-anchor
+- Merge branch 'main' into upstream/runtime-assets
+- Merge branch 'main' into fix/linux-clipboard-persistence
+- Merge branch 'main' into upstream/oauth-cancel
+- sync embedded docs with the changelog entry
+- Merge main v0.16.0 into preview
+- Merge main into preview for the next preview release
+- *(cli)* describe only the runtime-assets.json index the host reads
+- *(oauth)* a cancelled login never saves a late credential, across reloads
+- *(cli)* list Windows device names among runtime asset path rules
+- *(cli)* cover runtime asset path, digest and entry-count cases
+- *(cli)* document runtime assets in the install guide
+- *(ai)* isolate body timeout from loopback connection timing
+- await persisted stream frames and cover integrated runtime actions
+- Merge remote-tracking branch 'upstream/main' into fix/windows-kill-job
+- Merge tested preview integration into local resource management
+- *(oauth)* pin the old keepalive and a live call across a reload
+- *(oauth)* keep an in-flight OAuth call's library mapped across an unload
+- rustfmt after the rebase onto the turn_end suite
+- Merge branch 'main' into fix/retire-frames-in-memory
+- *(harness)* cover large progress spill and prune crash boundaries
+- *(harness)* verify isolated native transaction process faults
+- *(durable)* verify native fact projections against session reducer
+- *(durable)* prototype bounded recovery and lazy indexed history
+- *(tui)* add native scrollback acceptance contracts
+
+### Fixed
+
+- *(cli)* keep fullscreen mouse-selection copies on Linux: the arboard clipboard
+  handle now lives for the whole process instead of being dropped right after
+  each copy, which on X11 destroyed the selection data unless a desktop
+  clipboard manager happened to take it over (LXQt/Openbox runs none), so the
+  "Copied" toast was followed by an empty clipboard
+
+## [0.16.0](https://github.com/bigfish1913/pi-rust/compare/v0.15.0...v0.16.0) - 2026-11-01
+
+### Added
+
+- *(rpc)* add durable message IDs, ordered images and delegated text IO
+- *(rpc)* add paginated user summaries and bounded message windows
+- *(cli)* hot-reload the active theme file via fs_watch
+- *(cli)* consume extension themePaths into the theme registry
+- *(cli)* discover theme dirs and list custom themes in /theme
+- *(cli)* accept theme file paths in --theme and settings
+- *(rpc)* add bounded external tool registration and execution
+- *(tui)* parse pi theme JSON files into ThemeColors
+
+### Fixed
+
+- *(cli)* hot-reload through the registry onto the session palette
+- *(cli)* resolve themes through the registry at startup and reload
+- *(tui)* wrap table cells instead of clipping narrow columns
+- *(tui)* expand pasted tabs to the next tab stop, measured per span
+- *(cli)* buffer Windows paste bursts before folding
+- *(rpc)* cancel foreground before returning external writer failures
+- *(tools)* finish a UTF-8 character cut by the pending limit before deciding
+- *(tools)* decode independently of read boundaries; finish on bounded drain
+- *(tools)* prevent browser launch during doctests
+- *(tools)* decode shell output across reads and in the console code page
+- *(harness)* retain run admission through image preparation
+- *(tui)* keep CRLF rows and post-escape accents through the shared wrapper
+- *(tui)* validate slotless theme tokens when loading
+- *(tui)* avoid blocking mouse selection on terminal output
+
+### Other
+
+- Merge main before final ACP capability qualification
+- Merge branch 'main' into feat/paginated-user-message-queries
+- Merge branch 'main' into fix/theme-hot-reload
+- Merge branch 'main' into fix/theme-ext
+- Merge branch 'main' into fix/theme-dirs
+- Merge branch 'main' into fix/theme-load
+- Merge main into fix/tui-table-wrap; retain both changelog entries
+- *(cli)* format the reload registry block
+- *(tools)* assert prompt output after UTF-8 limit lookahead
+- Merge branch 'main' into fix/shell-output-decoding
+- Merge remote-tracking branch 'origin/main' into codex/acp-stage3-external-tools
+- add session recovery and extension regression workflow
+- Merge branch 'main' into fix/theme-json
+
+### Changed
+
+- *(tui)* pasted tabs now expand to the next 8-column tab stop (counting wide chars as 2 columns, resetting at each newline) instead of a fixed four spaces, so a paste lines up with how the source it was copied from renders it; text that relied on "tab = exactly four spaces" changes what gets sent
+
+### Fixed
+
+- *(tui)* markdown table cells wrap without splitting a displayed Unicode sequence: `wrap_text_with_ansi`, `visible_width` and the per-column width floor now measure grapheme clusters (and whole ANSI-free spans) instead of summing scalars, so a ZWJ sequence (`👩‍💻`), a skin-tone modifier (`👍🏽`) or a VS16 sequence (`❤️`) stays on one row at ordinary and narrow terminal widths
+- *(tui)* pasted tab stops are measured on each complete tab-free span, so a tab after a width-sensitive Unicode sequence (`❤️`, `👩‍💻`, `👍🏽`) or a cross-grapheme ligature (Arabic Lam-Alef `لا`) lands on the same column the terminal shows instead of one or two columns off
+
+## [0.15.0](https://github.com/bigfish1913/pi-rust/compare/v0.14.0...v0.15.0) - 2026-10-30
+
+### Added
+
+- *(extensions)* carry recorded tool results through plugin streams
+- *(ai)* add a recorded field to tool calls and stream frames
+- *(extensions)* advertise recorded tool calls in provider requests
+
+### Fixed
+
+- *(cli)* render each autocomplete row as exactly one screen line
+- *(cli)* compare the expiry too before writing a refresh back
+- *(prompt)* align tool snippets and guidelines with Pi
+- *(rpc)* [**breaking**] default to compact message deltas with migrated consumers
+- *(cli)* drop a refresh result when login or logout changed the credential
+- *(cli)* renew OAuth logins per provider, not under one global lock
+- *(runtime)* refresh stored OAuth logins before provider requests
+- *(agent)* never execute recorded tool calls
+- *(plugin-sdk)* refuse recorded calls on hosts that cannot honor them
+- *(extensions)* keep plugin call ids out of the fail-closed error text
+- *(extensions)* keep a streamed recording through the final message
+- *(tui)* drop the selected row's trailing space
+- *(tui)* size the settings label column to its labels
+- *(tui)* render overlays inside the frame's cell geometry scope
+- *(tui)* scope image geometry to the frame's polled cells
+- *(tui)* give each renderer its own polled cell geometry
+- *(tui)* poll cell geometry on the main screen and harden the probes
+- *(tui)* key image caches on cell geometry, not just width
+- *(tui)* size inline images from the terminal's real cell size
+
+### Other
+
+- *(extensions)* define recordedToolCalls as the highest decoded version
+- *(extensions)* document the recorded capability and the final out check
+- Merge branch 'main' into upstream/recorded-tool-calls
+- Merge branch 'main' into upstream/oauth-auto-refresh
+- Merge branch 'main' into fix/autocomplete-panel-flicker
+- Merge branch 'main' into upstream/oauth-auto-refresh
+- *(ai)* cover unversioned OpenAI proxy prefixes
+- *(ai)* frames written before the recorded field reduce to an ordinary call
+- *(agent)* a recorded call never reaches after_tool_call
+- *(agent)* an explicit retry of a recorded call runs once
+- *(extensions)* collapse two nested if-lets in the recorded-call tests
+- add the #183 review's provider-to-agent and JSONL recovery checks
+- *(extensions)* a toolcall_end without a recording stays an ordinary call
+- *(tui)* probe renderer-local cell geometry isolation
+
+### Changed
+
+- **Breaking (RPC wire format):** `--mode rpc` now defaults to `compact-deltas`. Text, thinking, and tool-call delta updates omit the cumulative `message` and `assistantMessageEvent.partial` snapshots while retaining nested delta fields and the top-level `eventType`, `contentIndex`, and `delta` mirrors. `ready.semantics.messageUpdates` identifies the selected mode; a missing field means legacy `snapshot`. Upgrade remote clients and protocol adapters before deploying the new host. `--rpc-message-updates=snapshot` is an explicit, temporary migration fallback, not the long-term default. Structural events, authoritative final messages, settlement and canonical branch-query contracts, plugin serialization, and `--mode json` are unchanged. This is not a fully snapshot-free or lossless replay protocol. ([#171](https://github.com/bigfish1913/pi-rust/issues/171))
+
+### Fixed
+
+- Remote TUI streaming now accumulates indexed compact text, thinking, and tool-argument updates and reconciles structural/final snapshots without appending deltas twice; older snapshot senders remain supported. Compact tool deltas include the provider's currently known `id`/`toolName` so identity discovered after start is not lost.
+- OpenAI Responses function-call deltas include any initial raw argument prefix exactly once on their first delta, matching the existing custom-tool behavior. This provider correctness fix applies to all event consumers; final message and snapshot contents are unchanged.
+- OpenAI Completions and Responses flush batched text/thinking before crossing channel/structural boundaries, preventing a snapshot from exposing content whose later compact delta would append it again. Real-provider offline SSE regressions compare both wire modes at every UI update.
+
+## [0.14.0](https://github.com/bigfish1913/pi-rust/compare/v0.13.0...v0.14.0) - 2026-10-30
+
+### Added
+
+- publish session entry commit events
+
+### Fixed
+
+- *(rpc)* bound branch queries and preserve type identities
+- *(tui)* keep the editor's wrap width independent of the caret row ([#165](https://github.com/bigfish1913/pi-rust/pull/165))
+- *(cli)* honor thinkingBudgets from settings.json ([#169](https://github.com/bigfish1913/pi-rust/pull/169))
+- *(rpc)* support multi-type branch filters ([#159](https://github.com/bigfish1913/pi-rust/pull/159))
+- *(rpc)* filter session branch reads ([#150](https://github.com/bigfish1913/pi-rust/pull/150))
+- *(rpc)* drain commit events and notify partial batch commits
+- *(rpc)* publish session commit events for atomic entry writes
+- *(ai)* give xhigh and max their own thinking budgets ([#170](https://github.com/bigfish1913/pi-rust/pull/170))
+- *(config)* keep compat on anthropic-messages models from models.json ([#168](https://github.com/bigfish1913/pi-rust/pull/168))
+
+### Other
+
+- bring preview canonical branch queries into main
+- *(rpc)* [**breaking**] require canonical customTypes branch queries ([#160](https://github.com/bigfish1913/pi-rust/pull/160))
+- Merge remote-tracking branch 'origin/main' into HEAD
+- Merge branch 'main' into preview
+- cover RPC session commit publication
+- centralize durable business state
+
+### Changed
+
+- **Breaking (rpc/extensions):** `get_session_branch` / `GetSessionBranch` now require an explicit non-empty `customTypes` array, support exclusive `afterSeq`, order and global limit, and reject unfiltered/legacy query arguments. Upgrade hosts and clients together; require `filtered: true` in replies because older ABI-compatible hosts may ignore filters. Custom-type identifiers match exactly, and bounded multi-type queries limit each storage read before merging. The append/write protocol and binary plugin ABI are unchanged.
+
+### Fixed
+
+- *(tui)* keep the editor's wrap width independent of the caret's row: a row used to wrap one column earlier while the caret sat on it, so the same draft reflowed (and the input box grew a line) once the caret moved away
+
+## [0.13.0](https://github.com/bigfish1913/pi-rust/compare/v0.12.0...v0.13.0) - 2026-10-29
+
+### Fixed
+
+- *(tui)* keep Windows mouse selections aligned with painted frames ([#166](https://github.com/bigfish1913/pi-rust/pull/166))
+- *(bash)* enforce a default tool execution timeout ([#164](https://github.com/bigfish1913/pi-rust/pull/164))
+- *(cli)* say when the terminal cannot render inline images ([#161](https://github.com/bigfish1913/pi-rust/pull/161))
+- *(cli)* classify session storage failures
+- *(cli)* stop footer counters freezing after dropped events
+- *(harness)* surface session write failures to the user ([#136](https://github.com/bigfish1913/pi-rust/pull/136))
+- *(ai)* redact credentials from stream and image option debug output ([#154](https://github.com/bigfish1913/pi-rust/pull/154))
+- *(bash)* read output while the command runs ([#163](https://github.com/bigfish1913/pi-rust/pull/163))
+- *(tui)* crop kitty images to the viewport ([#158](https://github.com/bigfish1913/pi-rust/pull/158))
+
+## [0.12.0](https://github.com/bigfish1913/pi-rust/compare/v0.11.1...v0.12.0) - 2026-10-28
+
+### Fixed
+
+- *(cli)* return to a restored session's working directory ([#141](https://github.com/bigfish1913/pi-rust/pull/141))
+- *(tui)* mark kitty image chunks as continued ([#145](https://github.com/bigfish1913/pi-rust/pull/145))
+
+### Changed
+
+- *(cli)* restoring a session (`-c`, `-r`, `--session`, an existing `--session-id`) now runs in the session's recorded working directory instead of the launch directory, and announces the switch (naming both directories) because tools, context files, and extensions follow it; when that directory no longer exists the launch directory is kept and the fallback is announced. Project trust is re-resolved against the adopted directory, so an untrusted project's settings, skills, and context files stay off until allowed
+
+### Fixed
+
+- *(tui)* switching to a session from another directory says where the session belongs instead of implying the tools moved
+
+## [0.11.1](https://github.com/bigfish1913/pi-rust/compare/v0.11.0...v0.11.1) - 2026-10-28
+
+### Added
+
+- *(rpc)* publish session entry commit invalidations ([#147](https://github.com/bigfish1913/pi-rust/pull/147))
+
+### Fixed
+
+- *(cli)* resolve CLI updates from GitHub releases ([#146](https://github.com/bigfish1913/pi-rust/pull/146))
+
+### Other
+
+- *(agent)* cover provider cache invalidation ([#148](https://github.com/bigfish1913/pi-rust/pull/148))
+
+## [0.11.0](https://github.com/bigfish1913/pi-rust/compare/v0.10.1...v0.11.0) - 2026-10-27
+
+### Added
+
+- *(rpc)* expose registered extension commands
+
+### Fixed
+
+- *(harness)* let the host wait for a session's durable writes
+- *(cli)* take the highlighted slash completion on Enter
+- *(prompt)* state each guideline once
+- *(harness)* run requests carry the session id, so providers can key caching on it
+- *(openai-responses)* send the session id as prompt_cache_key
+- *(tui)* keep a rewritten Shift+Enter from being dropped
+
+### Other
+
+- rustfmt the new prompt test
+- make stable release preparation manual
+
 ## [0.10.1](https://github.com/bigfish1913/pi-rust/compare/v0.10.0...v0.10.1) - 2026-10-27
 
 ### Added

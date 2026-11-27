@@ -650,6 +650,22 @@ pub enum EventTag {
     AgentEnd = 17,
     AgentSettled = 18,
     TurnStart = 19,
+    /// End of one assistant turn, carrying a JSON `data` payload:
+    /// `{"outcome":"stop"|"aborted"|"error", "stopReason":"<raw>",
+    /// "toolResultCount":N, "pendingMessages":N}`.
+    ///
+    /// `outcome` is the normalized value to branch on: `stop` covers a normal
+    /// stop, a tool-use continuation and a token-ceiling truncation; `aborted`
+    /// means the run was cancelled; `error` covers every other termination.
+    ///
+    /// `pendingMessages` is how many user messages were still queued (steering
+    /// + follow-up) when the turn settled — the data behind an "N queued"
+    /// indicator.
+    ///
+    /// ABI note: hosts before this payload existed sent `turn_end` with an
+    /// **empty** payload. Read it via `EventView::data_text()`, which returns
+    /// `None` for an empty payload, so a consumer handles both without a
+    /// version probe.
     TurnEnd = 20,
     MessageStart = 21,
     MessageUpdate = 22,
@@ -678,13 +694,28 @@ pub enum EventTag {
     /// is deliberately not shipped, because subscribers (a voice extension
     /// barging in on playback) only need to know *that* the user is composing.
     EditorChange = 36,
+
+    /// Turn-end **payload** event, separate from the [`EventTag::TurnEnd`]
+    /// lifecycle tag.
+    ///
+    /// `TurnEnd` may be sent by a host built against a pre-payload SDK, which
+    /// writes it with [`StablePluginEvent::empty`] — a 1-byte write into a
+    /// union whose `data` arm is a 16-byte `StbString`. Reading `payload.data`
+    /// for such a host would read uninitialized memory, and the ABI handshake
+    /// cannot distinguish the two hosts. Carrying the payload under its own tag
+    /// removes the ambiguity: a host that does not support it never sends this
+    /// tag, so the read is only reachable on hosts that do.
+    ///
+    /// Appended last so every existing discriminant stays stable.
+    TurnEndPayload = 37,
 }
 
-/// Number of event categories — `37` (33 Pi `on()` categories + 1 rpi-specific
-/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events + 1 rpi-specific
-/// [`EventTag::EditorChange`]). A test asserts
-/// `EVENT_TAG_COUNT == 37` so a future edit that adds/removes a tag is caught.
-pub const EVENT_TAG_COUNT: usize = 37;
+/// Number of event categories — `38` (33 Pi `on()` categories + 1 rpi-specific
+/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events + 2 rpi-specific payload
+/// tags: [`EventTag::EditorChange`] and [`EventTag::TurnEndPayload`]). A test
+/// asserts `EVENT_TAG_COUNT == 38` so a future edit that adds/removes a tag is
+/// caught.
+pub const EVENT_TAG_COUNT: usize = 38;
 
 /// The application name of the host that loads plugins: `"rpi"`.
 ///
@@ -870,7 +901,21 @@ impl StablePluginEvent {
         Self {
             tag,
             payload: EventPayload {
-                empty: EventEmpty::INSTANCE,
+                // Initialize the **largest** union member, not `EventEmpty`.
+                //
+                // `EventPayload` is a union: writing only `empty` (1 byte)
+                // leaves the remaining bytes — which `data` (`StbString`:
+                // ptr + len) would read — uninitialized. A reader that checks
+                // the tag cannot know whether *this* host wrote the `data` arm,
+                // and a tag an older host sent as no-payload must still be
+                // readable as "no data".
+                //
+                // Writing an empty `StbString` here makes every subsequent
+                // `payload.data.data` read defined, encoding "no payload" as an
+                // empty string rather than as indeterminate bytes.
+                data: EventData {
+                    data: StbString::empty(),
+                },
             },
         }
     }
@@ -1038,6 +1083,46 @@ pub type ResourcesDiscoverFn = extern "C" fn(
 pub type BeforeAgentStartFn =
     extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
+/// `tool_result` transform signature: pi's `tool_result` handler, which may
+/// return a changed `content` / `details` for a finished tool call
+/// (`ToolResultEventResult`). The [`EventTag::ToolResult`] broadcast only
+/// observes.
+///
+/// `event_json` is a borrowed envelope `{"toolCallId", "toolName", "input",
+/// "content", "details", "isError"}`: `input` holds the arguments the tool ran with,
+/// `content` is the result in the shape a plugin tool returns (`text` and
+/// `image` blocks, `image` carrying base64 `data` and `mimeType`). `out` is
+/// plugin-produced JSON with the fields to replace, `{"content": [...]}`,
+/// `{"details": ...}` or both; an empty string or object leaves the result
+/// alone. It is reclaimed via the `plugin_free_string` given at registration.
+///
+/// Handlers chain in registration order, each seeing the previous one's
+/// result. A nonzero return or a panic leaves the result as it was and the
+/// fan-out continues. The `rpi` host offers every finished result, including
+/// error results and immediate preparation failures such as argument-schema
+/// validation or a missing tool (`"isError": true`, for example a bash exit
+/// != 0 with its output); a transform cannot change whether the call failed.
+/// The reason of a call vetoed by a `ToolCall` handler is offered too, as the
+/// text of an error result with `"details": {"blocked": true}`; the first
+/// non-empty `text` block returned becomes the reason the model reads. If the
+/// transforms cannot run, including when `/reload` invalidates the captured
+/// snapshot before dispatch, the host withholds the result rather than pass it
+/// on. Recorded calls keep their recorded result without running hooks again.
+/// Handlers run on a blocking thread, so slow work (re-encoding an image) does
+/// not stall the runtime.
+///
+/// SAFETY: the plugin warrants `user_data` is valid for the registry's lifetime
+/// and the handler is callable from any thread.
+pub type ToolResultFn =
+    extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// Argument suggester for the TUI autocomplete pipeline (see
+/// [`PluginApi::register_argument_suggester`]). Same JSON-in/JSON-out shape as
+/// [`ToolResultFn`]: the request is borrowed and must not be freed; `out` is
+/// plugin-owned and reclaimed via the registered `plugin_free_string`.
+pub type ArgumentSuggesterFn =
+    extern "C" fn(request_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
 // ---------------------------------------------------------------------------
 // Runtime actions — uniform JSON-RPC dispatch by RuntimeActionId
 // ---------------------------------------------------------------------------
@@ -1092,8 +1177,20 @@ pub enum RuntimeActionId {
     /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
     /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
     SetEditorText = 19,
-    /// Return the current session branch entries oldest-first as JSON.
-    /// Args: `{}`; result: `{"entries":[...]}`.
+    /// Query custom entries on the current main branch. Args:
+    /// `{"customTypes":["durable-state","other-custom-type"],"afterSeq":42,
+    /// "limit":20,"order":"newestFirst"}`. `customTypes` is required and
+    /// non-empty; the other fields are optional. Default order: `oldestFirst`.
+    /// `afterSeq` is exclusive: `seq > afterSeq` for oldestFirst, `seq < afterSeq`
+    /// for newestFirst. Ordering and
+    /// limit apply globally across types, within the selected branch only.
+    /// Result: `{"entries":[...],"count":N,"filtered":true}`. Empty `{}`,
+    /// unknown keys and legacy `customType`/`custom_type`/`custom_types`/
+    /// `after_seq` query arguments are errors, including mixed old/new requests.
+    /// This does not change AppendEntry's singular `customType` write argument.
+    /// Type identifiers match exactly (including case and whitespace).
+    /// Consumers must require `filtered == true`: older ABI-compatible hosts
+    /// may ignore the query and return the unfiltered branch instead.
     GetSessionBranch = 20,
     /// Inspect or finish a plugin-owned stdio server lifecycle. Args:
     /// `{"op":"status"}` or `{"op":"finish","exitCode":0}`. Only the
@@ -1113,6 +1210,100 @@ pub enum RuntimeActionId {
     /// use start(question), status, cancel, hide and show. Never changes the
     /// main transcript or its queues. Presentation and execution stay in host.
     SideQuestion = 25,
+    /// Enumerate the registered slash commands. Args: `{}`; result:
+    /// `{"commands":[{"name":"…","description":"…","source":"builtin"|"extension"|"prompt"}]}`.
+    ///
+    /// Worth having as an action because the ABI had no way to enumerate
+    /// commands at all: a remote client saw an empty completion list and could
+    /// not tell it apart from "this host has no commands". `GetActiveTools` is
+    /// about tools, not slash commands.
+    ///
+    /// A host with no extension registry returns an **empty list** rather than
+    /// an error: "none registered" is a real answer, and a client should
+    /// degrade to "no completion available" instead of surfacing a failure.
+    ///
+    /// `source` is `builtin` for the host's own commands, `extension` for ones
+    /// a plugin registered, and `prompt` for a prompt template; clients use it
+    /// to decide how to dispatch a chosen entry.
+    ListCommands = 26,
+    /// Abort the current run on the main lane. Args: `{}`; result:
+    /// `{"aborted": true, "runId": "…"}` when a run was cancelled, or
+    /// `{"aborted": false}` when the lane was already idle — aborting an idle
+    /// lane is a no-op, not an error, so a plugin's stop button is idempotent.
+    ///
+    /// The abort is cooperative: the host observes the cancellation at its next
+    /// await point, so the run may emit further stream events after this action
+    /// returns.
+    ///
+    /// Queued messages the user staged during the run are **reclaimed** as part
+    /// of the abort and returned in `steer` / `followUp`, because the loop
+    /// drains that queue into the transcript when it observes the cancellation
+    /// (see `agent_loop`'s `drain_steering`). A caller with a remote queue
+    /// restores them instead of losing them.
+    ///
+    /// Each entry is `{"text": "…", "images": [{mediaType, data}]}` — text and
+    /// its own attachments together. A flat image list would lose the pairing
+    /// as soon as two queued messages carry different pictures.
+    Abort = 27,
+    /// Relay host UI-dialog requests to an external UI.
+    ///
+    /// Args:
+    /// * `{"op":"take"}` — take every request the host has **not** reserved for
+    ///   a plugin (i.e. ids that do not start with the reserved prefix),
+    ///   removing them from the mailbox. Result:
+    ///   `{"requests":[{"requestId","toolCallId","ui"}]}` (possibly empty).
+    /// * `{"op":"respond","requestId":"…","answer":…}` and
+    ///   `{"op":"cancel","requestId":"…"}` — behave like the corresponding
+    ///   `UiDialog` ops.
+    ///
+    /// Exists because the TUI and plugins share one dialog mailbox: without a
+    /// relay, a third-party extension's question pops up on the terminal while
+    /// the user is watching a remote client, and is effectively lost.
+    RelayUiDialog = 28,
+    /// Finish the current turn, then stop — the gentle counterpart of `Abort`.
+    ///
+    /// `Abort` interrupts the in-flight provider call and running tools; this
+    /// only prevents the loop from starting another turn, so the current answer
+    /// is not truncated. That is what a user means by "stop after this round".
+    ///
+    /// Args: `{}`; result: `{"requested": true}`.
+    ///
+    /// The flag is one-shot: it is consumed at the next turn boundary and
+    /// cleared when a new run starts. Setting it while idle is a harmless no-op.
+    StopRound = 29,
+    /// Invocation-bound nested tool execution (protocol version 1).
+    ToolProgram = 30,
+    /// Re-read the model/provider catalog from disk **without** reloading
+    /// extensions.
+    ///
+    /// Why this exists next to `Reload` (`15`): `Reload` re-runs extension
+    /// discovery and swaps the whole `ExtensionSession`. That swap invalidates
+    /// the old `RegistrySnapshot`, so the **in-flight run** — which captured
+    /// its emitter at run start — silently stops receiving plugin events
+    /// (`dispatch_to_handlers` drops everything from a stale snapshot). The
+    /// TUI keeps rendering (it uses the broadcast emitter), so the session
+    /// looks alive while every plugin event is dead until the next run.
+    ///
+    /// `ReloadModels` is the cheap counterpart: it re-reads `models.json`,
+    /// re-resolves the provider catalog and swaps the runtime bindings, but
+    /// **never touches the extension registry, the emitter, or the event
+    /// snapshot**. A running turn is unaffected.
+    ///
+    /// Args: `{}`; result: `{"models": <count>}`.
+    ReloadModels = 31,
+    /// Read the interactive prompt editor's current draft (pi's
+    /// `ui.getEditorText`).
+    ///
+    /// Args: `{}`; result: `{"text": "…"}`. Never an error: a host with no
+    /// editor (RPC, print, headless) returns an empty string, so a plugin can
+    /// degrade instead of branching on the failure.
+    ///
+    /// This is the pull counterpart of [`EventTag::EditorChange`], which
+    /// deliberately ships no draft text. An extension that needs the draft when
+    /// *it* decides to look (rather than on every keystroke) calls this; one
+    /// that wants to contribute candidates registers an autocomplete provider
+    /// through [`PluginApi::register_autocomplete_provider`].
+    GetEditorText = 32,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1159,9 +1350,78 @@ impl TryFrom<u32> for RuntimeActionId {
             23 => Ok(Self::GetExecutionContext),
             24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
+            26 => Ok(Self::ListCommands),
+            27 => Ok(Self::Abort),
+            28 => Ok(Self::RelayUiDialog),
+            29 => Ok(Self::StopRound),
+            30 => Ok(Self::ToolProgram),
+            31 => Ok(Self::ReloadModels),
+            32 => Ok(Self::GetEditorText),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
+}
+
+impl RuntimeActionId {
+    /// Every defined action, in ascending id order.
+    ///
+    /// Kept next to `TryFrom` so adding a variant has one obvious place to
+    /// update. The host's trampoline ceiling and the id-consistency tests both
+    /// derive from [`Self::MAX`], so a forgotten bump fails a test instead of
+    /// silently making the newest action unreachable.
+    pub const ALL: &'static [RuntimeActionId] = &[
+        Self::SendMessage,
+        Self::SendUserMessage,
+        Self::AppendEntry,
+        Self::SetSessionName,
+        Self::GetActiveTools,
+        Self::SetActiveTools,
+        Self::SetModel,
+        Self::GetThinkingLevel,
+        Self::SetThinkingLevel,
+        Self::Compact,
+        Self::GetSystemPrompt,
+        Self::NewSession,
+        Self::Fork,
+        Self::NavigateTree,
+        Self::SwitchSession,
+        Self::Reload,
+        Self::GetCliFlag,
+        Self::UiDialog,
+        Self::SetStatus,
+        Self::SetEditorText,
+        Self::GetSessionBranch,
+        Self::StdioLifecycle,
+        Self::UiComponent,
+        Self::GetExecutionContext,
+        Self::ChildAgent,
+        Self::SideQuestion,
+        Self::ListCommands,
+        Self::Abort,
+        Self::RelayUiDialog,
+        Self::StopRound,
+        Self::ToolProgram,
+        Self::ReloadModels,
+        Self::GetEditorText,
+    ];
+
+    /// The highest defined action id.
+    ///
+    /// The FFI trampoline rejects anything above it, so this must track the
+    /// variants — deriving it here (rather than at each call site) is what makes
+    /// forgetting impossible.
+    pub const MAX: u32 = {
+        let mut max = 0u32;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let id = Self::ALL[i] as u32;
+            if id > max {
+                max = id;
+            }
+            i += 1;
+        }
+        max
+    };
 }
 
 impl From<RuntimeActionId> for u32 {
@@ -1200,10 +1460,66 @@ pub type RuntimeActionFn = extern "C" fn(
 pub type CommandHandlerFn =
     extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
+/// A plugin autocomplete provider, stacked on top of the host's built-in one
+/// (pi's `ui.addAutocompleteProvider`).
+///
+/// `query_json` is a borrowed envelope:
+///
+/// ```json
+/// {"text":"#Bud","cursor":4,"line":"#Bud","linePrefix":"#Bud"}
+/// ```
+///
+/// `text` is the whole draft, `cursor` a **byte** offset into it (UTF-8 boundary
+/// aligned), `line` the current line, `linePrefix` the text before the caret on
+/// that line. Return code `0` means "here are suggestions" and `out` must hold
+/// (owning, reclaimed with the `plugin_free_string` passed to
+/// [`PluginApi::register_autocomplete_provider`]):
+///
+/// ```json
+/// {"items":[{"text":"#Budget.xlsx","label":"Budget.xlsx",
+///             "description":"Excel · focused","insertSpace":false}]}
+/// ```
+///
+/// Return code `1` (or an empty `items` array) means "no opinion": the host
+/// falls through to its built-in provider, so a plugin only wins the candidates
+/// it actually produces. Any other return code is logged and treated as `1`.
+///
+/// `insertSpace` defaults to `true` when absent, matching the editor's
+/// file/slash acceptance; a `#`-style insertion sets it to `false` so the caret
+/// lands right after the inserted name. `isDirectory` defaults to `false` and
+/// only affects display.
+pub type AutocompleteProviderFn =
+    extern "C" fn(query_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// Argument completions for one registered slash command (pi's
+/// `RegisteredCommand.getArgumentCompletions`).
+///
+/// `args_json` is a borrowed `{"argumentPrefix":"con"}` envelope holding the
+/// text after the command name and its trailing space. `out` is owning and
+/// reclaimed with the `plugin_free_string` passed to
+/// [`PluginApi::register_command_completions`]. Return `0` with
+/// `{"items":[{"text":"connect","description":"Connect the bridge"}]}`, or
+/// `1` (or empty `items`) for "no completions" — which is not an error and
+/// leaves the editor's default behavior alone.
+pub type CommandArgumentCompletionFn =
+    extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
 /// A render/transform fn (for the renderer registrars). `input_json` is borrowed;
-/// `out` is owning output the plugin frees via host `free_string`. Markdown
-/// handlers return `{markdown:"..."}`; message/entry handlers return
-/// `{text:"...",markdown?:true}` or `{lines:["..."]}` for terminal UI.
+/// `out` is owning output the plugin frees via host `free_string`.
+///
+/// The host passes JSON envelopes: markdown transformers receive
+/// `{"markdown":"..."}`; message renderers receive the message/custom-entry
+/// payload (for example `{"customType":"token-usage","usage":{...}}`);
+/// entry renderers receive `{"customType":"...","data":...}`. Message and
+/// entry renderers return `{"text":"...","markdown":true|false}` or
+/// `{"lines":["..."]}` for terminal UI. Entry renderers may instead return
+/// `{"display":false}` with status `0` to claim an entry without displaying it:
+/// no component, spacer or raw-text fallback is added. Only the boolean `false`
+/// hides; it takes precedence over `text` and `lines`. This is entry-only and
+/// requires a host implementing explicit visibility (older hosts may fall back
+/// to raw text). Non-zero status still means unhandled, not hidden.
+/// Markdown transformers return `{"markdown":"..."}`. The rendered value is
+/// one transcript row/component, not an arbitrary component tree.
 pub type RenderFn =
     extern "C" fn(input_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
@@ -1310,8 +1626,9 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// Same request envelope and final-response contract as [`ProviderRequestFn`],
 /// plus a per-chunk channel and the cancellation protocol:
 ///
-/// - `req_json` — borrowed `{ model, context, options }` envelope (never freed by
-///   the plugin).
+/// - `req_json` — borrowed `{ model, context, options, capabilities }` envelope
+///   (never freed by the plugin). `capabilities` is absent on hosts that predate
+///   it; see `recorded` below.
 /// - `emit` + `emit_user_data` — the host's per-chunk callback. `emit` is `None`
 ///   only if the host cannot accept chunks; a plugin then degrades to buffering
 ///   and returning the message through `out`. While the caller is cancelled the
@@ -1360,6 +1677,20 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// Unknown `type` values are ignored (forward compatibility). A `*_delta` may
 /// carry an optional `partial` object (a full assistant message) to override the
 /// host-side accumulated snapshot; otherwise the host accumulates deltas itself.
+///
+/// A `toolcall_end` may carry `recorded` when the call already ran upstream: the
+/// host then uses the recording as the tool result and never executes the call
+/// locally. Its shape is `{"version":1,"isError":false,"result":{"content":[...],"terminate":false}}`,
+/// and a call without the key executes as usual. A host that predates
+/// `recorded` ignores it and executes the call, so a plugin may send `recorded`
+/// only when the request's top-level `capabilities.recordedToolCalls` is at
+/// least `1`. That value is the highest recording version the host decodes; a
+/// host that advertises `n` decodes every version from `1` to `n`. The
+/// `provider` bridge applies this check itself.
+/// The host holds `out` to every recorded `toolcall_end`: a final call with the
+/// same `id`, `name` and `arguments` but no `recorded` key gets the streamed
+/// recording, and a missing, repeated or conflicting call ends the turn with an
+/// error instead of running it.
 pub type ProviderStreamRequestFn = extern "C" fn(
     req_json: StbStringRef,
     emit: Option<ProviderStreamEmitFn>,
@@ -1382,6 +1713,92 @@ pub type OAuthRequestFn =
 /// The manifest is copied by the host and should include `id`, `displayName`,
 /// `scopes`, `supportsPkce`, and optional `capabilities`.
 pub type OAuthRegisterFn = OAuthRequestFn;
+
+/// Cancellation poll for one OAuth action: returns nonzero once the host no
+/// longer wants the result. It never blocks and never frees anything.
+pub type OAuthRequestCancelledFn = extern "C" fn(user_data: *mut c_void) -> i32;
+
+/// Cancellation view for one OAuth action, passed to an [`OAuthRequestControlFn`].
+///
+/// The host lends the struct for a single action call and the plugin must not
+/// retain it. Poll it through [`OAuthRequestControl::poll_cancelled`], which also
+/// tolerates a host that supplies only a prefix of the struct.
+///
+/// `struct_size` is the first field, so a plugin can read how much the host
+/// supplied before it touches any later field. Fields are only ever appended.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OAuthRequestControl {
+    /// `sizeof(OAuthRequestControl)` as the host built it.
+    pub struct_size: u32,
+    /// `is_cancelled(user_data) -> i32`: nonzero once the action is cancelled.
+    pub is_cancelled: OAuthRequestCancelledFn,
+    /// Host-owned opaque handle, passed back unchanged to `is_cancelled`.
+    pub user_data: *mut c_void,
+}
+
+extern "C" fn never_cancelled(_user_data: *mut c_void) -> i32 {
+    0
+}
+
+impl OAuthRequestControl {
+    /// A control that is never cancelled. A legacy callback uses it to run a
+    /// control-aware action with no host cancellation available.
+    pub fn uncancellable() -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            is_cancelled: never_cancelled,
+            user_data: core::ptr::null_mut(),
+        }
+    }
+
+    /// Whether the host has cancelled the action. A null control, or one whose
+    /// `struct_size` does not reach `user_data`, reports `false`.
+    ///
+    /// # Safety
+    /// `control` must be null or point to a control that the host keeps valid
+    /// until the action callback returns.
+    pub unsafe fn poll_cancelled(control: *const Self) -> bool {
+        // SAFETY: `struct_size` is the leading u32, so reading it needs only the
+        // four bytes every host supplies.
+        let Some(size) = (unsafe { control.cast::<u32>().as_ref() }).copied() else {
+            return false;
+        };
+        let reached = core::mem::offset_of!(Self, user_data) + core::mem::size_of::<*mut c_void>();
+        if (size as usize) < reached {
+            return false;
+        }
+        let base = control.cast::<u8>();
+        // SAFETY: the host's `struct_size` covers both fields read here, and the
+        // caller keeps the control valid for the call.
+        let (is_cancelled, user_data) = unsafe {
+            (
+                base.add(core::mem::offset_of!(Self, is_cancelled))
+                    .cast::<OAuthRequestCancelledFn>()
+                    .read(),
+                base.add(core::mem::offset_of!(Self, user_data))
+                    .cast::<*mut c_void>()
+                    .read(),
+            )
+        };
+        is_cancelled(user_data) != 0
+    }
+}
+
+/// OAuth action callback that can observe cancellation through an
+/// [`OAuthRequestControl`]. The envelope and output contract match
+/// [`OAuthRequestFn`]. A host that supports cancellation passes a non-null
+/// `control` to every call. The callback must poll it during any long wait and
+/// return promptly with a nonzero status once it reports cancellation.
+///
+/// A legacy fallback registered through `register_oauth_provider` may pass a
+/// control from [`OAuthRequestControl::uncancellable`], which is never cancelled.
+pub type OAuthRequestControlFn = extern "C" fn(
+    req_json: StbStringRef,
+    control: *const OAuthRequestControl,
+    out: *mut StbString,
+    user_data: *mut c_void,
+) -> i32;
 
 // ---------------------------------------------------------------------------
 // Unified ABI — single struct, version inside
@@ -1463,6 +1880,14 @@ pub struct PluginApi {
             user_data: *mut c_void,
         ) -> i32,
     >,
+    /// Register a renderer for session custom entries. The host invokes it with
+    /// `{"customType":"...","data":...}` and accepts the same single-row
+    /// output as [`RenderFn`]: `{"text":"...","markdown":true|false}` or
+    /// `{"lines":["..."]}`, or `{"display":false}` for an explicitly hidden
+    /// entry (no component, spacer or fallback text). A renderer is tried in
+    /// registration order; the first valid JSON response with status `0` wins,
+    /// including a hidden response. Non-zero means unhandled. No ABI change is
+    /// needed; hosts predating explicit visibility may still render raw text.
     pub register_entry_renderer: Option<
         extern "C" fn(
             name: StbStringRef,
@@ -1565,9 +1990,238 @@ pub struct PluginApi {
 
     /// Optional plugin shutdown hooks, appended after wake-driven tools.
     pub register_plugin_lifecycle: Option<RegisterPluginLifecycleFn>,
+
+    /// Set explicit prompt metadata for a tool already registered by this plugin.
+    /// `metadata_json` is an object with optional `promptSnippet` (string) and
+    /// `promptGuidelines` (string array), matching pi's tool definition fields.
+    /// Both arguments are borrowed and copied before this call returns.
+    ///
+    /// Returns 0 on success, 1 for an unknown tool, 2 for malformed metadata,
+    /// and -1 outside registration. Appended without changing StableToolSchema
+    /// or the ABI version. Older hosts supply None: skip the call; the tool's
+    /// schema and execution remain available without any prompt contribution.
+    pub register_tool_prompt:
+        Option<extern "C" fn(name: StbStringRef, metadata_json: StbStringRef) -> i32>,
+    /// Cancellable OAuth registration, appended after `register_tool_prompt`.
+    /// Its callback takes an [`OAuthRequestControl`] and must poll it during long
+    /// waits. A host that predates this slot leaves it `None`. Plugins should
+    /// register through [`register_oauth_provider_cancellable`], which falls back
+    /// to `register_oauth_provider` on such a host.
+    pub register_oauth_provider_cancellable: Option<
+        extern "C" fn(
+            manifest_json: StbStringRef,
+            request_fn: OAuthRequestControlFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    /// Register a [`ToolResultFn`] transform, appended after
+    /// `register_oauth_provider_cancellable`. A host that predates this slot
+    /// does not reach it with `struct_size`: register through
+    /// [`register_tool_result`], which checks that and returns `-1` on such a
+    /// host, whose tool results then stay as the tools returned them.
+    pub register_tool_result: Option<
+        extern "C" fn(
+            handler: ToolResultFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    /// Stack an autocomplete provider on top of the host's built-in one
+    /// (pi's `ui.addAutocompleteProvider`). Appended after
+    /// `register_tool_result` so every earlier offset stays valid; older hosts
+    /// supply `None`.
+    ///
+    /// The handler (see [`AutocompleteProviderFn`]) is consulted **before** the
+    /// built-in providers, so a plugin can win the candidates it recognizes
+    /// while everything else keeps the file/slash behavior. `plugin_free_string`
+    /// reclaims the handler's `out` strings — the same producer-owns convention
+    /// as tools, not the host-owns one used by command handlers.
+    ///
+    /// Returns `0` once registered, `-1` outside registration.
+    pub register_autocomplete_provider: Option<
+        extern "C" fn(
+            handler: AutocompleteProviderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    /// Attach argument completions to a slash command this plugin already
+    /// registered (pi's `getArgumentCompletions`). Appended after
+    /// `register_autocomplete_provider`; older hosts supply `None`.
+    ///
+    /// Args for [`CommandArgumentCompletionFn`] are the text after the command
+    /// name and its trailing space, so `/office con` yields
+    /// `{"argumentPrefix":"con"}`. Re-registering the same name replaces the
+    /// previous handler (the last registration wins, matching how a command
+    /// handler is replaced).
+    ///
+    /// Returns `0` on success, `1` for a command this plugin never registered,
+    /// and `-1` outside registration or on a host without the slot.
+    pub register_command_completions: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            handler: CommandArgumentCompletionFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    /// Register an argument suggester for the TUI autocomplete pipeline,
+    /// appended after `register_tool_result`. Appended last on purpose so
+    /// older hosts (shorter `struct_size`) simply never reach it; plugins
+    /// must treat `None` as "no argument suggestions on this host".
+    ///
+    /// `command` is the slash-command token the suggestions annotate (with or
+    /// without the leading `/`; the host normalizes). Re-registering the same
+    /// command replaces the previous suggester. The host calls the handler
+    /// only when the editor draft starts with that command token.
+    ///
+    /// The handler receives a borrowed JSON request
+    /// `{"command":"/msg","args":""}` and writes an owning response
+    /// `{"items":[{"value":"…","label":"…","description":"…"}]}` into `out`.
+    /// `value` is what the completion inserts; `label` is what renders;
+    /// `description` is the optional right-hand hint. An empty or missing
+    /// `items` array means "no suggestions".
+    ///
+    /// **Full-candidate-list contract:** the host calls the suggester with an
+    /// EMPTY `args` and caches the returned list **per command**; narrowing
+    /// against the typed prefix happens in the host, locally per keystroke.
+    /// Return every valid candidate — do NOT filter on `args` (a filtered
+    /// list would shrink the host's cached frame and lose candidates when the
+    /// user deletes a character). Plugins that need query-dependent results
+    /// must instead return the full list and let the host narrow.
+    ///
+    /// Contract notes for plugins:
+    /// - the host calls the handler from a background worker with a **500 ms
+    ///   bounded wait**; a late response is reclaimed and dropped — it can
+    ///   never block typing. At most one call per command is in flight; keep
+    ///   the implementation cheap and cache-heavy (it runs at most once per
+    ///   refresh window per command, not per keystroke).
+    /// - response caps: at most 64 items, each string field at most 256
+    ///   characters including any truncation ellipsis (host-side; longer
+    ///   entries are truncated, oversized responses are dropped before the
+    ///   host copies them).
+    /// - narrowing/matching (host-side, per keystroke): rows whose `value`
+    ///   starts with the typed prefix rank first, then rows whose `label`
+    ///   contains it, then rows whose `value` contains it; an exact value
+    ///   match is excluded (it is the just-completed selection). Keep
+    ///   `value` a clean instance token so prefix matching stays predictable.
+    /// - the strings cross the ABI like every other callback: request is
+    ///   borrowed (do not free), response is plugin-owned and reclaimed via
+    ///   the registered `plugin_free_string`.
+    ///
+    /// Returns 0 on registration success, nonzero when the host rejects the
+    /// registration.
+    pub register_argument_suggester: Option<
+        extern "C" fn(
+            command: StbStringRef,
+            handler: ArgumentSuggesterFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
+
+/// Register an OAuth provider whose action callback can observe cancellation.
+///
+/// Uses `register_oauth_provider_cancellable` when the host provides it. An older
+/// host leaves that slot `None`, so `legacy_request_fn` is registered through
+/// `register_oauth_provider` instead. Actions on that host run to completion
+/// because the host cannot cancel them. `legacy_request_fn` should call
+/// `request_fn` with [`OAuthRequestControl::uncancellable`]. Returns the host's
+/// registration status, or `-1` when the host offers neither slot.
+pub fn register_oauth_provider_cancellable(
+    api: &PluginApi,
+    manifest_json: &str,
+    request_fn: OAuthRequestControlFn,
+    legacy_request_fn: OAuthRequestFn,
+    user_data: *mut c_void,
+) -> i32 {
+    let free = callbacks::free_string;
+    if let Some(register) = api.register_oauth_provider_cancellable {
+        register(
+            StbStringRef::from_str(manifest_json),
+            request_fn,
+            free,
+            user_data,
+        )
+    } else if let Some(register) = api.register_oauth_provider {
+        register(
+            StbStringRef::from_str(manifest_json),
+            legacy_request_fn,
+            free,
+            user_data,
+        )
+    } else {
+        -1
+    }
+}
+
+/// Register a `tool_result` transform (see [`ToolResultFn`]).
+///
+/// Returns the host's registration status, or `-1` when the host predates the
+/// slot (its `struct_size` does not reach it) or leaves it `None`.
+pub fn register_tool_result(api: &PluginApi, handler: ToolResultFn, user_data: *mut c_void) -> i32 {
+    let end =
+        core::mem::offset_of!(PluginApi, register_tool_result) + core::mem::size_of::<usize>();
+    if (api.struct_size as usize) < end {
+        return -1;
+    }
+    match api.register_tool_result {
+        Some(register) => register(handler, callbacks::free_string, user_data),
+        None => -1,
+    }
+}
+
+/// Register an autocomplete provider (see [`AutocompleteProviderFn`]).
+///
+/// Returns the host's registration status, or `-1` when the host predates the
+/// slot (its `struct_size` does not reach it) or leaves it `None`. A plugin on
+/// such a host keeps the built-in file/slash completion only.
+pub fn register_autocomplete_provider(
+    api: &PluginApi,
+    handler: AutocompleteProviderFn,
+    user_data: *mut c_void,
+) -> i32 {
+    let end = core::mem::offset_of!(PluginApi, register_autocomplete_provider)
+        + core::mem::size_of::<usize>();
+    if (api.struct_size as usize) < end {
+        return -1;
+    }
+    match api.register_autocomplete_provider {
+        Some(register) => register(handler, callbacks::free_string, user_data),
+        None => -1,
+    }
+}
+
+/// Attach argument completions to a command this plugin registered (see
+/// [`CommandArgumentCompletionFn`]).
+///
+/// Returns `0` on success, `1` for an unknown command, and `-1` when the host
+/// predates the slot or leaves it `None`.
+pub fn register_command_completions(
+    api: &PluginApi,
+    name: &str,
+    handler: CommandArgumentCompletionFn,
+    user_data: *mut c_void,
+) -> i32 {
+    let end = core::mem::offset_of!(PluginApi, register_command_completions)
+        + core::mem::size_of::<usize>();
+    if (api.struct_size as usize) < end {
+        return -1;
+    }
+    match api.register_command_completions {
+        Some(register) => register(
+            StbStringRef::from_str(name),
+            handler,
+            callbacks::free_string,
+            user_data,
+        ),
+        None => -1,
+    }
+}
 
 /// Unified ABI plugin entrypoint signature: `(api)`. The version is read from
 /// `api->abi_version`.
@@ -1851,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn event_tag_count_is_37() {
+    fn event_tag_count_is_38() {
         // Enumerate every tag; a compile-time + runtime guarantee that the
         // 37-category surface is intact (33 Pi on() categories + the
         // rpi-specific BeforeTuiStart + 2 UI prompt events + EditorChange).
@@ -1893,13 +2547,14 @@ mod tests {
             EventTag::UiPromptStart,
             EventTag::UiPromptEnd,
             EventTag::EditorChange,
+            EventTag::TurnEndPayload,
         ];
         assert_eq!(tags.len(), EVENT_TAG_COUNT);
-        assert_eq!(EVENT_TAG_COUNT, 37);
-        // Distinct discriminants 0..36.
+        assert_eq!(EVENT_TAG_COUNT, 38);
+        // Distinct discriminants 0..=36.
         let mut discs: Vec<u32> = tags.iter().map(|t| *t as u32).collect();
         discs.sort();
-        assert_eq!(discs, (0..37).collect::<Vec<u32>>());
+        assert_eq!(discs, (0..38).collect::<Vec<u32>>());
     }
 
     #[test]
@@ -1956,6 +2611,12 @@ mod tests {
             register_streaming_provider: None,
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -1973,6 +2634,7 @@ mod tests {
             !core::mem::needs_drop::<ProviderStreamControl>(),
             "the control struct is fn pointers + a u32: it must stay Copy/POD"
         );
+        assert!(!core::mem::needs_drop::<OAuthRequestControl>());
     }
 
     /// New vtable slots must be **appended**, never inserted.
@@ -2049,13 +2711,46 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_tool_with_wake),
             "wake registration must follow streaming registration"
         );
+        let lifecycle = core::mem::offset_of!(PluginApi, register_plugin_lifecycle);
         assert_eq!(
-            core::mem::offset_of!(PluginApi, register_plugin_lifecycle),
+            lifecycle,
             core::mem::offset_of!(PluginApi, register_tool_with_wake) + size_of::<usize>()
+        );
+        let tool_prompt = core::mem::offset_of!(PluginApi, register_tool_prompt);
+        assert_eq!(tool_prompt, lifecycle + size_of::<usize>());
+        let cancellable = core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable);
+        assert_eq!(
+            cancellable,
+            tool_prompt + size_of::<usize>(),
+            "register_oauth_provider_cancellable must be appended after register_tool_prompt"
+        );
+        let tool_result = core::mem::offset_of!(PluginApi, register_tool_result);
+        assert_eq!(
+            tool_result,
+            cancellable + size_of::<usize>(),
+            "register_tool_result must be appended after register_oauth_provider_cancellable"
+        );
+        let autocomplete = core::mem::offset_of!(PluginApi, register_autocomplete_provider);
+        assert_eq!(
+            autocomplete,
+            tool_result + size_of::<usize>(),
+            "register_autocomplete_provider must be appended after register_tool_result"
+        );
+        let command_completions = core::mem::offset_of!(PluginApi, register_command_completions);
+        assert_eq!(
+            command_completions,
+            autocomplete + size_of::<usize>(),
+            "register_command_completions must be appended after register_autocomplete_provider"
+        );
+        let argument_suggester = core::mem::offset_of!(PluginApi, register_argument_suggester);
+        assert_eq!(
+            argument_suggester,
+            command_completions + size_of::<usize>(),
+            "register_argument_suggester must be appended after register_command_completions"
         );
         assert_eq!(
             size_of::<PluginApi>(),
-            core::mem::offset_of!(PluginApi, register_plugin_lifecycle) + size_of::<usize>()
+            argument_suggester + size_of::<usize>()
         );
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
@@ -2089,17 +2784,41 @@ mod tests {
             RuntimeActionId::GetExecutionContext,
             RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
+            RuntimeActionId::ListCommands,
+            RuntimeActionId::Abort,
+            RuntimeActionId::RelayUiDialog,
+            RuntimeActionId::StopRound,
+            RuntimeActionId::ToolProgram,
+            RuntimeActionId::ReloadModels,
+            RuntimeActionId::GetEditorText,
         ];
 
-        for (raw, expected) in ids.into_iter().enumerate() {
-            assert_eq!(RuntimeActionId::try_from(raw as u32), Ok(expected));
-            assert_eq!(u32::from(expected), raw as u32);
+        // Stable wire ids must not depend on which proposal was merged first.
+        for expected in ids {
+            let raw = u32::from(expected);
+            assert_eq!(RuntimeActionId::try_from(raw), Ok(expected));
+            assert_eq!(u32::from(expected), raw);
         }
+        assert_eq!(u32::from(RuntimeActionId::ListCommands), 26);
+        assert_eq!(u32::from(RuntimeActionId::Abort), 27);
+        assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);
+        assert_eq!(u32::from(RuntimeActionId::StopRound), 29);
+        assert_eq!(u32::from(RuntimeActionId::ToolProgram), 30);
+        assert_eq!(u32::from(RuntimeActionId::ReloadModels), 31);
+        assert_eq!(u32::from(RuntimeActionId::GetEditorText), 32);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ReloadModels));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::GetEditorText));
+        assert_eq!(RuntimeActionId::MAX, 32);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
+        let one_past_last = RuntimeActionId::MAX + 1;
         assert_eq!(
-            RuntimeActionId::try_from(26),
-            Err(UnknownRuntimeActionId(26))
+            RuntimeActionId::try_from(one_past_last),
+            Err(UnknownRuntimeActionId(one_past_last))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
@@ -2131,6 +2850,12 @@ mod tests {
             register_streaming_provider: None,
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         }
     }
 
@@ -2183,6 +2908,8 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_streaming_provider),
             core::mem::offset_of!(PluginApi, register_tool_with_wake),
             core::mem::offset_of!(PluginApi, register_plugin_lifecycle),
+            core::mem::offset_of!(PluginApi, register_tool_prompt),
+            core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable),
         ] {
             let mut api = entrypoint_test_api();
             api.struct_size = size as u32;
@@ -2207,6 +2934,8 @@ mod tests {
                     assert!(api.register_streaming_provider.is_none());
                     assert!(api.register_tool_with_wake.is_none());
                     assert!(api.register_plugin_lifecycle.is_none());
+                    assert!(api.register_tool_prompt.is_none());
+                    assert!(api.register_oauth_provider_cancellable.is_none());
                     assert!(
                         api.register_provider.is_some(),
                         "one-shot fallback remains available"
@@ -2232,11 +2961,140 @@ mod tests {
         for size in [
             core::mem::offset_of!(PluginApi, declare) - 1,
             core::mem::offset_of!(PluginApi, register_streaming_provider) + 1,
+            core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable) + 1,
         ] {
             let mut api = entrypoint_test_api();
             api.struct_size = size as u32;
             let rc = unsafe { register_entrypoint(&api, |_| panic!("incomplete ABI layout")) };
             assert_eq!(rc, 3);
         }
+    }
+
+    #[test]
+    fn oauth_request_control_layout_is_pinned() {
+        use core::mem::{align_of, offset_of, size_of};
+        // Three words after the leading u32, with the pointers aligned: the
+        // same shape on 32-bit and 64-bit targets.
+        assert_eq!(offset_of!(OAuthRequestControl, struct_size), 0);
+        assert_eq!(
+            offset_of!(OAuthRequestControl, is_cancelled),
+            size_of::<*const ()>()
+        );
+        assert_eq!(
+            offset_of!(OAuthRequestControl, user_data),
+            2 * size_of::<*const ()>()
+        );
+        assert_eq!(size_of::<OAuthRequestControl>(), 3 * size_of::<*const ()>());
+        assert_eq!(align_of::<OAuthRequestControl>(), align_of::<*const ()>());
+        assert!(!core::mem::needs_drop::<OAuthRequestControl>());
+    }
+
+    extern "C" fn cancelled_now(_: *mut c_void) -> i32 {
+        1
+    }
+
+    #[test]
+    fn oauth_request_control_is_polled_only_when_the_host_supplied_it() {
+        let mut control = OAuthRequestControl::uncancellable();
+        // SAFETY: null is an accepted input; the other controls are live locals.
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(core::ptr::null()) });
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(&control) });
+        control.is_cancelled = cancelled_now;
+        assert!(unsafe { OAuthRequestControl::poll_cancelled(&control) });
+        // A host that supplied only the leading u32, or stopped before
+        // `user_data`, is never polled through the missing fields.
+        control.struct_size = core::mem::size_of::<u32>() as u32;
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(&control) });
+        control.struct_size = core::mem::offset_of!(OAuthRequestControl, user_data) as u32;
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(&control) });
+    }
+
+    std::thread_local! {
+        static OAUTH_SLOT: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+    }
+
+    extern "C" fn record_cancellable_oauth(
+        _: StbStringRef,
+        _: OAuthRequestControlFn,
+        _: FreeStringFn,
+        _: *mut c_void,
+    ) -> i32 {
+        OAUTH_SLOT.with(|slot| slot.set("cancellable"));
+        1
+    }
+
+    extern "C" fn record_legacy_oauth(
+        _: StbStringRef,
+        _: OAuthRequestFn,
+        _: FreeStringFn,
+        _: *mut c_void,
+    ) -> i32 {
+        OAUTH_SLOT.with(|slot| slot.set("legacy"));
+        1
+    }
+
+    extern "C" fn unused_control_request(
+        _: StbStringRef,
+        _: *const OAuthRequestControl,
+        _: *mut StbString,
+        _: *mut c_void,
+    ) -> i32 {
+        0
+    }
+
+    extern "C" fn unused_legacy_request(_: StbStringRef, _: *mut StbString, _: *mut c_void) -> i32 {
+        0
+    }
+
+    #[test]
+    fn oauth_registration_prefers_cancellable_slot_and_falls_back_to_legacy() {
+        let manifest = r#"{"id":"acme"}"#;
+        let register = |api: &PluginApi| {
+            register_oauth_provider_cancellable(
+                api,
+                manifest,
+                unused_control_request,
+                unused_legacy_request,
+                core::ptr::null_mut(),
+            )
+        };
+
+        // A current host offers both slots: the cancellable one is used.
+        let mut current = entrypoint_test_api();
+        current.register_oauth_provider = Some(record_legacy_oauth);
+        current.register_oauth_provider_cancellable = Some(record_cancellable_oauth);
+        assert_eq!(register(&current), 1);
+        assert_eq!(OAUTH_SLOT.with(std::cell::Cell::get), "cancellable");
+
+        // A host that predates the slot: its vtable ends where the slot begins.
+        // The entrypoint normalizes the missing slot to `None`, so the legacy
+        // slot receives the registration.
+        let size = core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable);
+        let mut old = entrypoint_test_api();
+        old.struct_size = size as u32;
+        old.register_oauth_provider = Some(record_legacy_oauth);
+        old.register_oauth_provider_cancellable = None;
+        let mut buffer = vec![0usize; size / core::mem::size_of::<usize>()];
+        // SAFETY: the buffer holds exactly the old layout's `size` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&old as *const PluginApi).cast::<u8>(),
+                buffer.as_mut_ptr().cast::<u8>(),
+                size,
+            );
+        }
+        let rc = unsafe {
+            register_entrypoint(buffer.as_ptr().cast(), |api| {
+                assert!(api.register_oauth_provider_cancellable.is_none());
+                register(api)
+            })
+        };
+        assert_eq!(rc, 1);
+        assert_eq!(OAUTH_SLOT.with(std::cell::Cell::get), "legacy");
+
+        // A host with neither slot cannot register the provider.
+        let mut none = entrypoint_test_api();
+        none.register_oauth_provider = None;
+        assert_eq!(register(&none), -1);
     }
 }
